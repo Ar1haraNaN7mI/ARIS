@@ -1,0 +1,10 @@
+.aris-emblem { display: block; flex-shrink: 0; color: #168ba8; }
+.profile-sync-notice { position: fixed; z-index: 24; right: 24px; bottom: 24px; display: flex; align-items: center; gap: 18px; max-width: calc(100vw - 48px); padding: 14px 18px; background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; }
+.profile-sync-notice button { flex-shrink: 0; border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; color: var(--ink); background: var(--soft); }
+.harness .sidebar { background: var(--sidebar); }
+.harness .new-session, .harness .session-link, .harness .composer, .harness .operator-avatar { border-radius: 10px; }
+.harness .new-session, .harness .session-link.active { border-color: var(--line); background: var(--surface); }
+.harness .brand { color: var(--ink); }
+.harness .brand > span { letter-spacing: .02em; }
+.harness .workspace-header { background: var(--surface); }
+.harness .solid-button { background: var(--blue); border-color: var(--blue); color: white; }

@@ -1,0 +1,13 @@
+[package]
+name = "aris-app-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed async client for the aris JSON-RPC app-server"
+
+[dependencies]
+aris-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "aris-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Windows WebView2 window for the ARIS Harness"
+
+[dependencies]
+anyhow.workspace = true
+aris-core = { path = "../aris-core" }
+serde_json.workspace = true
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+tao = "0.37.1"
+wry = "0.57.0"

@@ -1,0 +1,13 @@
+{
+  "name": "@aris/browser-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.mjs",
+    "install-browser": "playwright install chromium",
+    "test": "node --test test.mjs"
+  },
+  "dependencies": { "playwright": "1.65.1" }
+}

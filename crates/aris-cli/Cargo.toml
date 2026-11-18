@@ -1,0 +1,50 @@
+[package]
+name = "aris-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "aris CLI: tui, headless, plugin, skill"
+default-run = "aris"
+
+[[bin]]
+name = "aris"
+path = "src/main.rs"
+
+[[bin]]
+name = "aris-desktop"
+path = "src/desktop_main.rs"
+test = false
+bench = false
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22.1"
+async-trait.workspace = true
+parking_lot.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+dirs.workspace = true
+dotenvy = "0.15"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+aris-core.workspace = true
+aris-app-client.workspace = true
+aris-protocol.workspace = true
+aris-llm.workspace = true
+aris-tools.workspace = true
+aris-fs.workspace = true
+aris-skill.workspace = true
+aris-plugin.workspace = true
+aris-tui.workspace = true
+aris-desktop.workspace = true
+argon2 = "0.5.3"
+fs2 = "0.4"
