@@ -21,7 +21,7 @@ import type {
   SessionSummary,
 } from "./types";
 
-export function useHarness(initialData?: Bootstrap, latestProfile?: Profile) {
+export function useHarness(initialData?: Bootstrap, latestProfile?: Profile, observeSessions = true) {
   const [data, setData] = useState<Bootstrap>();
   useEffect(() => { if (data) acceptVisualProfile(data.profile); }, [data?.profile]);
   useEffect(() => {
@@ -102,6 +102,9 @@ export function useHarness(initialData?: Bootstrap, latestProfile?: Profile) {
         if (!alive) return;
         setData(value);
         setSessions(value.sessions);
+        // The collaboration workbench owns its session and approval observer.
+        // Settings still use bootstrap, but must not start a second chat reader.
+        if (!observeSessions) return;
         mutateLive((previous) => {
           const next = retry > 0 ? {} : { ...previous };
           for (const session of value.sessions)
@@ -235,10 +238,10 @@ export function useHarness(initialData?: Bootstrap, latestProfile?: Profile) {
       abort.abort();
       clearTimeout(timer);
     };
-  }, [retry, mutateLive, beginSnapshot, applySnapshot, initialData]);
+  }, [retry, mutateLive, beginSnapshot, applySnapshot, initialData, observeSessions]);
 
   useEffect(() => {
-    if (!data || !currentId) return;
+    if (!observeSessions || !data || !currentId) return;
     const abort = new AbortController();
     const version = beginSnapshot(currentId);
     setLoadingSession(true);
@@ -261,7 +264,7 @@ export function useHarness(initialData?: Bootstrap, latestProfile?: Profile) {
         if (!abort.signal.aborted) setLoadingSession(false);
       });
     return () => abort.abort();
-  }, [currentId, data?.token, beginSnapshot, applySnapshot]);
+  }, [currentId, data?.token, beginSnapshot, applySnapshot, observeSessions]);
 
   async function createSession() {
     if (!data || submitting) return;

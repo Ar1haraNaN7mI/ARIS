@@ -12,6 +12,7 @@ use tokio::process::Command;
 
 pub fn register_builtin_tools(registry: &ToolRegistry, fs: Arc<FsService>) {
     let todos = Arc::new(TodoStore::default());
+    registry.register(Arc::new(crate::report_calculate::ReportCalculate));
     registry.register(Arc::new(ReadFileTool { fs: fs.clone() }));
     registry.register(Arc::new(WriteFileTool { fs: fs.clone() }));
     registry.register(Arc::new(EditFileTool { fs: fs.clone() }));

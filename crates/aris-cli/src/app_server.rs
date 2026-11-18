@@ -382,10 +382,31 @@ pub(crate) fn resolve_session(
 fn session_result(
     runtime: &Runtime,
     session: &Arc<parking_lot::RwLock<aris_core::Session>>,
+    cursor: Option<&str>,
 ) -> Value {
-    let snapshot = session.read().clone();
-    let task = runtime.tasks.task_for_session(&snapshot.id);
-    json!({"session":snapshot,"task_id":task.as_ref().map(|task| &task.id),"state":task.map(|task| task.state)})
+    let session = session.read();
+    let (offset, reset, next_cursor) = session.event_delta(cursor);
+    let aris_core::Session {
+        schema_version,
+        id,
+        name,
+        archived,
+        goal,
+        goal_paused,
+        personality,
+        cwd,
+        events,
+    } = &*session;
+    let snapshot = json!({
+        "schema_version":schema_version, "id":id, "name":name, "archived":archived,
+        "goal":goal, "goal_paused":goal_paused, "personality":personality, "cwd":cwd,
+        "events":&events[offset..]
+    });
+    let sync = json!({"cursor":next_cursor,"reset":reset,"event_count":events.len()});
+    let id = id.clone();
+    drop(session);
+    let task = runtime.tasks.task_for_session(&id);
+    json!({"session":snapshot,"sync":sync,"task_id":task.as_ref().map(|task| &task.id),"state":task.map(|task| task.state)})
 }
 
 async fn handle_request(
@@ -438,7 +459,11 @@ async fn handle_request(
         "sessions/get" => {
             let id = required_string(&params, "id")?;
             let session = resolve_session(&runtime, &id)?;
-            Ok(session_result(&runtime, &session))
+            Ok(session_result(
+                &runtime,
+                &session,
+                params.get("cursor").and_then(Value::as_str),
+            ))
         }
         "sessions/create" => {
             let name = match params.get("name") {
@@ -466,7 +491,7 @@ async fn handle_request(
                 .sessions
                 .persist_now_result(&session)
                 .map_err(|error| RpcFailure::internal(error.to_string()))?;
-            Ok(session_result(&runtime, &session))
+            Ok(session_result(&runtime, &session, None))
         }
         "llm/status" => {
             let config = runtime.llm.config();

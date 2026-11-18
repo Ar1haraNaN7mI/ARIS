@@ -48,6 +48,12 @@ const snapshot = {
   state: null,
 };
 describe("Harness request lifecycle", () => {
+  it("does not start an independent session observer inside the collaboration workbench", async () => {
+    const { result } = renderHook(() => useHarness(data, undefined, false));
+    await waitFor(() => expect(result.current.data?.token).toBe("test"));
+    expect(api.rpc).not.toHaveBeenCalled();
+    expect(result.current.snapshot).toBeUndefined();
+  });
   it("keeps the fresh bootstrap profile after a service restart instead of restoring an older parent snapshot", async () => {
     const refreshed: Bootstrap = { ...data, token: "restarted-service", profile: { username: "Current operator", badge_id: "ARIS-03", visual_style: "laterano" } };
     vi.mocked(api.bootstrap).mockResolvedValue(refreshed);

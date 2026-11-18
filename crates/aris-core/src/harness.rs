@@ -70,6 +70,8 @@ pub struct TeamMessage {
     pub id: String,
     pub agent_id: Option<String>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub at: String,
     #[serde(default)]
     pub queued: bool,
@@ -89,6 +91,40 @@ pub struct FileCheckpoint {
     pub at: String,
     pub files: Vec<SnapshotFile>,
 }
+/// The controller has a durable conversation separate from its delegated work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAdmin {
+    pub request_id: String,
+    pub session_id: String,
+    pub profile_id: String,
+    pub model_id: String,
+    pub family: String,
+    pub phase: String,
+    pub response: String,
+    pub error: Option<String>,
+    pub requested_effort: Option<String>,
+    pub applied_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamExecutionBudget {
+    pub agent_ids: Vec<String>,
+    pub max_agent_runs: usize,
+    pub max_steps_per_agent: usize,
+    pub max_tool_calls_per_agent: usize,
+    pub max_context_chars: usize,
+    pub max_tokens_per_step: u32,
+    pub max_parallel: usize,
+    pub max_runtime_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAssignment {
+    pub agent_id: String,
+    pub instruction: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Team {
     pub id: String,
@@ -103,6 +139,10 @@ pub struct Team {
     pub checkpoints: Vec<FileCheckpoint>,
     pub events: Vec<TeamEvent>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<TeamAdmin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_budget: Option<TeamExecutionBudget>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamSpec {
@@ -200,11 +240,18 @@ impl TeamStore {
         let _guard = self.transaction.lock();
         let _state = self.state_lock(id)?;
         let mut team = self.read(id)?;
-        if matches!(team.status.as_str(), "running" | "cancelling")
+        if matches!(team.status.as_str(), "running" | "cancelling" | "planning")
             && !self.handles.lock().contains_key(id)
         {
             if let Ok(_lease) = self.run_lock(id) {
                 team.status = "failed".into();
+                if let Some(admin) = &mut team.admin {
+                    if admin.phase == "planning" {
+                        admin.phase = "failed".into();
+                        admin.error =
+                            Some("Controller process stopped; send the message again.".into());
+                    }
+                }
                 for agent in &mut team.agents {
                     if agent.status == "running" {
                         agent.status = "failed".into();
@@ -313,6 +360,8 @@ impl TeamStore {
             checkpoints: vec![],
             events: vec![],
             created_at: now(),
+            admin: None,
+            execution_budget: None,
         };
         Self::event(&mut team, None, "created", "Shared workspace created");
         let _guard = self.transaction.lock();
@@ -503,7 +552,10 @@ impl TeamStore {
     }
     pub fn cancel(&self, id: &str) -> Result<Team> {
         let team = self.mutate(id, |team| {
-            ensure!(team.status == "running", "team is not running");
+            ensure!(
+                matches!(team.status.as_str(), "running" | "planning"),
+                "team is not running"
+            );
             team.status = "cancelling".into();
             Self::event(
                 team,
@@ -613,6 +665,219 @@ impl TeamStore {
             Ok(())
         })
     }
+    /// Reserve the same cross-process lease used by execution before any model
+    /// request. Other controller requests and structural mutations cannot race it.
+    pub fn admin_lease(&self, id: &str) -> Result<File> {
+        self.get(id)?;
+        self.run_lock(id)
+    }
+    pub fn reserve_admin(&self, id: &str, admin: TeamAdmin, lease: File) -> Result<(Team, File)> {
+        let team = self.mutate(id, |team| {
+            ensure!(
+                !matches!(team.status.as_str(), "running" | "cancelling" | "planning"),
+                "Wait for the current team operation before asking the admin"
+            );
+            ensure!(
+                !team.messages.iter().any(|m| m.queued),
+                "Run or resolve queued team messages first"
+            );
+            if let Some(controller) = team
+                .agents
+                .iter_mut()
+                .find(|a| a.session_id == admin.session_id)
+            {
+                controller.profile_id.clone_from(&admin.profile_id);
+            }
+            team.admin = Some(admin);
+            team.status = "planning".into();
+            Self::event(
+                team,
+                None,
+                "admin_started",
+                "Admin is answering or planning this message",
+            );
+            Ok(())
+        })?;
+        Ok((team, lease))
+    }
+
+    /// Called only by the controller that owns the run lease. Existing roles,
+    /// profiles, dependencies and sessions are never rewritten by a model plan.
+    pub fn finish_admin(
+        &self,
+        runtime: &Runtime,
+        id: &str,
+        request_id: &str,
+        response: &str,
+        mut additions: Vec<TeamAgent>,
+        assignments: Vec<AdminAssignment>,
+    ) -> Result<Team> {
+        self.mutate(id, |team| {
+            ensure!(
+                team.status == "planning",
+                "Admin was cancelled before applying its result"
+            );
+            let admin = team.admin.as_ref().context("admin session missing")?;
+            ensure!(
+                admin.request_id == request_id && admin.phase == "planning",
+                "Stale admin result"
+            );
+            let admin_session = admin.session_id.clone();
+            ensure!(
+                additions.len() <= 4 && assignments.len() <= 6,
+                "Admin execution budget exceeded"
+            );
+            ensure!(
+                team.agents.len() + additions.len() <= 32,
+                "Team role limit exceeded"
+            );
+            let mut combined = team.agents.clone();
+            combined.extend(additions.clone());
+            validate_graph(&combined)?;
+            let mut selected = HashSet::new();
+            for assignment in &assignments {
+                ensure!(
+                    selected.insert(assignment.agent_id.clone()),
+                    "duplicate admin assignment"
+                );
+                ensure!(
+                    !assignment.instruction.trim().is_empty()
+                        && assignment.instruction.len() <= 12000,
+                    "invalid admin assignment instructions"
+                );
+                let agent = combined
+                    .iter()
+                    .find(|a| a.id == assignment.agent_id)
+                    .context("admin selected an unknown role")?;
+                ensure!(
+                    agent.session_id != admin_session,
+                    "Admin cannot recursively delegate to itself"
+                );
+            }
+            for agent in &combined {
+                if selected.contains(&agent.id) {
+                    for dep in &agent.depends_on {
+                        ensure!(
+                            selected.contains(dep)
+                                || combined
+                                    .iter()
+                                    .any(|a| &a.id == dep && a.status == "completed"),
+                            "A selected role depends on an unfinished role outside this dispatch"
+                        );
+                    }
+                }
+            }
+            let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
+            let mut files = team.files.clone();
+            for agent in &mut additions {
+                ensure!(
+                    selected.contains(&agent.id),
+                    "New roles must have an assignment"
+                );
+                ensure!(
+                    !agent.name.trim().is_empty()
+                        && agent.name.len() <= 200
+                        && !agent.role.trim().is_empty()
+                        && agent.role.len() <= 4000
+                        && agent.prompt.len() <= 12000,
+                    "Invalid new role"
+                );
+                kei.profile(&agent.profile_id)?.resolve(
+                    &kei,
+                    &runtime.llm.config(),
+                    &runtime.outer_home,
+                )?;
+                agent.files = self.validate_files(&agent.files)?;
+                files.extend(agent.files.clone());
+            }
+            let files = self.validate_files(&files)?;
+            for agent in &mut additions {
+                let session = runtime.sessions.create();
+                {
+                    let mut s = session.write();
+                    s.name = Some(format!("{} / {}", team.name, agent.name));
+                    s.cwd = Some(self.workspace.to_string_lossy().into());
+                }
+                runtime.sessions.persist_now_result(&session)?;
+                agent.session_id = session.read().id.clone();
+                agent.status = pending();
+                agent.output.clear();
+                agent.error = None;
+            }
+            team.files = files;
+            team.agents.extend(additions);
+            for agent in &mut team.agents {
+                if agent.session_id == admin_session {
+                    agent.status = "completed".into();
+                    agent.output = response.into();
+                    agent.error = None;
+                } else if selected.contains(&agent.id) {
+                    agent.status = pending();
+                    agent.output.clear();
+                    agent.error = None;
+                }
+            }
+            for assignment in assignments {
+                team.messages.push(TeamMessage {
+                    id: new_id(),
+                    agent_id: Some(assignment.agent_id),
+                    text: assignment.instruction,
+                    source: Some("admin".into()),
+                    at: now(),
+                    queued: false,
+                    cascade: false,
+                });
+            }
+            let delegated = !selected.is_empty();
+            team.execution_budget = delegated.then(|| TeamExecutionBudget {
+                agent_ids: selected.into_iter().collect(),
+                max_agent_runs: 6,
+                max_steps_per_agent: 6,
+                max_tool_calls_per_agent: 24,
+                max_context_chars: 64_000,
+                max_tokens_per_step: 4096,
+                max_parallel: 3,
+                max_runtime_secs: 900,
+            });
+            let admin = team.admin.as_mut().unwrap();
+            admin.phase = if delegated { "delegated" } else { "answered" }.into();
+            admin.response = response.into();
+            admin.error = None;
+            team.status = if delegated {
+                "planning"
+            } else if team.agents.iter().any(|a| a.status != "completed") {
+                "idle"
+            } else {
+                "completed"
+            }
+            .into();
+            Self::event(
+                team,
+                None,
+                if delegated {
+                    "admin_delegated"
+                } else {
+                    "admin_answered"
+                },
+                response,
+            );
+            Ok(())
+        })
+    }
+
+    pub fn fail_admin(&self, id: &str, request_id: &str, error: &str) -> Result<Team> {
+        self.mutate(id, |team| {
+            let cancelled = team.status == "cancelling";
+            let admin = team.admin.as_mut().context("admin session missing")?;
+            ensure!(admin.request_id == request_id, "Stale admin result");
+            admin.phase = if cancelled { "cancelled" } else { "failed" }.into();
+            admin.error = Some(error.into());
+            team.status = if cancelled { "cancelled" } else { "failed" }.into();
+            Self::event(team, None, "admin_stopped", error);
+            Ok(())
+        })
+    }
+
     fn submit_message(
         &self,
         id: &str,
@@ -625,6 +890,17 @@ impl TeamStore {
             "message needs 1–32000 bytes"
         );
         self.mutate(id, |team| {
+            ensure!(team.status != "planning" && !(team.status == "cancelling" && team.admin.as_ref().is_some_and(|a| a.phase == "planning")),
+                "Wait for the admin to finish planning, or cancel it first");
+            // A controller can already own the lease while preparing its
+            // persisted planning state. Do not accept a message in that gap.
+            let _idle_lease = if !matches!(team.status.as_str(), "running" | "cancelling") {
+                Some(self.run_lock(id)?)
+            } else { None };
+            // A direct user instruction starts its own ordinary, explicit run.
+            if !matches!(team.status.as_str(), "running" | "cancelling") {
+                team.execution_budget = None;
+            }
             if let Some(target) = agent_id {
                 ensure!(
                     team.agents.iter().any(|a| a.id == target),
@@ -632,10 +908,17 @@ impl TeamStore {
                 );
             }
             let queued = matches!(team.status.as_str(), "running" | "cancelling");
+            if queued {
+                if let Some(budget) = &team.execution_budget {
+                    ensure!(agent_id.is_some_and(|id| budget.agent_ids.iter().any(|selected| selected == id)) && !cascade,
+                        "This admin run has a fixed role budget; wait or cancel before dispatching other roles");
+                }
+            }
             team.messages.push(TeamMessage {
                 id: new_id(),
                 agent_id: agent_id.map(str::to_owned),
                 text: text.trim().into(),
+                source: Some("user".into()),
                 at: now(),
                 queued: true,
                 cascade,
@@ -658,16 +941,32 @@ impl TeamStore {
         })
     }
     pub fn start(self: &Arc<Self>, runtime: Arc<Runtime>, id: &str) -> Result<Team> {
-        let team = self.get(id)?;
+        // Recover a stale process before taking the lease ourselves.
+        self.get(id)?;
         let lease = self.run_lock(id)?;
+        self.start_reserved(runtime, id, lease)
+    }
+    /// Transfers the controller lease directly into execution with no unlock gap.
+    pub fn start_reserved(
+        self: &Arc<Self>,
+        runtime: Arc<Runtime>,
+        id: &str,
+        lease: File,
+    ) -> Result<Team> {
+        let team = self.get(id)?;
         let file_leases = self.artifact_leases(&team)?;
         let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
         // Validate all connections before marking any stage running.
         ensure!(
-            !matches!(team.status.as_str(), "running" | "cancelling"),
+            !matches!(team.status.as_str(), "running" | "cancelling")
+                && (team.status != "planning"
+                    || team.admin.as_ref().is_some_and(|a| a.phase == "delegated")),
             "team is already running"
         );
         for agent in &team.agents {
+            if !selected_for_run(&team, agent) {
+                continue;
+            }
             kei.profile(&agent.profile_id)?.resolve(
                 &kei,
                 &runtime.llm.config(),
@@ -677,12 +976,19 @@ impl TeamStore {
         let team = self.mutate(id, |team| {
             apply_queued_messages(team);
             ensure!(
-                team.agents.iter().any(|a| a.status != "completed"),
+                team.agents
+                    .iter()
+                    .any(|a| selected_for_run(team, a) && a.status != "completed"),
                 "all agents completed; send a message to continue"
             );
             self.capture(team, "Before run")?;
+            let budget = team.execution_budget.clone();
             for agent in &mut team.agents {
-                if agent.status != "completed" {
+                if agent.status != "completed"
+                    && budget
+                        .as_ref()
+                        .is_none_or(|b| b.agent_ids.contains(&agent.id))
+                {
                     agent.status = pending();
                     agent.error = None;
                     agent.output.clear();
@@ -716,6 +1022,8 @@ impl TeamStore {
         Ok(team)
     }
     async fn drive(self: &Arc<Self>, runtime: Arc<Runtime>, id: &str) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut runs = 0usize;
         loop {
             let team = self.mutate(id, |t| {
                 if t.status != "cancelling" {
@@ -737,6 +1045,16 @@ impl TeamStore {
                 return Ok(());
             }
             let ready = ready_wave(&team);
+            if let Some(budget) = &team.execution_budget {
+                ensure!(
+                    started.elapsed().as_secs() < budget.max_runtime_secs,
+                    "Admin execution time budget exhausted"
+                );
+                ensure!(
+                    runs + ready.len() <= budget.max_agent_runs,
+                    "Admin agent-run budget exhausted; send a new instruction to continue"
+                );
+            }
             if ready.is_empty() {
                 self.mutate(id, |t| {
                     // A message may arrive after ready_wave was computed. Keep
@@ -744,10 +1062,17 @@ impl TeamStore {
                     if t.status == "cancelling" || t.messages.iter().any(|message| message.queued) {
                         return Ok(());
                     }
-                    let complete = t.agents.iter().all(|a| a.status == "completed");
+                    let complete = t
+                        .agents
+                        .iter()
+                        .filter(|a| selected_for_run(t, a))
+                        .all(|a| a.status == "completed");
                     t.status = if complete { "completed" } else { "failed" }.into();
+                    let budget = t.execution_budget.clone();
                     for a in &mut t.agents {
-                        if a.status == "pending" {
+                        if a.status == "pending"
+                            && budget.as_ref().is_none_or(|b| b.agent_ids.contains(&a.id))
+                        {
                             a.status = "failed".into();
                             a.error = Some("A dependency did not complete".into());
                         }
@@ -770,11 +1095,16 @@ impl TeamStore {
                 return Ok(());
             }
             let mut running = tokio::task::JoinSet::new();
+            runs += ready.len();
+            let deadline = team
+                .execution_budget
+                .as_ref()
+                .map(|b| started + std::time::Duration::from_secs(b.max_runtime_secs));
             for agent in ready {
                 let store = self.clone();
                 let runtime = runtime.clone();
                 let id = id.to_owned();
-                running.spawn(async move { store.run_agent(runtime, &id, agent).await });
+                running.spawn(async move { store.run_agent(runtime, &id, agent, deadline).await });
             }
             let mut first_error = None;
             while let Some(result) = running.join_next().await {
@@ -805,6 +1135,7 @@ impl TeamStore {
         runtime: Arc<Runtime>,
         id: &str,
         agent: TeamAgent,
+        deadline: Option<std::time::Instant>,
     ) -> Result<()> {
         let team = self.mutate(id, |t| {
             let current = t
@@ -819,7 +1150,14 @@ impl TeamStore {
         let outcome: Result<()> = async {
             let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
             let profile = kei.profile(&agent.profile_id)?;
-            let runner = AgentLoop::with_profile(runtime.clone(), profile)?;
+            let mut runner = AgentLoop::with_profile(runtime.clone(), profile)?;
+            if let Some(budget) = &team.execution_budget {
+                runner = runner.with_execution_limits(
+                    budget.max_steps_per_agent,
+                    budget.max_tokens_per_step,
+                    budget.max_tool_calls_per_agent,
+                );
+            }
             let session = runtime.sessions.get_or_load(&agent.session_id)?;
             let prompt = agent_prompt(&team, &agent);
             let (tx, mut rx) = mpsc::channel(256);
@@ -841,10 +1179,15 @@ impl TeamStore {
                 _ => {}
             }
             let mut output = String::new();
+            let mut clock = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 let event = tokio::select! {
                     event = rx.recv() => match event { Some(value) => value, None => break },
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    _ = clock.tick() => {
+                        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                            error = Some("Admin execution time budget exhausted".into());
+                            handle.cancel();
+                        }
                         match self.read(id) {
                             Ok(team) if team.status == "cancelling" => handle.cancel(),
                             Err(failure) => { error = Some(failure.to_string()); handle.cancel(); },
@@ -1033,10 +1376,22 @@ fn agent_prompt(team: &Team, agent: &TeamAgent) -> String {
                     .as_deref()
                     .is_none_or(|target| target == agent.id)
         })
-        .map(|m| m.text.as_str())
+        .map(|m| {
+            format!(
+                "{}: {}",
+                if m.source.as_deref() == Some("admin") {
+                    "ARIS admin assignment"
+                } else if m.source.is_none() && team.admin.is_some() {
+                    "Task instruction (source not recorded)"
+                } else {
+                    "User"
+                },
+                m.text
+            )
+        })
         .collect();
     messages.reverse();
-    format!("You are {} in ARIS, a general-purpose multi-agent harness. Role: {}.\nShared goal: {}\nYour assignment: {}\nYour browser identity is your session; use your own browser tools.\nShared artifact files: {}\nYour owned output files: {}\nRead relevant existing files before editing. Keep edits within your assigned output files; other agents can be working concurrently. Use shared files directly, preserve previous contributions, and report exact delivered paths and unfinished work. If no output files were assigned, return your findings in the response.\nDependency results:\n{}\nExplicit handoffs:\n{}\nUser follow-up instructions, oldest to newest (latest takes precedence):\n{}", agent.name,agent.role,team.goal,agent.prompt,team.files.join(", "),agent.files.join(", "),inputs.join("\n\n"),handoffs.join("\n\n"),messages.join("\n\n"))
+    format!("You are {} in ARIS, a general-purpose multi-agent harness. Role: {}.\nShared goal: {}\nYour assignment: {}\nYour browser identity is your session; use your own browser tools.\nShared artifact files: {}\nYour owned output files: {}\nRead relevant existing files before editing. Keep edits within your assigned output files; other agents can be working concurrently. Use shared files directly, preserve previous contributions, and report exact delivered paths and unfinished work. If no output files were assigned, return your findings in the response.\nDependency results:\n{}\nExplicit handoffs:\n{}\nConversation instructions with their actual source, oldest to newest (latest takes precedence):\n{}", agent.name,agent.role,team.goal,agent.prompt,team.files.join(", "),agent.files.join(", "),inputs.join("\n\n"),handoffs.join("\n\n"),messages.join("\n\n"))
 }
 
 pub(crate) fn validate_graph(agents: &[TeamAgent]) -> Result<()> {
@@ -1083,10 +1438,18 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
     let mut files = HashSet::new();
     let mut ready = vec![];
     for agent in &team.agents {
-        if ready.len() >= 8 {
+        if ready.len()
+            >= team
+                .execution_budget
+                .as_ref()
+                .map_or(8, |b| b.max_parallel.min(8))
+        {
             break;
         }
-        if agent.status != "pending" || !agent.depends_on.iter().all(|d| complete.contains(d)) {
+        if !selected_for_run(team, agent)
+            || agent.status != "pending"
+            || !agent.depends_on.iter().all(|d| complete.contains(d))
+        {
             continue;
         }
         let claims: Vec<_> = agent.files.iter().map(|p| p.to_lowercase()).collect();
@@ -1097,6 +1460,12 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
         ready.push(agent.clone());
     }
     ready
+}
+
+fn selected_for_run(team: &Team, agent: &TeamAgent) -> bool {
+    team.execution_budget
+        .as_ref()
+        .is_none_or(|b| b.agent_ids.contains(&agent.id))
 }
 
 #[cfg(test)]
@@ -1118,6 +1487,24 @@ mod tests {
             checkpoints: vec![],
             events: vec![],
             created_at: now(),
+            admin: None,
+            execution_budget: None,
+        }
+    }
+    #[test]
+    fn admin_message_source_preserves_legacy_unknown_and_explicit_authors() {
+        let old: TeamMessage = serde_json::from_value(serde_json::json!({
+            "id":"message","agent_id":"a","text":"existing instruction","at":"2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(old.source.is_none());
+        assert!(serde_json::to_value(&old).unwrap().get("source").is_none());
+        for source in ["user", "admin"] {
+            let mut message = old.clone();
+            message.source = Some(source.into());
+            let restored: TeamMessage =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            assert_eq!(restored.source.as_deref(), Some(source));
         }
     }
     #[test]

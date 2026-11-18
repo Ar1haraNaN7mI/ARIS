@@ -17,9 +17,11 @@ pub mod kei;
 pub mod learn;
 pub mod learn_tools;
 pub mod mcp;
+pub mod media;
 pub mod model_profile;
 pub mod permissions;
 pub mod policy;
+mod report_calculate;
 pub mod scheduler;
 mod session;
 pub mod settings;
@@ -72,7 +74,7 @@ pub use settings::{
 pub use startup_profile::{
     load_startup_profile, save_startup_profile, update_startup_profile, StartupProfile, VisualStyle,
 };
-pub use system_prompt::{SystemPromptBuilder, SECURITY_RESEARCH_PROMPT};
+pub use system_prompt::{SystemPromptBuilder, SECURITY_RESEARCH_PROMPT, WRITING_GUIDANCE};
 pub use task::{
     EventStore, JsonlEventStore, TaskStore, TaskStoreSnapshot, TASK_SNAPSHOT_SCHEMA_VERSION,
 };
@@ -151,6 +153,8 @@ impl Runtime {
         std::fs::create_dir_all(&workspace_outer)?;
         std::fs::create_dir_all(workspace_outer.join("skills"))?;
         std::fs::create_dir_all(workspace_outer.join("plugins"))?;
+
+        media::register(&tools, &config, &workspace_root, &outer_home)?;
 
         let pipeline = Arc::new(DefaultPipeline::new(tools.clone()));
         let sessions = Arc::new(SessionStore::with_dir(outer_home.join("sessions")));

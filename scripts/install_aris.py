@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and install ARIS plus its web interface, independent of the caller's cwd.
 
-Requirements: Python 3.9+, Node.js 22.12+, npm, and the Rust/Cargo toolchain.
+Full installation requires Python 3.11+, Node.js 22.12+, npm, and Rust/Cargo.
 
 Usage (the script path may be absolute and the current directory may be anything):
     python scripts/install_aris.py
@@ -76,11 +76,13 @@ def build_steps(repo: Path, root: Path, npm: str, cargo: str, debug: bool = Fals
     ]
 
 
-def validate_destination(root: Path) -> Path:
+def validate_destination(root: Path, name: str = "web") -> Path:
     """Resolve the exact owned asset directory before creating or replacing it."""
+    if name not in {"web", "bundled-skills"}:
+        raise ValueError(f"Unknown asset directory: {name}")
     root = root.resolve()
     parent = root / "share" / "aris"
-    for part in (root / "share", parent, parent / "web"):
+    for part in (root / "share", parent, parent / name):
         if part.is_symlink():
             raise RuntimeError(f"Refusing to replace an install path containing a symlink: {part}")
         resolved = part.resolve()
@@ -90,7 +92,7 @@ def validate_destination(root: Path) -> Path:
             raise RuntimeError(f"Install asset path escapes its root: {resolved}") from error
         if not relative.parts:
             raise RuntimeError(f"Invalid install asset path: {resolved}")
-    target = parent / "web"
+    target = parent / name
     if target.exists() and not target.is_dir():
         raise RuntimeError(f"The web install target is not a directory: {target}")
     return target
@@ -109,22 +111,30 @@ def remove_owned_tree(path: Path, parent: Path, prefix: str) -> None:
 
 
 def publish_web_assets(source: Path, root: Path) -> Path:
+    return publish_assets(source, root, "web", "index.html")
+
+
+def publish_bundled_skills(source: Path, root: Path) -> Path:
+    return publish_assets(source, root, "bundled-skills", "anti-defensive-writing/SKILL.md")
+
+
+def publish_assets(source: Path, root: Path, name: str, marker: str) -> Path:
     """Stage first, swap the complete directory, and restore on a failed swap."""
-    if not source.is_dir() or not (source / "index.html").is_file():
-        raise RuntimeError(f"Built web interface is missing index.html: {source}")
-    target = validate_destination(root)
+    if not source.is_dir() or not (source / marker).is_file():
+        raise RuntimeError(f"{name} is missing {marker}: {source}")
+    target = validate_destination(root, name)
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     # Recheck after creation before any directory move or recursive removal.
-    target = validate_destination(root)
+    target = validate_destination(root, name)
     stage = Path(tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=parent))
     backup = parent / (BACKUP_PREFIX + uuid.uuid4().hex)
     moved_old = False
     try:
         shutil.copytree(source, stage, dirs_exist_ok=True)
-        if not (stage / "index.html").is_file():
-            raise RuntimeError("The staged web interface is incomplete")
-        validate_destination(root)
+        if not (stage / marker).is_file():
+            raise RuntimeError(f"The staged {name} is incomplete")
+        validate_destination(root, name)
         if target.exists():
             target.rename(backup)
             moved_old = True
@@ -247,10 +257,12 @@ $shortcut.Save()
 
 
 def install_tool_runtimes(root: Path, npm: str) -> None:
-    """Install reproducible browser/crawler dependencies outside the checkout."""
+    """Install reproducible browser/crawler/media dependencies outside the checkout."""
+    if sys.version_info < (3, 11):
+        raise RuntimeError("The pinned media runtime requires Python 3.11 or newer; rerun this installer with a supported Python")
     destination = root.resolve() / "share" / "aris"
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("browser-runtime", "scrapling"):
+    for name in ("browser-runtime", "scrapling", "media"):
         target = destination / name
         if target.is_symlink() or not target.resolve().is_relative_to(root.resolve()):
             raise RuntimeError(f"Invalid runtime install path: {target}")
@@ -266,13 +278,23 @@ def install_tool_runtimes(root: Path, npm: str) -> None:
     subprocess.run([sys.executable, "-m", "venv", str(crawler / ".venv")], check=True)
     python = crawler / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     subprocess.run([str(python), "-m", "pip", "install", "-r", str(crawler / "requirements.txt")], check=True)
+    media = destination / "media"
+    subprocess.run([sys.executable, "-m", "venv", str(media / ".venv")], check=True)
+    media_python = media / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run([str(media_python), "-m", "pip", "install", "-r", str(media / "requirements.txt")], check=True)
+    missing = [name for name in ("ffmpeg", "ffprobe")
+               if not shutil.which(os.environ.get("ARIS_" + name.upper(), name))]
+    if missing:
+        print("Video editing needs local " + ", ".join(missing) +
+              ". Install FFmpeg from https://ffmpeg.org/download.html and expose both programs on PATH. "
+              "Offline posters and configured image generation remain available.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", help="Install root; defaults to CARGO_HOME or ~/.cargo")
     parser.add_argument("--debug", action="store_true", help="Install a development build instead of the default release build")
-    parser.add_argument("--skip-tool-runtimes", action="store_true", help="Install only CLI and web; configure browser/crawler runtimes separately")
+    parser.add_argument("--skip-tool-runtimes", action="store_true", help="Install only CLI and web; configure browser/crawler/media runtimes separately")
     parser.add_argument("--desktop-shortcut", action="store_true", help="Create a Windows desktop shortcut for the native app")
     parser.add_argument("--desktop-workspace", type=Path, help="Shortcut working directory (default: your user home)")
     arguments = parser.parse_args(argv)
@@ -284,11 +306,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"\n{label}\n  {subprocess.list2cmdline(command) if os.name == 'nt' else shlex.join(command)}", flush=True)
             subprocess.run(command, cwd=cwd, check=True)
         assets = publish_web_assets(REPOSITORY / "web" / "dist", root)
+        skills = publish_bundled_skills(REPOSITORY / "outer" / "bundled-skills", root)
         if not arguments.skip_tool_runtimes:
             install_tool_runtimes(root, npm)
         bin_dir = root / "bin"
         print(f"\nInstalled binary: {bin_dir / ('aris.exe' if os.name == 'nt' else 'aris')}")
         print(f"Installed web:    {assets}")
+        print(f"Installed skills: {skills}")
         print(f"Installed desktop: {bin_dir / ('aris-desktop.exe' if os.name == 'nt' else 'aris-desktop')}")
         if os.name == "nt":
             if ensure_windows_path(bin_dir):

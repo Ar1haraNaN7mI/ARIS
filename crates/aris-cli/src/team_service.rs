@@ -44,6 +44,9 @@ async fn handle(runtime: Arc<Runtime>, method: &str, params: &Value) -> Result<V
         "teams/list" => json!({"teams":runtime.teams.list()?}),
         "teams/get" => json!({"team":runtime.teams.get(string(params,"id")?)?}),
         "teams/plan" => json!({"team":crate::team_planner::plan(&runtime,params).await?}),
+        "teams/admin" => {
+            json!({"accepted":true,"team":crate::team_planner::admin(runtime.clone(),params)?})
+        }
         "teams/model" => json!({"team":runtime.teams.set_model(
             &runtime, string(params,"id")?, string(params,"agent_id")?, string(params,"profile_id")?
         )?}),

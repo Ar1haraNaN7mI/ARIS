@@ -65,6 +65,9 @@ class InstallRootTests(unittest.TestCase):
             dist = repo / "web" / "dist"
             dist.mkdir(parents=True)
             (dist / "index.html").write_text("built interface", encoding="utf-8")
+            writing = repo / "outer/bundled-skills/anti-defensive-writing/SKILL.md"
+            writing.parent.mkdir(parents=True)
+            writing.write_text("report writing", encoding="utf-8")
             root = base / "install"
             with mock.patch.object(installer, "REPOSITORY", repo), \
                  mock.patch.object(installer, "find_program", side_effect=lambda name: name), \
@@ -74,6 +77,7 @@ class InstallRootTests(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 result = installer.main(["--root", str(root), "--debug"])
             self.assertEqual(result, 0)
+            self.assertEqual((root / "share/aris/bundled-skills/anti-defensive-writing/SKILL.md").read_text(encoding="utf-8"), "report writing")
             runtimes.assert_called_once_with(root, "npm")
             self.assertEqual(Path.cwd(), original_cwd)
             self.assertEqual([call.kwargs["cwd"] for call in run.call_args_list], [repo / "web", repo / "web", repo])
@@ -91,6 +95,20 @@ class AssetPublicationTests(unittest.TestCase):
         (self.source / "index.html").write_text("new", encoding="utf-8")
         self.root = self.base / "install"
         self.target = self.root / "share" / "aris" / "web"
+
+    def test_media_runtime_installs_its_own_pinned_environment(self):
+        with mock.patch.object(installer.subprocess, "run") as run, \
+             mock.patch.object(installer.shutil, "which", return_value=None), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            installer.install_tool_runtimes(self.root, "npm")
+        media = self.root / "share/aris/media"
+        self.assertTrue((media / "media.py").is_file())
+        self.assertIn("Pillow==", (media / "requirements.txt").read_text(encoding="utf-8"))
+        python = media / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        self.assertTrue(any(call.args[0] == [str(python), "-m", "pip", "install", "-r", str(media / "requirements.txt")]
+                            for call in run.call_args_list))
+        self.assertIn("Video editing needs local ffmpeg, ffprobe", output.getvalue())
+        self.assertTrue(all(call.kwargs.get("check") for call in run.call_args_list))
 
     def test_replacement_removes_stale_assets_and_preserves_adjacent_data(self):
         self.target.mkdir(parents=True)

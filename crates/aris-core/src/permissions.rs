@@ -52,6 +52,7 @@ impl PermissionMode {
                 matches!(
                     n.as_str(),
                     "read_file"
+                        | "report_calculate"
                         | "list_dir"
                         | "glob"
                         | "grep"

@@ -1,4 +1,4 @@
-import { useEffect, useRef, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, type CSSProperties } from "react";
 import Markdown from "react-markdown";
 import { FileTextIcon, PersonIcon } from "@radix-ui/react-icons";
 import { sessionTimeline } from "./AgentTranscript";
@@ -9,12 +9,13 @@ import { formatTime } from "./TeamConversation";
 import { RunningBorder } from "./RunningBorder";
 import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
 import type { SessionEvent, SessionResult } from "./types";
+import { conversationAgents, messageSource } from "./teamConversationModel";
 
-type Entry = { id: string; at: string; user?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; note?: string; partial?: boolean };
+type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; note?: string; partial?: boolean };
 export function conversationEntries(team: Team, sessions: Record<string, SessionResult>, agentId?: string, profiles: ModelProfile[] = []): Entry[] {
   const entries: Entry[] = [{ id: "goal", at: team.created_at, user: team.goal }];
-  for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, queued: message.queued });
-  for (const agent of team.agents.filter((item) => !agentId || item.id === agentId)) {
+  for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, source: messageSource(team, message), recipient: team.agents.find((agent) => agent.id === message.agent_id)?.name, queued: message.queued });
+  for (const agent of conversationAgents(team).filter((item) => !agentId || item.id === agentId)) {
     const events = sessions[agent.id]?.session.events || [];
     const identities = sessionModelIdentities(events, profiles);
     for (const item of sessionTimeline(events)) {
@@ -40,7 +41,7 @@ export function conversationEntries(team: Team, sessions: Record<string, Session
   }
   return entries.sort((a, b) => a.at.localeCompare(b.at));
 }
-function Body({ text }: { text: string }) { return <div className="message-body"><Markdown components={{ a: (props) => <a {...props} target="_blank" rel="noreferrer noopener" /> }}>{text}</Markdown></div>; }
+const Body = memo(function Body({ text }: { text: string }) { return <div className="message-body"><Markdown components={{ a: (props) => <a {...props} target="_blank" rel="noreferrer noopener" /> }}>{text}</Markdown></div>; });
 function pretty(value: unknown) { if (typeof value !== "string") return JSON.stringify(value, null, 2) || ""; try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; } }
 function writtenFile(event?: SessionEvent) {
   if (!event || !/(write|save|edit|patch)/i.test(event.name || "")) return;
@@ -51,7 +52,8 @@ function writtenFile(event?: SessionEvent) {
   return typeof record.path === "string" ? record.path : typeof record.file_path === "string" ? record.file_path : undefined;
 }
 export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }: { team: Team; sessions: Record<string, SessionResult>; profiles: ModelProfile[]; agentId?: string; onSelectAgent: (id: string) => void }) {
-  const entries = conversationEntries(team, sessions, agentId, profiles);
+  const entries = useMemo(() => conversationEntries(team, sessions, agentId, profiles), [team, sessions, agentId, profiles]);
+  const activeAgents = conversationAgents(team).filter((agent) => agent.status === "running" && (!agentId || agent.id === agentId));
   const scroll = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
   useEffect(() => { nearBottom.current = true; }, [team.id, agentId]);
@@ -61,6 +63,7 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
     const agent = entry.agent;
     const color = entry.identity?.family ? modelColors[entry.identity.family] : "#8ba1ad";
     const attrs = agent ? { "data-anchor-key": `message:${team.id}:${agent.id}:${entry.event?.id || entry.id}`, "data-process-team": team.id, "data-process-agent": agent.id, "data-process-event": entry.event?.id } : {};
+    if (entry.user && entry.source && entry.source !== "user") return <details className="lp-note lp-dispatch-note" key={entry.id}><summary><span>{entry.source === "admin" ? "ARIS · 分工安排" : "任务指令"}{entry.recipient && ` · ${entry.recipient}`}</span><time>{formatTime(entry.at)}</time></summary><pre>{entry.user}</pre></details>;
     if (entry.user) return <article className="lp-user-message" key={entry.id}><div className="lp-message-who"><PersonIcon /><span>你</span><time>{formatTime(entry.at)}</time>{entry.queued && <small>等待下一轮</small>}</div><div className="lp-user-bubble">{entry.user}</div></article>;
     if (entry.tool) {
       const { event, result } = entry.tool;
@@ -71,5 +74,5 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
     }
     if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{agent?.name} · {agent?.error === entry.note ? "执行失败" : "运行记录"}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
     return <article className={`lp-assistant-message ${entry.partial ? "running" : ""}`} key={entry.id} {...attrs} style={{ "--model-color": color, "--light-color": color } as CSSProperties}>{entry.partial && <RunningBorder />}<div className="lp-message-who"><AgentGlyph family={entry.identity?.family || "unknown"} /><button title={entry.identity?.modelId || "历史模型未记录"} onClick={() => agent && onSelectAgent(agent.id)}>{agent?.name}</button>{entry.identity?.modelId && <small className="lp-message-model">{entry.identity.modelId}</small>}<time>{formatTime(entry.at)}</time>{entry.partial && <span className="lp-writing">正在回复</span>}</div>{entry.event?.reasoning && <details className="lp-reasoning"><summary>思考过程</summary><pre>{entry.event.reasoning}</pre></details>}{entry.event?.text && <Body text={entry.event.text} />}</article>;
-  })}{team.agents.some((agent) => agent.status === "running" && (!agentId || agent.id === agentId)) && <div className="lp-active-line"><span />{team.agents.filter((agent) => agent.status === "running" && (!agentId || agent.id === agentId)).map((agent) => agent.name).join("、")} 正在执行</div>}</div></div>;
+  })}{activeAgents.length > 0 && <div className="lp-active-line"><span />{activeAgents.map((agent) => agent.name).join("、")} {team.status === "planning" ? "正在处理" : "正在执行"}</div>}</div></div>;
 }

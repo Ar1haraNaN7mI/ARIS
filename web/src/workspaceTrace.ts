@@ -1,4 +1,5 @@
 import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
+import { conversationAgents, progressAgents } from "./teamConversationModel";
 import type { SessionEvent, SessionResult } from "./types";
 import { sessionModelIdentities, type SessionModelIdentity } from "./sessionModelIdentity";
 
@@ -18,7 +19,7 @@ export type TraceLane = {
 // Same authored lane palette as Lancer. It identifies task lines, not success.
 const LANE_COLORS = ["#3B82F6", "#8B5CF6", "#10B981", "#DB2777", "#0891b2", "#b58430"];
 export const traceLabels: Record<TraceKind, string> = {
-  start: "开始", message: "用户输入", reply: "回复", tool: "工具调用", artifact: "文件写入",
+  start: "开始", message: "消息", reply: "回复", tool: "工具调用", artifact: "文件写入",
   checkpoint: "检查点", merge: "依赖汇合", wait: "等待确认", error: "错误", complete: "阶段完成",
   cancelled: "已停止", model: "模型切换", note: "运行记录",
 };
@@ -87,7 +88,7 @@ function sessionNodes(team: Team, agent: TeamAgent, events: SessionEvent[], prof
       identity: identities.get(event.id),
       label: kind === "message" ? compact(shortUserInput(team, agent.id, event.at)) : kind === "reply" ? compact(event.text || "模型回复") : kind === "tool" ? toolLabel(event, event.ok) : compact(event.text || "运行记录"),
       detail: event.text || event.name || "", arguments: event.arguments, result: event.content, ok: event.ok,
-      running: event.type === "tool_call" && agent.status === "running" && ["running", "cancelling"].includes(team.status),
+      running: event.type === "tool_call" && agent.status === "running" && ["planning", "running", "cancelling"].includes(team.status),
     };
     nodes.push(node);
     if (event.type === "tool_call" && event.call_id) pending.set(event.call_id, node);
@@ -102,6 +103,11 @@ function teamNode(team: Team, event: Team["events"][number], index: number): Tra
   switch (event.kind) {
     case "created": kind = "start"; label = "工作区已创建"; break;
     case "started": kind = "start"; label = "开始执行"; break;
+    case "admin_started": kind = "start"; label = "ARIS · 正在处理"; break;
+    case "admin_answered": kind = "complete"; label = "ARIS · 已回复"; break;
+    case "admin_delegated": kind = "merge"; label = "ARIS · 已安排协作"; break;
+    case "admin_failed": kind = "error"; label = "ARIS · 未完成"; break;
+    case "admin_cancelled": kind = "cancelled"; label = "ARIS · 已停止"; break;
     case "agent_started": kind = agent && agent.depends_on.length > 1 ? "merge" : "start"; label = agent ? `${agent.name} · 开始` : event.message; break;
     case "agent_finished":
       kind = /:\s*failed$/.test(event.message) ? "error" : /:\s*cancelled$/.test(event.message) ? "cancelled" : /:\s*completed$/.test(event.message) ? "complete" : "note";
@@ -126,8 +132,10 @@ function teamNode(team: Team, event: Team["events"][number], index: number): Tra
 export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = [], activeTeamId?: string, sessions: Record<string, SessionResult> = {}): TraceLane[] {
   const order = [...teams].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
   return teams.map((team) => {
+    const agents = conversationAgents(team);
+    const workers = progressAgents(team);
     const actualSessions = new Map<string, SessionResult>();
-    if (team.id === activeTeamId) for (const agent of team.agents) {
+    if (team.id === activeTeamId) for (const agent of agents) {
       const session = sessions[agent.id];
       if (session && agent.session_id && session.session.id === agent.session_id) actualSessions.set(agent.id, session);
     }
@@ -137,7 +145,7 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       if (event.agent_id && actualSessions.has(event.agent_id) && ["tool", "tool_finished"].includes(event.kind)) return [];
       return [teamNode(team, event, index)];
     });
-    for (const agent of team.agents) {
+    for (const agent of agents) {
       const session = actualSessions.get(agent.id);
       if (session) nodes.push(...sessionNodes(team, agent, session.session.events, profiles));
     }
@@ -148,7 +156,7 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
         kind: "checkpoint", label: checkpointLabel(checkpoint.label), detail: checkpoint.files.map((file) => `${file.path} · ${file.exists ? `${file.size} bytes` : "未创建"}`).join("\n"), source: "checkpoint", parentIds: [], branch: 0, y: 0 });
     }
     nodes.sort((a, b) => time(a.at) - time(b.at));
-    const slots = branchSlots(team.agents);
+    const slots = branchSlots(agents);
     const latest = new Map<string, TraceNode>();
     let trunk: TraceNode | undefined;
     let cursor = 24;
@@ -159,7 +167,7 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       if (node.agentId) {
         const previous = latest.get(node.agentId);
         if (previous) node.parentIds.push(previous.id);
-        const agent = team.agents.find((value) => value.id === node.agentId);
+        const agent = agents.find((value) => value.id === node.agentId);
         if (!previous || (node.source === "team" && ["start", "merge"].includes(node.kind))) {
           for (const parentId of agent?.depends_on || []) { const parent = latest.get(parentId); if (parent && !node.parentIds.includes(parent.id)) node.parentIds.push(parent.id); }
           if (!node.parentIds.length && trunk) node.parentIds.push(trunk.id);
@@ -171,12 +179,12 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
         trunk = node;
       }
     }
-    const currentAgent = team.agents.find((agent) => agent.status === "running") || [...team.agents].reverse().find((agent) => agent.status !== "pending") || team.agents[0];
+    const currentAgent = agents.find((agent) => agent.status === "running") || [...agents].reverse().find((agent) => agent.status !== "pending") || agents[0];
     const profile = profiles.find((value) => value.id === currentAgent?.profile_id);
     return { team, color: LANE_COLORS[order.findIndex((value) => value.id === team.id) % LANE_COLORS.length], nodes,
       width: Math.max(112, 112 + Math.max(0, ...slots.values()) * 20), height: Math.max(280, cursor + 72), currentAgent,
       model: profile?.model || profile?.name || currentAgent?.profile_id || "—",
-      completed: team.agents.filter((agent) => agent.status === "completed").length, total: team.agents.length };
+      completed: workers.filter((agent) => agent.status === "completed").length, total: workers.length };
   });
 }
 

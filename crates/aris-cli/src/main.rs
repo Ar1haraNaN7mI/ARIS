@@ -389,6 +389,19 @@ enum Commands {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TeamCmd {
+    /// Ask the admin to answer or orchestrate work, then wait for the result
+    Admin {
+        message: String,
+        /// Continue an existing team, preserving its configured roles
+        #[arg(long)]
+        id: Option<String>,
+        /// Pin the admin to a configured KEI model profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Use only the roles already configured for this team
+        #[arg(long, requires = "id")]
+        existing_roles_only: bool,
+    },
     /// Plan a team from a natural-language goal using a configured KEI model
     Plan {
         goal: String,
@@ -2512,6 +2525,16 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
     use anyhow::Context;
     use serde_json::json;
     let (method, params, wait) = match command {
+        TeamCmd::Admin {
+            message,
+            id,
+            profile,
+            existing_roles_only,
+        } => (
+            "teams/admin",
+            json!({"message":message,"id":id,"profile_id":profile,"allow_new_roles":!existing_roles_only}),
+            true,
+        ),
         TeamCmd::Plan { goal, profile, run } => {
             ("teams/plan", json!({"goal":goal,"profile_id":profile}), run)
         }
@@ -2574,11 +2597,17 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
             );
         }
         event_cursor = team.events.len();
-        if !matches!(team.status.as_str(), "running" | "cancelling") {
+        if !matches!(team.status.as_str(), "planning" | "running" | "cancelling") {
             runtime.computer.shutdown().await;
             println!("{}", serde_json::to_string_pretty(&json!({"team":team}))?);
             anyhow::ensure!(
-                team.status == "completed",
+                team.status == "completed"
+                    || (method == "teams/admin"
+                        && team.status == "idle"
+                        && team
+                            .admin
+                            .as_ref()
+                            .is_some_and(|admin| admin.phase == "answered")),
                 "team finished with status {}",
                 team.status
             );

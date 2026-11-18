@@ -7,7 +7,7 @@
 ## 工作方式
 
 - **自由组队**：1–32 个智能体；角色、任务、固定模型档案、依赖与交付文件均可编辑，每波最多 8 个并行。
-- **对话工作台**：输入目标，由已配置模型规划 2–8 个协作角色后执行；按任务分组的子会话、顶部协作顺序和右侧工作树同时可见。直接与子智能体续聊，运行中的补充消息会排队，在当前执行阶段结束后消费，保留原会话。
+- **对话工作台**支持从空白会话直接提问。管理员可以当场回答、将任务派给一位执行者，或拆分成并行泳道。子会话、顶部分工和右侧工作树同步更新。点名某位角色续聊时，它沿用自己的会话和模型。
 - **模板**：内置调研、竞品、内容、数据、运营、工程实现、审查、文档、网页自动化和故障排查 10 类。可以修改、另存、自建和删除个人模板。
 - **模型隔离**：每次运行固定客户端与提示词副本。不同智能体可分别使用 DeepSeek、Grok、Gemini、GPT/Codex、GLM、Kimi 家族的模型；真实可用范围由 KEI 账户决定。
 - **自动衔接**：独立会话共用工作区文件，后续阶段收到依赖结果后自动继续，无需手动切换执行者。命令行仍提供显式交接与下游重跑能力。
@@ -19,7 +19,7 @@
 
 ## 安装
 
-需要 Rust stable、Python 3.10+、Node.js 22.12+、npm。建议使用仓库锁定依赖。
+完整安装需要 Rust stable、Python 3.11+、Node.js 22.12+ 和 npm。剪辑视频还需要 FFmpeg 与 ffprobe。
 
 ```powershell
 python scripts/install_aris.py
@@ -28,7 +28,7 @@ aris web
 aris app
 ```
 
-安装器将 CLI、网页、浏览器运行时和 Scrapling 环境安装至 `~/.cargo`，可从任意工作目录使用。`--debug` 使用开发构建；`--skip-tool-runtimes` 只安装 CLI 和网页。动态 Scrapling 抓取还需要其浏览器依赖，见 [Scrapling 适配器](integrations/scrapling/README.md)。
+安装器将 CLI、桌面程序、网页、内置技能和工具运行时安装至 `~/.cargo`，可从任意工作目录使用。`--debug` 使用开发构建。`--skip-tool-runtimes` 保留程序、网页和技能，跳过浏览器、Scrapling 和媒体依赖。动态抓取需要额外的浏览器依赖。[Scrapling 适配器](integrations/scrapling/README.md)
 
 开发运行：
 
@@ -63,9 +63,16 @@ aris models
 
 ## CLI 工作流
 
+工作台的新对话可以直接输入目标。管理员先判断当前信息是否足以回答。需要操作文件或生成媒体时，它可以派给一位执行者。遇到能独立开展的研究和核算，它会并行派工，再把结果交给负责汇总的角色。自建团队保留原成员、会话和固定模型。
+
+管理员优先使用已配置的 `gpt-6.2-astra`。也可通过 `--profile` 指定其他已导入的模型档案。推理档位沿用该档案和协议的显式设置。首次自动分工最多新增四位执行者，已有成员时每次最多补两位，自动扩充后的团队最多八位执行者。每轮最多运行六位，同时最多三位。前置工作和共享输出文件会影响实际并行度。
+
 ```powershell
 aris                         # 终端交互
 aris exec "总结当前目录材料"   # 单次任务
+aris team admin "解释七日激活率的统计口径"
+aris team admin "两人分别核算成本与转化，再合成决策简报"
+aris team admin "更新上一轮的成本估算" --id <team-id> --existing-roles-only
 aris team plan "调研目标用户，比较方案并形成报告" --run
 aris team create workflow.json
 aris team list
@@ -77,6 +84,10 @@ aris team handoff <team-id> researcher writer "根据研究结果完善交付"
 aris team message <team-id> "补充成本与限制"         # 新一轮团队协作
 aris team message <team-id> "复核数据单位" --agent researcher
 ```
+
+在对话里也可以直接要求剪辑素材、制作中文海报或生成插画。可用格式、图像模型配置和命令示例见[媒体工具说明](docs/media-tools.md)。
+
+普通会话、管理员和执行者都使用内置写作指导。报告可调用 `report_calculate` 批量复核加权分数、比率和预算。安装包附带 Anti-Defensive Writing 的中英文原文和 MIT 许可。[技能及来源](outer/bundled-skills/anti-defensive-writing/SKILL.md)
 
 可编辑的工作流文件示例：
 

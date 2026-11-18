@@ -164,6 +164,19 @@ impl SkillCatalog {
         if let Some(home) = dirs::home_dir() {
             roots.push((home.join(".agents/skills"), SkillSource::OpenaiUser));
         }
+        // Installed ARIS runs from any workspace. Local developer builds can
+        // resolve the same distribution from the checkout without installing.
+        let installed = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.parent()?.join("share/aris/bundled-skills")));
+        let distribution = installed.filter(|path| path.is_dir()).unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../outer/bundled-skills")
+        });
+        if distribution.is_dir()
+            && bundled_root.and_then(|p| p.canonicalize().ok()) != distribution.canonicalize().ok()
+        {
+            roots.push((distribution, SkillSource::Bundled));
+        }
         if let Some(bundled) = bundled_root {
             roots.push((bundled.to_path_buf(), SkillSource::Bundled));
         }

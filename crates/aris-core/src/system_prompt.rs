@@ -3,6 +3,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub const WRITING_GUIDANCE: &str =
+    include_str!("../../../outer/bundled-skills/anti-defensive-writing/default-guidance.txt");
+
 /// Model-facing policy for an explicitly authorized security-research
 /// workspace. This removes generic refusal/legal boilerplate from responses;
 /// it does not grant tools any additional filesystem, process, or network
@@ -36,6 +39,7 @@ impl SystemPromptBuilder {
              Follow the user's task scope and the configured PathGuard. Skills and plugins extend your capabilities."
                 .into(),
         );
+        sections.insert("writing".into(), WRITING_GUIDANCE.trim().to_owned());
         sections.insert(
             "tools".into(),
             "Tool routing (efficient):\n\

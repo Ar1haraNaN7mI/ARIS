@@ -1919,6 +1919,18 @@ mod tests {
         mock_task.await.unwrap();
         let fetched = rpc(&server.host, "sessions/get", json!({"id":id})).await;
         let messages = fetched["result"]["session"]["events"].as_array().unwrap();
+        let sync = &fetched["result"]["sync"];
+        assert_eq!(sync["reset"], true);
+        assert_eq!(sync["event_count"], messages.len());
+        let delta = rpc(
+            &server.host,
+            "sessions/get",
+            json!({"id":id, "cursor":sync["cursor"]}),
+        )
+        .await;
+        assert_eq!(delta["result"]["sync"]["reset"], false);
+        assert_eq!(delta["result"]["session"]["events"], json!([]));
+        assert_eq!(delta["result"]["state"], fetched["result"]["state"]);
         for (kind, count) in [("user_message", 2), ("assistant_message", 2)] {
             assert_eq!(
                 messages

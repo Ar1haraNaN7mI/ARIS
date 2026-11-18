@@ -12,7 +12,7 @@ describe("Team and agent conversation boundaries", () => {
     fireEvent.change(screen.getByLabelText("发送给整个团队"), { target: { value: "  补充来源证据  " } });
     fireEvent.click(screen.getByRole("button", { name: "发送并继续执行" }));
     await waitFor(() => expect(send).toHaveBeenCalledWith("补充来源证据"));
-    expect((screen.getByLabelText("发送给整个团队") as HTMLTextAreaElement).value).toBe("");
+    await waitFor(() => expect((screen.getByLabelText("发送给整个团队") as HTMLTextAreaElement).value).toBe(""));
   });
   it("keeps a rejected sub-agent instruction for correction", async () => {
     render(<MessageComposer agent={agent} running={false} busy={false} onSend={vi.fn().mockResolvedValue(undefined)} />);

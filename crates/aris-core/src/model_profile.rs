@@ -615,6 +615,57 @@ fn intent_bonus(query: &str, tool_name: &str) -> i32 {
     let matches = |terms: &[&str]| terms.iter().any(|term| query.contains(term));
     let tool_matches = |names: &[&str]| names.contains(&tool_name);
     if matches(&[
+        "剪辑",
+        "剪视频",
+        "剪片",
+        "拼接视频",
+        "视频",
+        "video",
+        "footage",
+        "clip",
+    ]) && tool_matches(&["video_edit", "media_probe", "media_status"])
+    {
+        return 18;
+    }
+    if matches(&["海报", "排版", "poster", "flyer"])
+        && tool_matches(&["poster_render", "media_status"])
+    {
+        return 18;
+    }
+    if matches(&[
+        "生图",
+        "生成图片",
+        "画一张",
+        "画个",
+        "插画",
+        "imagegen",
+        "generate an image",
+        "illustration",
+    ]) && tool_matches(&["image_generate", "media_status"])
+    {
+        return 16;
+    }
+    if tool_name == "report_calculate"
+        && matches(&[
+            "加权",
+            "评分",
+            "预算",
+            "比例",
+            "转化率",
+            "复算",
+            "算术",
+            "测算",
+            "获客成本",
+            "weighted",
+            "calculate",
+            "budget",
+            "conversion rate",
+            "arithmetic",
+        ])
+    {
+        return 15;
+    }
+    if matches(&[
         "电脑",
         "桌面",
         "窗口",

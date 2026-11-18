@@ -86,6 +86,22 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
+    fn id(&self) -> &str {
+        match self {
+            Self::TurnStart { id, .. }
+            | Self::TurnEnd { id, .. }
+            | Self::StepStart { id, .. }
+            | Self::StepEnd { id, .. }
+            | Self::UserMessage { id, .. }
+            | Self::AssistantMessage { id, .. }
+            | Self::AssistantChunk { id, .. }
+            | Self::ReasoningChunk { id, .. }
+            | Self::ToolCall { id, .. }
+            | Self::ToolResult { id, .. }
+            | Self::SystemNote { id, .. } => id,
+        }
+    }
+
     fn is_live_chunk(&self) -> bool {
         matches!(
             self,
@@ -141,6 +157,29 @@ impl Default for Session {
 }
 
 impl Session {
+    fn event_cursor(&self, count: usize) -> String {
+        let (first, last) = if count == 0 {
+            ("", "")
+        } else {
+            (self.events[0].id(), self.events[count - 1].id())
+        };
+        format!("{count}:{}:{first}:{last}", self.id)
+    }
+
+    /// Check both ends of the retained prefix so compaction and disk reloads
+    /// that discard live chunks invalidate a client's previous event cursor.
+    pub fn event_delta(&self, cursor: Option<&str>) -> (usize, bool, String) {
+        let offset = cursor.and_then(|value| {
+            let count = value.split_once(':')?.0.parse::<usize>().ok()?;
+            (count <= self.events.len() && self.event_cursor(count) == value).then_some(count)
+        });
+        (
+            offset.unwrap_or(0),
+            offset.is_none(),
+            self.event_cursor(self.events.len()),
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
@@ -858,6 +897,36 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_delta_syncs_appends_and_resets_after_compaction_or_session_switch() {
+        let mut session = Session::new();
+        let (offset, reset, empty) = session.event_delta(None);
+        assert_eq!((offset, reset), (0, true));
+        for i in 0..12 {
+            session.append(SessionEvent::SystemNote {
+                id: i.to_string(),
+                text: "x".repeat(4096),
+                at: Utc::now(),
+            });
+        }
+        let (offset, reset, before) = session.event_delta(Some(&empty));
+        assert_eq!((offset, reset), (0, false));
+        assert_eq!(
+            session.event_delta(Some(&before)),
+            (12, false, before.clone())
+        );
+        session.append(SessionEvent::SystemNote {
+            id: "more".into(),
+            text: "latest".into(),
+            at: Utc::now(),
+        });
+        assert_eq!(session.event_delta(Some(&before)).0, 12);
+        session.compact(8);
+        assert!(session.event_delta(Some(&before)).1);
+        assert!(Session::new().event_delta(Some(&empty)).1);
+        assert!(session.event_delta(Some("99999999999999999999:")).1);
+    }
 
     struct ManagementFixture(PathBuf);
 

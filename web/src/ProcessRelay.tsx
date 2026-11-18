@@ -3,6 +3,7 @@ import { AgentGlyph } from "./AgentGlyph";
 import { RunningBorder } from "./RunningBorder";
 import type { ModelFamily, ModelProfile, Team, TeamAgent } from "./teamTypes";
 import { statusLabels } from "./teamTypes";
+import { adminAgent, workerAgents } from "./teamConversationModel";
 
 export const modelColors: Record<ModelFamily, string> = { gpt: "#169785", gemini: "#7182d7", grok: "#516a7a", deepseek: "#4c89d8", glm: "#8b71bc", kimi: "#b38a32" };
 export function ModelGlyph({ family, className = "" }: { family?: ModelFamily; className?: string }) {
@@ -23,10 +24,15 @@ export function agentStages(agents: TeamAgent[]) {
   return Array.from(new Set(depths.values())).sort((a, b) => a - b).map((level) => agents.filter((agent) => depths.get(agent.id) === level));
 }
 
+export function relayStages(team: Team) {
+  const admin = adminAgent(team);
+  return admin ? [[admin], ...agentStages(workerAgents(team))] : agentStages(team.agents);
+}
+
 export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId, onSelect }: { teams: Team[]; profiles: ModelProfile[]; selectedTeamId?: string; selectedAgentId?: string; onSelect: (teamId: string, agentId?: string) => void }) {
   return <section className="lp-relay" aria-label="任务协作顺序">{teams.map((team, index) => <div className={`lp-relay-row ${team.id === selectedTeamId ? "selected" : ""}`} key={team.id}>
     <button className="lp-relay-label" title={team.name} onClick={() => onSelect(team.id)}><i style={{ background: ["#4c92d1", "#8976c4", "#38a38f", "#c29142"][index % 4] }} />{team.name}</button>
-    <div className="lp-relay-stages">{agentStages(team.agents).map((stage, stageIndex) => <span className="lp-relay-stage" key={stageIndex}>{stageIndex > 0 && <span className="lp-relay-arrow">→</span>}{stage.map((agent, agentIndex) => {
+    <div className="lp-relay-stages">{relayStages(team).map((stage, stageIndex) => <span className="lp-relay-stage" key={stageIndex}>{stageIndex > 0 && <span className="lp-relay-arrow">→</span>}{stage.map((agent, agentIndex) => {
       const profile = profiles.find((item) => item.id === agent.profile_id);
       return <span className="lp-relay-step" key={agent.id}>{agentIndex > 0 && <span className="lp-relay-parallel" title="并行">+</span>}<button className={`lp-model-chip ${agent.status} ${team.id === selectedTeamId && agent.id === selectedAgentId ? "selected" : ""}`} style={{ "--model-color": modelColors[profile?.family || "gpt"], "--light-color": modelColors[profile?.family || "gpt"] } as CSSProperties} title={`${agent.name} · ${profile?.model || agent.profile_id} · ${statusLabels[agent.status]}`} data-anchor-key={`chip:${team.id}:${agent.id}`} data-relay-team={team.id} data-relay-agent={agent.id} onClick={() => onSelect(team.id, agent.id)}>{agent.status === "running" && <RunningBorder />}<ModelGlyph family={profile?.family} /><span>{profile?.name || agent.profile_id}</span>{agent.status === "completed" && <small>✓</small>}{agent.status === "running" && <i className="lp-chip-live" />}{agent.status === "failed" && <small className="lp-failed">!</small>}</button></span>;
     })}</span>)}</div>

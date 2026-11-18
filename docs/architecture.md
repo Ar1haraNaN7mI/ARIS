@@ -12,7 +12,9 @@
 
 每个工作流持久化于工作区 `.aris/teams/<uuid>/team.json`，包含成员、依赖、固定模型档案、会话 ID、结果、交接、事件和快照索引。
 
-运行状态为 `idle → running → completed/failed/cancelled`。取消先持久化 `cancelling`，再通知运行中的智能体并等待工具停止。进程中断后恢复读取会识别失效的运行租约。任务图检查重复 ID、缺失依赖和环；每波最多 8 个无文件冲突的已就绪智能体。
+手动启动从 `idle` 进入 `running`。通过 `teams/admin` 发送消息时，工作台立即收到状态为 `planning` 的团队。管理员直接作答后，回答保存在同一个会话。需要派工时，服务持有同一把运行锁，将通过校验的依赖图交给执行器。团队的 `admin` 字段记录模型、会话、回答和阶段。自动派工每轮最多执行六个角色，最多三个并行。手动工作流每波最多八个。两种路径都要等待前置结果和文件租约。
+
+运行以 `completed`、`failed` 或 `cancelled` 收尾。取消先持久化 `cancelling`，再通知运行中的智能体并等待工具停止。进程中断后，恢复读取会识别失效的运行租约。
 
 每个工作流使用独占运行锁；状态读改写使用独立文件锁，避免跨进程取消被覆盖。声明的文件使用工作区级租约，阻止其他工作流同时修改或恢复相同文件。文件声明是编排约定，不能替代操作系统沙盒。
 
@@ -20,7 +22,7 @@
 
 ## RPC
 
-- `teams/list`, `teams/get`, `teams/create`, `teams/plan`, `teams/model`, `teams/run`, `teams/cancel`
+- `teams/list`, `teams/get`, `teams/create`, `teams/admin`, `teams/plan`, `teams/model`, `teams/run`, `teams/cancel`
 - `teams/message`, `teams/handoff`, `teams/checkpoint`, `teams/restore`
 - `templates/list`, `templates/save`, `templates/delete`
 - `kei/config`, `kei/update`, `kei/credential`, `kei/models`

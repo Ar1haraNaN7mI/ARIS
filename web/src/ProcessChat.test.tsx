@@ -54,4 +54,14 @@ describe("Process conversation uses real chronological records", () => {
     const partial = conversationEntries(team, sessions, undefined, [{ id: "gpt", name: "Updated", model: "gemini-changed", family: "gemini", protocol: "chat_completions" }]).find((entry) => entry.partial);
     expect(partial?.identity).toMatchObject({ modelId: "gpt-original", family: "gpt" });
   });
+  it("separates admin assignments and unknown legacy instructions from human messages", () => {
+    const team = makeTeam();
+    team.admin = { session_id: "admin", profile_id: "gpt", model_id: "actual", family: "gpt", phase: "delegated", response: "" };
+    team.messages = [{ id: "generated", agent_id: "a", text: "Analyze independently", at: at(2), source: "admin" }, { id: "legacy", agent_id: "b", text: "Unlabelled historic instruction", at: at(3) }, { id: "human", agent_id: "a", text: "My follow-up", at: at(4), source: "user" }];
+    const view = render(<ProcessChat team={team} sessions={{}} profiles={[]} onSelectAgent={vi.fn()} />);
+    expect(view.container.querySelectorAll(".lp-user-message")).toHaveLength(2); // Original human goal and actual follow-up.
+    expect(screen.getByText("ARIS · 分工安排 · a")).toBeTruthy();
+    expect(screen.getByText("任务指令 · b")).toBeTruthy();
+    expect(view.container.querySelectorAll(".lp-dispatch-note")).toHaveLength(2);
+  });
 });

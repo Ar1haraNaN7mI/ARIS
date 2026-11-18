@@ -186,12 +186,14 @@ impl AgentHandle {
 pub struct AgentLoop {
     runtime: Arc<Runtime>,
     profile: Option<crate::kei::ModelProfileConfig>,
+    execution_limits: Option<(usize, u32, usize)>,
 }
 
 struct TurnControl {
     cancel_rx: watch::Receiver<bool>,
     pause_rx: watch::Receiver<bool>,
     handle: AgentHandle,
+    execution_limits: Option<(usize, u32, usize)>,
 }
 
 struct TurnModelIdentity {
@@ -205,6 +207,7 @@ impl AgentLoop {
         Self {
             runtime,
             profile: None,
+            execution_limits: None,
         }
     }
 
@@ -217,7 +220,14 @@ impl AgentLoop {
         Ok(Self {
             runtime,
             profile: Some(profile),
+            execution_limits: None,
         })
+    }
+
+    /// Limits are local to this invocation, never global model/user settings.
+    pub fn with_execution_limits(mut self, steps: usize, tokens: u32, tools: usize) -> Self {
+        self.execution_limits = Some((steps.max(1), tokens.max(1), tools.max(1)));
+        self
     }
 
     pub async fn run_turn(
@@ -261,13 +271,16 @@ impl AgentLoop {
         // Freeze the client and prompt before spawning. Updating another agent's
         // settings cannot alter this turn, including subsequent tool-loop steps.
         let base_config = self.runtime.llm.config();
-        let llm_config = if let Some(profile) = &self.profile {
+        let mut llm_config = if let Some(profile) = &self.profile {
             let gateway =
                 crate::kei::load_kei_config(&self.runtime.outer_home, &self.runtime.config.kei)?;
             profile.resolve(&gateway, &base_config, &self.runtime.outer_home)?
         } else {
             base_config
         };
+        if let Some((_, tokens, _)) = self.execution_limits {
+            llm_config.max_tokens = llm_config.max_tokens.min(tokens).max(1);
+        }
         let model_identity = TurnModelIdentity {
             profile_id: self.profile.as_ref().map(|profile| profile.id.clone()),
             model_id: (!llm_config.model.is_empty()).then(|| llm_config.model.clone()),
@@ -310,6 +323,7 @@ impl AgentLoop {
         let runtime_for_release = runtime.clone();
         let control_handle = handle.clone();
         let reservation_id = task_override.clone();
+        let execution_limits = self.execution_limits;
         tokio::spawn(async move {
             if let Err(err) = run_turn_inner(
                 runtime,
@@ -325,6 +339,7 @@ impl AgentLoop {
                     cancel_rx,
                     pause_rx,
                     handle: control_handle,
+                    execution_limits,
                 },
             )
             .await
@@ -357,6 +372,7 @@ async fn run_turn_inner(
         mut cancel_rx,
         pause_rx,
         handle: control_handle,
+        execution_limits,
     } = control;
     let turn_id = Uuid::new_v4().to_string();
     let (session_id, session_goal, goal_paused) = {
@@ -571,12 +587,28 @@ async fn run_turn_inner(
         .max_steps
         .map(|limit| max_steps.min(limit))
         .unwrap_or(max_steps)
+        .min(execution_limits.map_or(10_000, |limits| limits.0))
         .min(10_000);
     let deadline = task_goal.as_ref().and_then(|goal| goal.deadline);
     let mut completed_response = false;
     // Cache tool schemas across steps until registry generation changes.
     let mut tool_gen = u64::MAX;
-    let mut tool_specs: Vec<ToolSpec> = Vec::new();
+    let mut tool_specs: Arc<[ToolSpec]> = Arc::from([]);
+    let context_chars = if execution_limits.is_some() {
+        Some(model_policy.context_chars.unwrap_or(64_000).min(64_000))
+    } else {
+        model_policy.context_chars
+    };
+    let context_messages = if execution_limits.is_some() {
+        Some(model_policy.context_messages.unwrap_or(32).min(32))
+    } else {
+        model_policy.context_messages
+    };
+    let system_limit = context_chars.map(|chars| (chars / 3).max(2_048));
+    let message_limit =
+        context_chars.map(|chars| chars.saturating_sub(system_limit.unwrap_or(0)).max(2_048));
+    let system = turn_prompt.render_with_limit(system_limit);
+    let mut tool_calls_used = 0usize;
 
     for _step in 0..max_steps {
         if *cancel_rx.borrow() || *pause_rx.borrow() {
@@ -613,16 +645,9 @@ async fn run_turn_inner(
         );
 
         runtime.computer_status();
-        let system_limit = model_policy
-            .context_chars
-            .map(|chars| (chars / 3).max(2_048));
-        let message_limit = model_policy
-            .context_chars
-            .map(|chars| chars.saturating_sub(system_limit.unwrap_or(0)).max(2_048));
-        let system = turn_prompt.render_with_limit(system_limit);
         let mut messages = session.read().derive_messages_with_budget(
             &system,
-            model_policy.context_messages,
+            context_messages,
             message_limit,
             model_policy.thinking.unwrap_or(base_llm_config.thinking),
         );
@@ -801,6 +826,15 @@ async fn run_turn_inner(
         };
 
         for (call_id, name, args) in tool_calls {
+            tool_calls_used += 1;
+            if execution_limits.is_some_and(|limits| tool_calls_used > limits.2) {
+                let message =
+                    "Admin tool-call budget exhausted; send a new instruction to continue";
+                runtime.sessions.persist_now(&session);
+                record_task_feedback(&runtime, &task_id, &run_id, false, message);
+                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                return Err(anyhow::anyhow!(message));
+            }
             if *cancel_rx.borrow() || *pause_rx.borrow() {
                 break;
             }

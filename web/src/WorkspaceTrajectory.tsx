@@ -2,6 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "
 import type { ModelProfile, Team } from "./teamTypes";
 import type { SessionResult } from "./types";
 import { statusLabels } from "./teamTypes";
+import { conversationAgents, teamIsActive } from "./teamConversationModel";
 import { AgentGlyph } from "./AgentGlyph";
 import { newTraceNodes, projectWorkspaceTrace, traceLabels, type TraceKind, type TraceNode } from "./workspaceTrace";
 import { createLightLayer, type LightLayer } from "./vendor/lancer-light-ui/src/index";
@@ -49,6 +50,7 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
   const history = useRef(new Map<string, { revisions: Set<string>; latest: number; baseline?: number }>());
   const flights = useRef(new Map<string, { teamId: string; cancel: () => void; cleanup: ReturnType<typeof setTimeout> }>());
   const lanes = useMemo(() => projectWorkspaceTrace(teams, profiles, activeTeamId, sessions), [teams, profiles, activeTeamId, sessions]);
+  const nodeIndexes = useMemo(() => new Map(lanes.map((lane) => [lane.team.id, new Map(lane.nodes.map((node) => [node.id, node]))])), [lanes]);
   const visible = focused && activeTeamId ? lanes.filter((lane) => lane.team.id === activeTeamId) : lanes;
   const minimumWidth = visible.reduce((total, lane) => total + lane.width, 0);
   const canvasWidth = Math.max(width, minimumWidth);
@@ -56,8 +58,8 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
   const columns = visible.map((lane) => lane.width + slack);
   const offsets = columns.map((_, index) => columns.slice(0, index).reduce((sum, value) => sum + value, 0));
   const height = Math.max(280, ...visible.map((lane) => lane.height));
-  const currentDetail = detail && (lanes.find((lane) => lane.team.id === detail.teamId)?.nodes.find((node) => node.id === detail.id) || detail);
-  const lastTimestamp = [...lanes.flatMap((lane) => lane.nodes)].sort((a, b) => a.at.localeCompare(b.at)).at(-1)?.at;
+  const currentDetail = detail && (nodeIndexes.get(detail.teamId)?.get(detail.id) || detail);
+  const lastTimestamp = lanes.reduce((latest, lane) => lane.nodes.reduce((value, node) => node.at > value ? node.at : value, latest), "");
   const grid = { gridTemplateColumns: columns.map((value) => `${value}px`).join(" "), width: canvasWidth };
 
   useLayoutEffect(() => {
@@ -131,13 +133,13 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
   const choose = (node: TraceNode) => { setDetail(node); if (node.agentId) onSelectAgent(node.teamId, node.agentId); };
   const legend: TraceKind[] = ["reply", "checkpoint", "start", "merge", "artifact", "tool", "model", "wait", "complete", "error", "cancelled", "message"];
   return <aside className="lp-trajectory wt-panel" aria-label="工作树与泳道">
-    <header className="wt-heading"><strong>工作树 · 泳道</strong><span>{teams.length} 条任务线 · {teams.filter((team) => team.status === "running").length} 运行中</span></header>
+    <header className="wt-heading"><strong>工作树 · 泳道</strong><span>{teams.length} 条任务线 · {teams.filter(teamIsActive).length} 运行中</span></header>
     <div className="wt-heads-scroll" ref={heads}><div className="wt-lane-heads" style={grid}>
       {visible.map((lane) => <button type="button" key={lane.team.id} className="wt-lane-head" data-current={activeTeamId === lane.team.id} style={{ "--lc": lane.color } as CSSProperties} onClick={() => lane.currentAgent && onSelectAgent(lane.team.id, lane.currentAgent.id)} title={lane.team.name}>
         <span className="wt-lane-name"><i />{lane.team.name}</span>
         <span className="wt-lane-model"><AgentGlyph profileId={lane.currentAgent?.profile_id} profiles={profiles} size={11} /><span>{lane.model}</span></span>
         <span className="wt-progress" aria-label={`${lane.completed} / ${lane.total} 阶段已完成`}><i style={{ width: `${lane.total ? lane.completed / lane.total * 100 : 0}%` }} /></span>
-        <span className="wt-lane-state">{lane.completed}/{lane.total} · {statusLabels[lane.team.status]}</span>
+        <span className="wt-lane-state">{lane.total ? `${lane.completed}/${lane.total} · ` : "对话 · "}{statusLabels[lane.team.status]}</span>
       </button>)}
     </div></div>
     <div className="wt-filter"><button type="button" className={focused ? "selected" : ""} aria-pressed={focused} disabled={!activeTeamId} onClick={() => setFocused(true)}>聚焦</button><button type="button" className={!focused ? "selected" : ""} aria-pressed={!focused} onClick={() => setFocused(false)}>全部泳道</button><time>{clock(lastTimestamp)}</time></div>
@@ -147,7 +149,7 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
           {visible.map((lane, index) => <g key={lane.team.id} stroke={lane.color} fill="none" strokeWidth="1.6">
             <path className="wt-lane-divider" d={`M${offsets[index] + columns[index]} 0 V${height}`} />
             {lane.nodes.flatMap((node) => node.parentIds.map((parentId) => {
-              const parent = lane.nodes.find((value) => value.id === parentId); if (!parent) return null;
+              const parent = nodeIndexes.get(lane.team.id)?.get(parentId); if (!parent) return null;
               const x1 = offsets[index] + 17 + parent.branch * 20, x2 = offsets[index] + 17 + node.branch * 20;
               const mid = (parent.y + node.y) / 2;
               return <path key={`${node.id}:${parent.id}`} d={x1 === x2 ? `M${x1} ${parent.y} V${node.y}` : `M${x1} ${parent.y} C${x1} ${mid},${x2} ${mid},${x2} ${node.y}`} opacity={node.kind === "tool" ? .55 : .8} data-trace-parent={parentId} />;
@@ -157,7 +159,7 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
         </svg>
         {visible.flatMap((lane, index) => lane.nodes.map((node) => {
           const x = offsets[index] + 17 + node.branch * 20;
-          const agent = lane.team.agents.find((value) => value.id === node.agentId);
+          const agent = conversationAgents(lane.team).find((value) => value.id === node.agentId);
           return <button type="button" key={`${lane.team.id}:${node.id}`} className="wt-node" data-selected={currentDetail?.teamId === node.teamId && currentDetail.id === node.id} data-agent-current={activeTeamId === lane.team.id && selectedAgentId === node.agentId} data-trace-kind={node.kind} style={{ left: x - 9, top: node.y - 10, width: offsets[index] + columns[index] - x + 2, "--lc": lane.color } as CSSProperties} aria-label={`${traceLabels[node.kind]} · ${node.label}`} onClick={() => choose(node)} onMouseEnter={(event) => showTip(node, event.currentTarget)} onMouseLeave={() => setTip(undefined)} onFocus={(event) => showTip(node, event.currentTarget)} onBlur={() => setTip(undefined)}>
             <span className="wt-marker" data-anchor-key={`tree:${node.teamId}:${node.id}`} data-tree-anchor={node.id} data-event-lane={lane.team.id} data-event-type={node.kind}><TraceGlyph kind={node.kind} failed={node.ok === false} /></span>
             <span className="wt-node-label"><span>{node.label}</span><small>{node.identity?.modelId || node.identity?.profileId || agent?.name || "工作区"} · {clock(node.at)}</small></span>

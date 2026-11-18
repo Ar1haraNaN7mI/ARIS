@@ -58,6 +58,7 @@ export type SessionResult = {
   session: Session;
   task_id: string | null;
   state: string | null;
+  sync?: { cursor: string; reset: boolean; event_count: number };
 };
 export type Bootstrap = {
   token: string;
