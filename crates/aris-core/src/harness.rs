@@ -16,6 +16,9 @@ use std::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Automatic administration is bounded independently of manually created teams.
+pub const ADMIN_WORKER_LIMIT: usize = 8;
+
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -160,6 +163,24 @@ pub struct Team {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnel_turns: HashMap<String, u8>,
 }
+
+/// A controller is identified by its durable session, never its role or name.
+pub fn admin_workers(team: &Team) -> impl Iterator<Item = &TeamAgent> {
+    let controller = team
+        .admin
+        .as_ref()
+        .map(|admin| admin.session_id.as_str())
+        .filter(|session| !session.is_empty());
+    team.agents
+        .iter()
+        .filter(move |agent| Some(agent.session_id.as_str()) != controller)
+}
+
+/// Larger manual teams may dispatch existing workers without gaining new ones.
+pub fn admin_worker_capacity(team: &Team) -> usize {
+    ADMIN_WORKER_LIMIT.saturating_sub(admin_workers(team).count())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamSpec {
     pub name: String,
@@ -991,8 +1012,12 @@ impl TeamStore {
             );
             let admin_session = admin.session_id.clone();
             ensure!(
-                additions.len() <= 4 && assignments.len() <= 6,
-                "Admin execution budget exceeded"
+                additions.len() <= admin_worker_capacity(team),
+                "Admin may add only enough roles to reach {ADMIN_WORKER_LIMIT} workers"
+            );
+            ensure!(
+                assignments.len() <= ADMIN_WORKER_LIMIT,
+                "Admin may assign at most {ADMIN_WORKER_LIMIT} workers per dispatch"
             );
             ensure!(
                 team.agents.len() + additions.len() <= 32,
@@ -1108,10 +1133,11 @@ impl TeamStore {
                     selected.contains(&a.id)
                         && a.delivery == Some(crate::synthesis::DeliveryKind::Final)
                 });
+            let max_agent_runs = selected.len() + crate::tunnel::MAX_FOLLOWUPS;
             team.dispatch_agent_ids = None;
             team.execution_budget = delegated.then(|| TeamExecutionBudget {
                 agent_ids: selected.into_iter().collect(),
-                max_agent_runs: 6 + crate::tunnel::MAX_FOLLOWUPS,
+                max_agent_runs,
                 max_steps_per_agent: if compiling_delivery { 18 } else { 12 },
                 max_tool_calls_per_agent: if compiling_delivery { 40 } else { 32 },
                 max_context_chars: 64_000,
@@ -1941,6 +1967,97 @@ mod tests {
             dispatch_agent_ids: None,
             tunnels: vec![],
             tunnel_turns: HashMap::new(),
+        }
+    }
+    fn admin(session_id: &str) -> TeamAdmin {
+        TeamAdmin {
+            request_id: "capacity-request".into(),
+            session_id: session_id.into(),
+            profile_id: "test".into(),
+            model_id: "local-capacity-fixture".into(),
+            family: "gpt".into(),
+            phase: "planning".into(),
+            response: String::new(),
+            error: None,
+            requested_effort: None,
+            applied_effort: None,
+        }
+    }
+    #[test]
+    fn admin_worker_capacity_counts_real_controller_and_saturates() {
+        for count in [0, 1, 2, 7, 8, 9, 32] {
+            let mut workers: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut worker = agent(&format!("worker-{index}"), &[], &[]);
+                    worker.session_id = format!("session-{index}");
+                    worker
+                })
+                .collect();
+            if let Some(first) = workers.first_mut() {
+                // A manually named admin remains a worker, even without a native ID.
+                first.id = "admin".into();
+                first.role = "admin".into();
+            }
+            let mut t = team(workers);
+            let capacity = ADMIN_WORKER_LIMIT.saturating_sub(count);
+            assert_eq!(admin_worker_capacity(&t), capacity);
+            t.admin = Some(admin("controller-session"));
+            assert_eq!(admin_workers(&t).count(), count);
+            assert_eq!(admin_worker_capacity(&t), capacity);
+            let mut controller = agent("different-controller-name", &[], &[]);
+            controller.session_id = "controller-session".into();
+            t.agents.insert(0, controller);
+            assert_eq!(admin_workers(&t).count(), count);
+            assert_eq!(admin_worker_capacity(&t), capacity);
+        }
+        let mut legacy = team(vec![agent("admin", &[], &[])]);
+        legacy.admin = Some(admin(""));
+        assert_eq!(admin_workers(&legacy).count(), 1);
+    }
+    #[tokio::test]
+    async fn admin_capacity_rejection_is_atomic_without_cli_validation() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), false);
+        let runtime = &fixture.runtime;
+        for (existing, added, assigned, expected_error) in
+            [(7, 2, 2, "reach 8 workers"), (9, 0, 9, "at most 8 workers")]
+        {
+            let mut before = team(
+                (0..existing)
+                    .map(|index| agent(&format!("existing-{index}"), &[], &[]))
+                    .collect(),
+            );
+            before.status = "planning".into();
+            before.admin = Some(admin("controller-session"));
+            runtime.teams.save(&before).unwrap();
+            let session_count = runtime.sessions.list_ids().len();
+            let additions = (0..added)
+                .map(|index| agent(&format!("new-{index}"), &[], &[]))
+                .collect();
+            let assignments = (0..assigned)
+                .map(|index| AdminAssignment {
+                    agent_id: format!("{}-{index}", if added > 0 { "new" } else { "existing" }),
+                    instruction: "Complete this assignment".into(),
+                })
+                .collect();
+
+            // The core guard must reject before provider resolution or session creation.
+            let error = runtime
+                .teams
+                .finish_admin(
+                    runtime,
+                    &before.id,
+                    "capacity-request",
+                    "Reject the oversized dispatch",
+                    additions,
+                    assignments,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(expected_error));
+            assert_eq!(runtime.sessions.list_ids().len(), session_count);
+            assert_eq!(
+                serde_json::to_value(runtime.teams.read(&before.id).unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
         }
     }
     #[test]
