@@ -3,11 +3,12 @@ import { adminAgent, conversationAgents } from "./teamConversationModel";
 import type { SessionEvent, SessionResult } from "./types";
 import { sessionModelIdentities, type SessionModelIdentity } from "./sessionModelIdentity";
 
-export type TraceKind = "start" | "message" | "reply" | "tool" | "artifact" | "checkpoint" | "merge" | "wait" | "error" | "complete" | "cancelled" | "model" | "note";
-export type TraceEdgeKind = "sequence" | "dependency" | "handoff" | "dispatch";
+export type TraceKind = "start" | "message" | "reply" | "tool" | "artifact" | "checkpoint" | "merge" | "wait" | "error" | "complete" | "cancelled" | "model" | "note" | "tunnel";
+export type TraceEdgeKind = "sequence" | "dependency" | "handoff" | "dispatch" | "tunnel";
 export type TraceNode = {
   id: string; revision: string; teamId: string; laneId?: string; agentId?: string; at: string;
-  kind: TraceKind; label: string; detail: string; source: "team" | "session" | "checkpoint" | "handoff";
+  kind: TraceKind; label: string; detail: string; source: "team" | "session" | "checkpoint" | "handoff" | "tunnel";
+  tunnelId?: string; sentNodeId?: string; tunnelOrder?: number;
   eventId?: string; anchorEventId?: string; ok?: boolean; running?: boolean; arguments?: unknown; result?: string;
   identity?: SessionModelIdentity;
   parentIds: string[]; parentKinds: Record<string, TraceEdgeKind>; y: number; durationMs?: number;
@@ -26,6 +27,7 @@ export type TraceHistory = { revisions: Set<string>; latest: number; baseline?: 
 // The column identity belongs to the role, never to its current model.
 const LANE_COLORS = ["#3B82F6", "#8B5CF6", "#10B981", "#DB2777", "#0891b2", "#b58430"];
 export const traceLabels: Record<TraceKind, string> = {
+  tunnel: "角色协商",
   start: "开始", message: "消息", reply: "回复", tool: "工具调用", artifact: "文件写入",
   checkpoint: "检查点", merge: "依赖汇合", wait: "等待确认", error: "错误", complete: "阶段完成",
   cancelled: "已停止", model: "模型切换", note: "运行记录",
@@ -129,13 +131,14 @@ function compareAt(a: string, b: string) {
   const remainder = (value: string) => (value.match(/\.(\d+)(?:Z|[+-]\d\d:\d\d)$/)?.[1] || "").padEnd(9, "0").slice(3, 9);
   return remainder(a).localeCompare(remainder(b));
 }
-const byTime = (a: TraceNode, b: TraceNode) => compareAt(a.at, b.at);
+const byTime = (a: TraceNode, b: TraceNode) => compareAt(a.at, b.at) || (a.tunnelOrder ?? -1) - (b.tunnelOrder ?? -1);
 const gap = (node: TraceNode) => node.kind === "tool" ? 28 : 43;
 
 function arrangeRoleLanes(lanes: TraceLane[]) {
   const byAgent = new Map(lanes.map((lane) => [lane.agent.id, lane]));
   const latest = new Map<string, TraceNode>();
   const deliveries = new Map<string, TraceNode>();
+  const sent = new Map<string, TraceNode>();
   const consumed = new Map<string, Map<string, string>>();
   const lastStart = new Map<string, TraceNode>();
   let dispatch: TraceNode | undefined;
@@ -150,7 +153,9 @@ function arrangeRoleLanes(lanes: TraceLane[]) {
     const previous = latest.get(lane.agent.id);
     node.y = 24;
     link(node, previous, "sequence");
-    const starting = node.teamEventKind === "agent_started" || (!previous && !node.handoffFrom && node.teamEventKind !== "subagent_created");
+    if (node.sentNodeId) link(node, sent.get(node.sentNodeId), "tunnel");
+    else if (node.source === "tunnel") sent.set(node.id, node);
+    const starting = node.teamEventKind === "agent_started" || (!previous && node.source !== "tunnel" && !node.handoffFrom && node.teamEventKind !== "subagent_created");
     if (starting && lane.kind !== "admin") {
       const priorInputs = consumed.get(lane.agent.id) || new Map<string, string>();
       let newInputs = 0;
@@ -235,6 +240,18 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       } else {
         node.agentId = lane.agent.id; node.laneId = lane.id; lane.nodes.push(node);
       }
+    }
+    for (const channel of team.tunnels || []) for (const message of channel.messages) {
+      const from = roles.get(message.from), to = roles.get(message.to);
+      if (!from || !to || from === to || !channel.participants.includes(message.from) || !channel.participants.includes(message.to)) continue;
+      const sentId = nodeId(team.id, "tunnel", channel.id, message.id, "send");
+      const receivedId = nodeId(team.id, "tunnel", channel.id, message.id, "receive");
+      const verb = message.kind === "accept" ? "同意" : message.kind === "proposal" ? "提议" : "发言";
+      const base = { teamId: team.id, tunnelId: channel.id, at: message.at, kind: "tunnel" as const, source: "tunnel" as const, detail: message.text, y: 0 };
+      from.nodes.push({ ...base, id: sentId, revision: sentId, laneId: from.id, agentId: from.agent.id, tunnelOrder: 2 * message.seq,
+        label: `${verb} → ${to.label}`, parentIds: [], parentKinds: {} });
+      to.nodes.push({ ...base, id: receivedId, revision: receivedId, laneId: to.id, agentId: to.agent.id, tunnelOrder: 2 * message.seq + 1,
+        sentNodeId: sentId, label: `来自 ${from.label} · ${verb}`, parentIds: [], parentKinds: {} });
     }
     for (const handoff of team.handoffs) {
       const id = nodeId(team.id, "handoff", handoff.id);

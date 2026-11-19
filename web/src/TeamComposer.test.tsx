@@ -20,6 +20,7 @@ describe("Editable team templates", () => {
     const draft: TeamDraft = create.mock.calls[0][0];
     expect(draft.agents.map((a) => a.profile_id)).toEqual(["delivery", "delivery", "research"]);
     expect(draft.agents.map((a) => a.depends_on)).toEqual([[], [], ["agent-1", "agent-2"]]);
+    expect(draft.agents.filter((a) => a.delivery === "final").map((a) => a.id)).toEqual(["agent-3"]);
     expect(draft.files).toContain("deliverables/report.md");
   });
   it("loads a saved template without replacing its fixed model assignments and saves edits", async () => {

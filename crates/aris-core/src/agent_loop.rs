@@ -670,6 +670,10 @@ async fn run_turn_inner(
     // Cache tool schemas across steps until registry generation changes.
     let mut tool_gen = u64::MAX;
     let mut tool_specs: Arc<[ToolSpec]> = Arc::from([]);
+    let team_worker = runtime
+        .tasks
+        .task(&task_id)
+        .is_some_and(|task| task.owner.is_some());
     let context_chars = if execution_limits.is_some() {
         Some(model_policy.context_chars.unwrap_or(64_000).min(64_000))
     } else {
@@ -721,12 +725,25 @@ async fn run_turn_inner(
         );
 
         runtime.computer_status();
+        let peer_context = crate::tunnel::context(&runtime, &task_id)?;
+        let conversation_limit = message_limit.map(|limit| {
+            limit
+                .saturating_sub(
+                    peer_context
+                        .as_ref()
+                        .map_or(0, |context| context.chars().count()),
+                )
+                .max(2_048)
+        });
         let mut messages = session.read().derive_messages_with_budget(
             &system,
             context_messages,
-            message_limit,
+            conversation_limit,
             model_policy.thinking.unwrap_or(base_llm_config.thinking),
         );
+        if let Some(context) = peer_context {
+            messages.push(aris_llm::ChatMessage::user(context));
+        }
         if vision {
             session
                 .read()
@@ -735,9 +752,30 @@ async fn run_turn_inner(
         let gen = runtime.tools.generation();
         if gen != tool_gen {
             tool_gen = gen;
-            let definitions = runtime.tools.definitions();
-            let definitions =
+            let definitions: Vec<_> = runtime
+                .tools
+                .definitions()
+                .into_iter()
+                .filter(|definition| team_worker || definition.name != "agent_tunnel")
+                .collect();
+            let tunnel = team_worker
+                .then(|| {
+                    definitions
+                        .iter()
+                        .find(|definition| definition.name == "agent_tunnel")
+                        .cloned()
+                })
+                .flatten();
+            let mut definitions =
                 select_tools_for_query(&definitions, &user_text, model_policy.tool_budget);
+            if let Some(tunnel) = tunnel {
+                if !definitions
+                    .iter()
+                    .any(|definition| definition.name == "agent_tunnel")
+                {
+                    definitions.push(tunnel);
+                }
+            }
             tool_specs = definitions
                 .into_iter()
                 .map(|d| ToolSpec {
@@ -885,7 +923,9 @@ async fn run_turn_inner(
         let needs_tools =
             !tool_calls.is_empty() && assembled.finish_reason == FinishReason::ToolCalls;
         if !needs_tools {
-            completed_response = true;
+            let peer_arrived =
+                _step + 1 < max_steps && crate::tunnel::has_unread(&runtime, &task_id)?;
+            completed_response = !peer_arrived;
             session.write().append(SessionEvent::StepEnd {
                 id: step_id.clone(),
                 turn_id: turn_id.clone(),
@@ -901,6 +941,9 @@ async fn run_turn_inner(
                 Some(&run_id),
             );
             save_step_checkpoint(&runtime, &session, &task_id, &run_id, _step);
+            if peer_arrived {
+                continue;
+            }
             break;
         }
 
@@ -1063,7 +1106,7 @@ async fn run_turn_inner(
                     value = json!({"text": truncate_chars(text, max.saturating_sub(1024)), "screenshot": screenshot, "truncated":true});
                     content = value.to_string();
                 }
-            } else if content.chars().count() > max {
+            } else if name != "agent_tunnel" && content.chars().count() > max {
                 content = if model_policy.compact_tool_results {
                     compact_tool_result(&content, max)
                 } else {

@@ -78,6 +78,19 @@ describe("role-owned workspace trajectory", () => {
     expect(select).toHaveBeenLastCalledWith("current", "score");
   });
 
+  it("connects the two participating lanes until their temporary discussion closes", () => {
+    const { current } = fixture();
+    const open = vi.fn();
+    const team: Team = { ...current, tunnels: [{ id: "thread", topic: "定价依据", status: "open", participants: ["cost", "score"], messages: [], created_at: at(1), updated_at: at(2) }] };
+    const props = { activeTeamId: team.id, profiles, onSelectAgent: vi.fn(), onOpenTunnel: open };
+    const view = render(<WorkspaceTrajectory {...props} teams={[team]} />);
+    fireEvent.click(screen.getByRole("button", { name: /打开协商 · 成本核算员 ↔ 机会评分员 · 定价依据/ }));
+    expect(open).toHaveBeenCalledWith(team.id, "thread");
+    view.rerender(<WorkspaceTrajectory {...props} teams={[{ ...team, tunnels: [{ ...team.tunnels![0], status: "closed" }] }]} />);
+    expect(screen.queryByLabelText("正在协商的角色")).toBeNull();
+    expect(headers(view.container)).toHaveLength(3);
+  });
+
   it("preserves the metadata-only admin column while new same-model roles start independently", () => {
     const select = vi.fn();
     const initial: Team = {

@@ -53,7 +53,8 @@ async fn fixture() -> (
                 let (reply, receive) = oneshot::channel();
                 requests.send(Request { body, reply }).await.unwrap();
                 if let Ok(text) = receive.await {
-                    let payload = json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]}).to_string();
+                    let payload = text.strip_prefix("LOCAL_TOOL_FIXTURE:").map(str::to_owned).unwrap_or_else(||
+                        json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]}).to_string());
                     let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes()).await;
                 }
             });
@@ -459,4 +460,175 @@ async fn team_execution_lock_protects_live_native_runs_and_released_lock_recover
         2
     );
     server.abort();
+}
+
+fn tool_reply(request: Request, call_id: &str, args: Value) {
+    let body = json!({"choices":[{"message":{"role":"assistant","content":"", "tool_calls":[{
+        "id":call_id,"type":"function","function":{"name":"agent_tunnel","arguments":args.to_string()}
+    }]},"finish_reason":"tool_calls"}]});
+    request
+        .reply
+        .send(format!("LOCAL_TOOL_FIXTURE:{body}"))
+        .unwrap();
+}
+
+async fn real_tunnel_roundtrip(dependent: bool) {
+    let (fixture, mut rx, server) = fixture().await;
+    let runtime = fixture.runtime.clone();
+    let mut final_agent = worker("c", &["a", "b"]);
+    final_agent.delivery = Some(crate::synthesis::DeliveryKind::Final);
+    let team = runtime
+        .teams
+        .create(
+            &runtime,
+            TeamSpec {
+                name: "real peer tools".into(),
+                goal: "Consult the peer then deliver".into(),
+                agents: vec![
+                    worker("a", &[]),
+                    worker("b", if dependent { &["a"] } else { &[] }),
+                    final_agent,
+                ],
+                files: vec![],
+            },
+        )
+        .unwrap();
+    let a_session = team.agents[0].session_id.clone();
+    runtime.teams.start(runtime.clone(), &team.id).unwrap();
+    let first = request(&mut rx).await;
+    let (a, held_b) = if dependent {
+        (first, None)
+    } else {
+        let second = request(&mut rx).await;
+        if first
+            .body
+            .to_string()
+            .contains("Your assignment: Answer as a")
+        {
+            (first, Some(second))
+        } else {
+            (second, Some(first))
+        }
+    };
+    assert!(a.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "agent_tunnel"));
+    tool_reply(
+        a,
+        "open-peer",
+        json!({"action":"open","to":"b","topic":"Verify the conclusion","text":"Please verify the denominator before I finalize."}),
+    );
+    let a_after_open = request(&mut rx).await;
+    assert!(a_after_open
+        .body
+        .to_string()
+        .contains("Please verify the denominator"));
+    a_after_open
+        .reply
+        .send("Initial analysis; peer consultation requested.".into())
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while runtime.teams.get(&team.id).unwrap().agents[0].status != "completed" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let initial_a_task = runtime.teams.get(&team.id).unwrap().agents[0]
+        .task_id
+        .clone();
+    let b = if let Some(held_b) = held_b {
+        held_b
+            .reply
+            .send("Draft before the pending peer message was delivered.".into())
+            .unwrap();
+        request(&mut rx).await
+    } else {
+        request(&mut rx).await
+    };
+    assert!(b.body.to_string().contains("Please verify the denominator"));
+    let open = runtime.teams.get(&team.id).unwrap().tunnels[0].clone();
+    tool_reply(
+        b,
+        "reply-peer",
+        json!({"action":"send","tunnel_id":open.id,"reply_to":open.messages[0].id,
+        "text":"Confirmed: the denominator is 25 trial applications, not 8 activations.","expects_reply":false}),
+    );
+    request(&mut rx)
+        .await
+        .reply
+        .send("Peer verification complete.".into())
+        .unwrap();
+    let resumed_a = request(&mut rx).await;
+    assert!(resumed_a
+        .body
+        .to_string()
+        .contains("Confirmed: the denominator is 25"));
+    assert!(resumed_a
+        .body
+        .to_string()
+        .contains("Your assignment: Answer as a"));
+    resumed_a
+        .reply
+        .send("Final analysis corrected using the peer's denominator.".into())
+        .unwrap();
+    let final_request = request(&mut rx).await;
+    assert!(final_request
+        .body
+        .to_string()
+        .contains("Final analysis corrected"));
+    final_request
+        .reply
+        .send("Merged final deliverable with the verified denominator.".into())
+        .unwrap();
+    let completed = settled(&runtime, &team.id).await;
+    assert_eq!(completed.status, "completed");
+    let delivery = crate::synthesis::deliverable(&runtime, &completed)
+        .unwrap()
+        .unwrap();
+    assert!(delivery.text.contains("Merged final deliverable"));
+    assert!(
+        !delivery.stale,
+        "Final evidence must include the completed peer exchange"
+    );
+    assert_eq!(completed.tunnels.len(), 1);
+    let tunnel = &completed.tunnels[0];
+    assert_eq!(tunnel.status, "closed");
+    assert!(
+        tunnel.decision.is_none(),
+        "a question and answer is not mutual acceptance"
+    );
+    assert_eq!(tunnel.messages.len(), 2);
+    assert_eq!(tunnel.messages[0].from, "a");
+    assert_eq!(tunnel.messages[1].from, "b");
+    assert!(tunnel
+        .messages
+        .iter()
+        .all(|message| message.delivered_at.is_some()));
+    assert_eq!(completed.tunnel_turns.get("a"), Some(&1));
+    assert_eq!(completed.agents[0].session_id, a_session);
+    assert_ne!(completed.agents[0].task_id, initial_a_task);
+    for agent in &completed.agents[..2] {
+        let session = runtime.sessions.get_or_load(&agent.session_id).unwrap();
+        let session = session.read();
+        assert!(session.events.iter().any(
+            |event| matches!(event,crate::SessionEvent::ToolCall{name,..} if name == "agent_tunnel")
+        ));
+        assert!(session.events.iter().any(|event|matches!(event,crate::SessionEvent::ToolResult{name,ok:true,..} if name == "agent_tunnel")));
+        assert!(session.events.iter().any(|event|matches!(event,crate::SessionEvent::SystemNote{text,..} if text.starts_with("Peer coordination"))));
+    }
+    assert!(rx.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_tunnel_parallel_peer_and_late_reply_resume_original_worker_once() {
+    real_tunnel_roundtrip(false).await;
+}
+
+#[tokio::test]
+async fn native_tunnel_delivers_to_a_dependency_that_has_not_started() {
+    real_tunnel_roundtrip(true).await;
 }

@@ -49,6 +49,8 @@ pub struct TeamAgent {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::synthesis::DeliveryKind>,
     #[serde(default = "pending")]
     pub status: String,
     #[serde(default)]
@@ -153,6 +155,10 @@ pub struct Team {
     pub execution_budget: Option<TeamExecutionBudget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_agent_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub tunnels: Vec<crate::tunnel::AgentTunnel>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tunnel_turns: HashMap<String, u8>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamSpec {
@@ -273,6 +279,11 @@ impl TeamStore {
                     }
                 }
                 team.status = "failed".into();
+                crate::tunnel::close_all(
+                    &mut team,
+                    "interrupted",
+                    "Coordinator stopped; transcript retained for the next explicit dispatch",
+                );
                 if let Some(admin) = &mut team.admin {
                     if admin.phase == "planning" {
                         admin.phase = "failed".into();
@@ -320,7 +331,11 @@ impl TeamStore {
         teams.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(teams)
     }
-    fn mutate(&self, id: &str, update: impl FnOnce(&mut Team) -> Result<()>) -> Result<Team> {
+    pub(crate) fn mutate(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Team) -> Result<()>,
+    ) -> Result<Team> {
         let _guard = self.transaction.lock();
         let _state = self.state_lock(id)?;
         let mut team = self.read(id)?;
@@ -329,7 +344,7 @@ impl TeamStore {
         self.cache_team_sessions(&team);
         Ok(team)
     }
-    fn event(team: &mut Team, agent_id: Option<&str>, kind: &str, message: &str) {
+    pub(crate) fn event(team: &mut Team, agent_id: Option<&str>, kind: &str, message: &str) {
         team.events.push(TeamEvent {
             at: now(),
             agent_id: agent_id.map(str::to_owned),
@@ -607,6 +622,8 @@ impl TeamStore {
             admin: None,
             execution_budget: None,
             dispatch_agent_ids: None,
+            tunnels: vec![],
+            tunnel_turns: HashMap::new(),
         };
         Self::register_workers(&mut team);
         Self::event(&mut team, None, "created", "Shared workspace created");
@@ -1089,9 +1106,9 @@ impl TeamStore {
             team.dispatch_agent_ids = None;
             team.execution_budget = delegated.then(|| TeamExecutionBudget {
                 agent_ids: selected.into_iter().collect(),
-                max_agent_runs: 6,
-                max_steps_per_agent: 6,
-                max_tool_calls_per_agent: 24,
+                max_agent_runs: 6 + crate::tunnel::MAX_FOLLOWUPS,
+                max_steps_per_agent: 12,
+                max_tool_calls_per_agent: 32,
                 max_context_chars: 64_000,
                 max_tokens_per_step: 4096,
                 max_parallel: 3,
@@ -1242,6 +1259,7 @@ impl TeamStore {
         }
         let team = self.mutate(id, |team| {
             Self::register_workers(team);
+            team.tunnel_turns.clear();
             apply_queued_messages(team);
             ensure!(
                 team.agents
@@ -1280,6 +1298,7 @@ impl TeamStore {
             if let Err(error) = result {
                 let _ = store.mutate(&id, |t| {
                     t.status = "failed".into();
+                    crate::tunnel::close_all(t, "interrupted", &error.to_string());
                     Self::event(t, None, "error", &error.to_string());
                     Ok(())
                 });
@@ -1297,12 +1316,14 @@ impl TeamStore {
             let team = self.mutate(id, |t| {
                 if t.status != "cancelling" {
                     apply_queued_messages(t);
+                    crate::tunnel::schedule(t);
                 }
                 Ok(())
             })?;
             if team.status == "cancelling" {
                 self.mutate(id, |t| {
                     t.status = "cancelled".into();
+                    crate::tunnel::close_all(t, "cancelled", "Team execution was cancelled");
                     let selected: HashSet<_> = t
                         .agents
                         .iter()
@@ -1343,6 +1364,15 @@ impl TeamStore {
                         .filter(|a| selected_for_run(t, a))
                         .all(|a| a.status == "completed");
                     t.status = if complete { "completed" } else { "failed" }.into();
+                    crate::tunnel::close_all(
+                        t,
+                        "closed",
+                        if complete {
+                            "Workflow completed"
+                        } else {
+                            "Workflow stopped with an unfinished role"
+                        },
+                    );
                     let selected: HashSet<_> = t
                         .agents
                         .iter()
@@ -1437,7 +1467,9 @@ impl TeamStore {
                 );
             }
             let session = runtime.sessions.get_or_load(&agent.session_id)?;
-            let prompt = agent_prompt(&team, &agent);
+            let prepared =
+                crate::synthesis::prepare(&runtime, &team, &agent, agent_prompt(&team, &agent))?;
+            let prompt = prepared.prompt.clone();
             let task = self.prepare_task(&runtime, &team, &agent, &prompt)?;
             let (tx, mut rx) = mpsc::channel(256);
             let handle = runner
@@ -1548,16 +1580,45 @@ impl TeamStore {
                     _ => {}
                 }
             }
-            let native_task = runtime
+            let mut native_task = runtime
                 .tasks
                 .task(&task.id)
                 .context("subagent task missing")?;
+            if matches!(
+                native_task.state,
+                TaskState::Running | TaskState::WaitingApproval | TaskState::WaitingEvent
+            ) {
+                // The loop has ended. An infrastructure error (for example a
+                // failed coordination/session write) must not leave its real
+                // native lease looking live after the team role has failed.
+                runtime.tasks.interrupt_team_task(&task.id)?;
+                native_task = runtime
+                    .tasks
+                    .task(&task.id)
+                    .context("subagent task missing")?;
+                error.get_or_insert_with(|| {
+                    "Native subagent ended before completing its task".into()
+                });
+            }
             let latest_run = runtime
                 .tasks
                 .latest_run_for_task(&task.id)
                 .map(|run| run.id);
             if native_task.state == TaskState::Failed && error.is_none() {
                 error = Some("Native subagent task failed".into());
+            }
+            if native_task.state == TaskState::Completed
+                && error.is_none()
+                && self.read(id)?.status != "cancelling"
+            {
+                crate::synthesis::capture(
+                    &runtime,
+                    &self.read(id)?,
+                    &agent,
+                    &task.id,
+                    latest_run.as_deref(),
+                    &prepared,
+                )?;
             }
             self.mutate(id, |t| {
                 let cancelling = t.status == "cancelling";
@@ -1739,10 +1800,34 @@ fn agent_prompt(team: &Team, agent: &TeamAgent) -> String {
         })
         .collect();
     messages.reverse();
+    let peers = team
+        .agents
+        .iter()
+        .filter(|peer| peer.id != agent.id && peer.subagent_id.is_some())
+        .map(|peer| format!("{}: {} ({})", peer.id, peer.name, peer.role))
+        .collect::<Vec<_>>()
+        .join("; ");
+    messages.push(format!("Internal coordination: your worker id is {}. Available peer ids: {}. Use agent_tunnel for a short, nonblocking question or proposal when another worker's expertise is needed. Reply to a received message with reply_to; use expects_reply=false for a complete answer. Continue your assignment rather than waiting or polling. Only mutual proposal acceptance is a joint decision.",agent.id,peers));
     format!("You are {} in ARIS, a general-purpose multi-agent harness. Role: {}.\nShared goal: {}\nYour assignment: {}\nYour browser identity is your session; use your own browser tools.\nShared artifact files: {}\nYour owned output files: {}\nRead relevant existing files before editing. Keep edits within your assigned output files; other agents can be working concurrently. Use shared files directly, preserve previous contributions, and report exact delivered paths and unfinished work. If no output files were assigned, return your findings in the response.\nDependency results:\n{}\nExplicit handoffs:\n{}\nConversation instructions with their actual source, oldest to newest (latest takes precedence):\n{}", agent.name,agent.role,team.goal,agent.prompt,team.files.join(", "),agent.files.join(", "),inputs.join("\n\n"),handoffs.join("\n\n"),messages.join("\n\n"))
 }
 
 pub(crate) fn validate_graph(agents: &[TeamAgent]) -> Result<()> {
+    let finals: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.delivery == Some(crate::synthesis::DeliveryKind::Final))
+        .collect();
+    ensure!(
+        finals.len() <= 1,
+        "A workflow can have at most one final delivery role"
+    );
+    if let Some(final_agent) = finals.first() {
+        ensure!(
+            !agents
+                .iter()
+                .any(|agent| agent.depends_on.contains(&final_agent.id)),
+            "A final delivery role must be terminal; other roles cannot depend on it"
+        );
+    }
     let ids: HashSet<_> = agents.iter().map(|a| a.id.as_str()).collect();
     ensure!(
         ids.len() == agents.len() && !ids.contains(""),
@@ -1796,6 +1881,7 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
         }
         if !selected_for_run(team, agent)
             || agent.status != "pending"
+            || crate::tunnel::blocks_final(team, agent)
             || !agent.depends_on.iter().all(|d| {
                 complete.contains(d)
                     || team
@@ -1816,7 +1902,7 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
     ready
 }
 
-fn selected_for_run(team: &Team, agent: &TeamAgent) -> bool {
+pub(crate) fn selected_for_run(team: &Team, agent: &TeamAgent) -> bool {
     team.execution_budget
         .as_ref()
         .is_none_or(|b| b.agent_ids.contains(&agent.id))
@@ -1848,6 +1934,8 @@ mod tests {
             admin: None,
             execution_budget: None,
             dispatch_agent_ids: None,
+            tunnels: vec![],
+            tunnel_turns: HashMap::new(),
         }
     }
     #[test]
@@ -1883,6 +1971,25 @@ mod tests {
             vec!["a", "c"]
         );
         assert!(validate_graph(&[agent("a", &["b"], &[]), agent("b", &["a"], &[])]).is_err());
+    }
+    #[test]
+    fn graph_rejects_multiple_or_nonterminal_explicit_final_roles() {
+        let mut first = agent("a", &[], &[]);
+        first.delivery = Some(crate::synthesis::DeliveryKind::Final);
+        let mut second = agent("b", &[], &[]);
+        second.delivery = Some(crate::synthesis::DeliveryKind::Final);
+        assert!(validate_graph(&[first.clone(), second])
+            .unwrap_err()
+            .to_string()
+            .contains("at most one"));
+        assert!(validate_graph(&[first, agent("b", &["a"], &[])])
+            .unwrap_err()
+            .to_string()
+            .contains("terminal"));
+        let supporting = agent("a", &[], &[]);
+        let mut final_agent = agent("b", &["a"], &[]);
+        final_agent.delivery = Some(crate::synthesis::DeliveryKind::Final);
+        validate_graph(&[supporting, final_agent]).unwrap();
     }
     #[test]
     fn chat_instructions_queue_without_interrupting_then_continue_only_target() {

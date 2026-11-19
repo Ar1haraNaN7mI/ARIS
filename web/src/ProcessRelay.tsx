@@ -29,7 +29,7 @@ export function relayStages(team: Team) {
   return admin ? [[admin], ...agentStages(workerAgents(team))] : agentStages(team.agents);
 }
 
-export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId, onSelect }: { teams: Team[]; profiles: ModelProfile[]; selectedTeamId?: string; selectedAgentId?: string; onSelect: (teamId: string, agentId?: string) => void }) {
+export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId, onSelect, onOpenTunnel }: { teams: Team[]; profiles: ModelProfile[]; selectedTeamId?: string; selectedAgentId?: string; onSelect: (teamId: string, agentId?: string) => void; onOpenTunnel?: (teamId: string, tunnelId: string) => void }) {
   return <section className="lp-relay" aria-label="智能体泳道">{teams.map((team, index) => {
     const members = relayStages(team).flat();
     const names = new Map(members.map((agent) => [agent.id, agent.name]));
@@ -58,7 +58,9 @@ export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId,
           <small className="lp-relay-model" title={model}>{model}</small>
           {predecessors && <small className="lp-relay-inputs" title={predecessors}>接收 {predecessors} 的交付</small>}
         </div>;
-      })}</div>
+      })}{team.tunnels?.filter((t) => t.status === "open").map((t) => <button key={t.id} className="lp-tunnel-relay" data-live-tunnel={t.id} onClick={() => onOpenTunnel?.(team.id, t.id)}>
+        <span aria-hidden="true">⇄</span><strong>{t.participants.map((id) => names.get(id) || id).join(" · ")}</strong><span>协商中 · {t.topic}</span>
+      </button>)}</div>
     </div>;
   })}{!teams.length && <div className="lp-relay-empty">会话开始后，智能体会在这里各自展开。</div>}</section>;
 }

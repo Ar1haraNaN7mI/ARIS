@@ -65,3 +65,15 @@ it("keeps a simple answer as one normal admin conversation without subroles", as
   await waitFor(() => expect(mocks.admin).toHaveBeenCalledWith("Continue", "t", undefined));
   expect(mocks.message).not.toHaveBeenCalled();
 });
+
+it("retries the same administrator after planning failed before any workers existed", async () => {
+  const team: Team = { ...base, status: "failed", agents: [], admin: {
+    session_id: "admin-session", profile_id: "astra", model_id: "actual-astra", family: "gpt", phase: "failed", response: "",
+  } };
+  mocks.state = { ...mocks.state, team, teams: [team] };
+  const view = render(<TeamWorkspace onChat={vi.fn()} />);
+  fireEvent.click(view.container.querySelector(".lp-group-heading")!);
+  fireEvent.click(screen.getByRole("button", { name: /▶ 继续/ }));
+  expect(mocks.admin).toHaveBeenCalledWith("继续完成上一次未完成的请求。", team.id, undefined);
+  expect(mocks.run).not.toHaveBeenCalled();
+});

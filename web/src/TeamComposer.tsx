@@ -24,7 +24,11 @@ type Preset = keyof typeof presets;
 function draftAgents(preset: Preset, config?: KeiConfig): AgentDraft[] {
   const definition = presets[preset];
   const available = config?.profiles.filter((p) => p.model.trim()) || [];
-  return definition.agents.map((agent, i) => ({ ...agent, id: `agent-${i + 1}`, profile_id: available[i % (available.length || 1)]?.id || "", files: [`deliverables/${definition.files[i]}`] }));
+  const finalRole = { research: "writer", writing: "editor", build: undefined }[preset];
+  return definition.agents.map((agent, i) => ({
+    ...agent, id: `agent-${i + 1}`, profile_id: available[i % (available.length || 1)]?.id || "",
+    files: [`deliverables/${definition.files[i]}`], delivery: agent.role === finalRole ? "final" : undefined,
+  }));
 }
 export function TeamComposer({ token, config, busy, onCreate, onConfigure, initialGoal = "", initialTemplate, initialDraft, onDraftChange }: {
   token?: string; config?: KeiConfig; busy: boolean; onCreate: (draft: TeamDraft) => Promise<unknown>; onConfigure: () => void;
@@ -44,6 +48,7 @@ export function TeamComposer({ token, config, busy, onCreate, onConfigure, initi
   const [templateError, setTemplateError] = useState("");
   const [templateNotice, setTemplateNotice] = useState("");
   const profiles = config?.profiles.filter((p) => p.model.trim()) || [];
+  const finalChoices = agents.filter((agent) => !agents.some((peer) => peer.depends_on.includes(agent.id)));
   const validAssignments = agents.every((agent, index) => profiles.some((profile) => profile.id === (agent.profile_id || profiles[index % (profiles.length || 1)]?.id)));
   useEffect(() => {
     if (!token) return;
@@ -52,7 +57,11 @@ export function TeamComposer({ token, config, busy, onCreate, onConfigure, initi
     return () => abort.abort();
   }, [token]);
   function update(index: number, patch: Partial<AgentDraft>) {
-    setAgents((items) => items.map((agent, i) => i === index ? { ...agent, ...patch } : agent));
+    setAgents((items) => items.map((agent, i) => {
+      if (i === index) return { ...agent, ...patch };
+      if (agent.delivery === "final" && patch.depends_on?.includes(agent.id)) return { ...agent, delivery: undefined };
+      return agent;
+    }));
   }
   function currentDraft(): TeamDraft {
     const resolved = agents.map((agent, i) => ({ ...agent, profile_id: agent.profile_id || profiles[i % (profiles.length || 1)]?.id || "" }));
@@ -99,6 +108,12 @@ export function TeamComposer({ token, config, busy, onCreate, onConfigure, initi
       <div className="agent-dependencies"><span>前置子流程</span>{agents.filter((candidate) => candidate.id !== agent.id).map((candidate) => <label key={candidate.id}><input type="checkbox" checked={agent.depends_on.includes(candidate.id)} onChange={(e) => update(index, { depends_on: e.target.checked ? [...agent.depends_on, candidate.id] : agent.depends_on.filter((id) => id !== candidate.id) })} />{candidate.name}</label>)}{!agent.depends_on.length && <small>独立开始</small>}</div>
     </fieldset>)}</div>
     <button type="button" className="outline-button" disabled={agents.length >= 32} onClick={() => setAgents((items) => [...items, { id: `agent-${crypto.randomUUID().slice(0, 8)}`, name: `智能体 ${items.length + 1}`, role: "assistant", profile_id: profiles[0]?.id || "", prompt: "", depends_on: [], files: [] }])}><PlusIcon />添加智能体</button>
+    <label className="aris-field">最终汇总<select value={agents.find((actor) => actor.delivery === "final")?.id || ""}
+      onChange={(event) => { const id = event.target.value; setAgents((items) => items.map((actor) => ({
+        ...actor, delivery: actor.id === id ? "final" : actor.delivery === "final" ? undefined : actor.delivery,
+      }))); }}>
+      <option value="">各自交付</option>{finalChoices.map((actor) => <option key={actor.id} value={actor.id}>{actor.name}</option>)}
+    </select></label>
     <label className="aris-field shared-draft">共享输入文件 <small>相对工作区路径，每行一个</small><textarea rows={2} value={shared} onChange={(e) => setShared(e.target.value)} placeholder="brief.md" /></label>
     <details className="template-save"><summary>保存为可重复使用的模板</summary><label className="aris-field">模板名称<input value={templateName} onChange={(e) => setTemplateName(e.target.value)} placeholder={name || "我的团队模板"} /></label><label className="aris-field">模板说明<input value={templateDescription} onChange={(e) => setTemplateDescription(e.target.value)} placeholder="适合完成什么工作？" /></label><div className="inline-actions"><button type="button" className="outline-button" disabled={templateBusy || !profiles.length || !goal.trim() || agents.some((a) => !a.prompt.trim())} onClick={() => void saveTemplate()}>保存为新模板</button>{templateId && templates.find((t) => t.id === templateId)?.builtin === false && <button type="button" className="outline-button" disabled={templateBusy} onClick={() => { setTemplateBusy(true); void rpc(token!, "templates/delete", { id: templateId }).then(() => { setTemplates((items) => items.filter((t) => t.id !== templateId)); setTemplateId(""); setTemplateNotice("模板已删除，当前草稿保留。"); }).catch((e) => setTemplateError(errorText(e))).finally(() => setTemplateBusy(false)); }}>删除此模板</button>}</div></details>
     <div className="composer-submit"><span>团队与执行记录保存在本机</span><button className="solid-button" disabled={busy || !goal.trim() || !profiles.length || !validAssignments}>{busy ? "正在创建…" : "创建团队"}<ArrowRightIcon /></button></div>

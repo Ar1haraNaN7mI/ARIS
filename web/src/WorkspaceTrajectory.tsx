@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { ModelProfile, Team } from "./teamTypes";
 import type { SessionResult } from "./types";
 import { statusLabels } from "./teamTypes";
@@ -21,6 +21,7 @@ function TraceGlyph({ kind, failed = false }: { kind: TraceKind; failed?: boolea
   if (kind === "complete") return <span className="wt-glyph wt-complete">✓</span>;
   if (kind === "model") return <span className="wt-glyph wt-model">◇</span>;
   if (kind === "cancelled") return <span className="wt-glyph wt-cancelled">−</span>;
+  if (kind === "tunnel") return <span className="wt-glyph wt-tunnel">⇄</span>;
   return <span className={`wt-glyph wt-${kind}`} />;
 }
 
@@ -39,10 +40,12 @@ function anchor(key: string): Element | null {
   return element;
 }
 
-export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, profiles = [], sessions = {}, onSelectAgent }: {
+export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, profiles = [], sessions = {}, onSelectAgent, onOpenTunnel }: {
   teams: Team[]; activeTeamId?: string; selectedAgentId?: string; profiles?: ModelProfile[];
   sessions?: Record<string, SessionResult>; onSelectAgent: (teamId: string, agentId?: string) => void;
+  onOpenTunnel?: (teamId: string, tunnelId: string) => void;
 }) {
+  const arrowId = useId();
   const [scope, setScope] = useState<"team" | "all">("team");
   const focused = scope === "team" && !!activeTeamId;
   const [showTeamEvents, setShowTeamEvents] = useState(false);
@@ -76,6 +79,13 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
   const currentDetail = detail && detail.teamId === activeTeamId && detail.agentId === selectedAgentId
     ? positions.get(detail.id)?.node : undefined;
   const visibleTeams = teams.filter((team) => !focused || team.id === activeTeamId);
+  const activeTunnels = visibleTeams.flatMap((team) => (team.tunnels || []).flatMap((tunnel) => {
+    if (tunnel.status !== "open") return [];
+    const pair = columns.filter(({ lane }) => lane.team.id === team.id && tunnel.participants.includes(lane.agent.id));
+    if (pair.length !== 2) return [];
+    const [first, last] = pair.map((col) => col.left + col.width / 2);
+    return [{ team, tunnel, left: first, width: last - first, names: pair.map(({ lane }) => lane.agent.name).join(" ↔ ") }];
+  }));
   const recordCount = visibleTeams.reduce((count, team) => count + (teamEvents.get(team.id)?.length || 0), 0);
   const lastTimestamp = visibleTeams.reduce((latest, team) => {
     const at = teamEvents.get(team.id)?.at(-1)?.at || "";
@@ -84,7 +94,8 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
     const at = lane.nodes.at(-1)?.at || ""; return at > latest ? at : latest;
   }, ""));
   const grid = { gridTemplateColumns: columns.map((column) => `${column.width}px`).join(" "), width: canvasWidth };
-  const followLanes = visible.filter((lane) => lane.team.id === activeTeamId && (!selectedAgentId || lane.agent.id === selectedAgentId));
+  const coordinating = visible.some((l) => l.team.id === activeTeamId && l.agent.id === selectedAgentId && l.kind === "admin" && l.team.status === "running");
+  const followLanes = visible.filter((lane) => lane.team.id === activeTeamId && (coordinating || !selectedAgentId || lane.agent.id === selectedAgentId));
   const followY = followLanes.reduce<number | undefined>((bottom, lane) => {
     const y = lane.nodes.at(-1)?.y;
     return y === undefined ? bottom : Math.max(bottom ?? 0, y);
@@ -142,7 +153,9 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
       if (!lane || ["failed", "cancelled"].includes(lane.team.status)) continue;
       const targetKey = `tree:${node.teamId}:${node.id}`;
       if (!anchor(targetKey)) continue;
-      const sources: { key: string; kind: "model" | "message" }[] = [{ key: `chip:${node.teamId}:${node.agentId}`, kind: "model" }];
+      const sources: { key: string; kind: "model" | "message" }[] = node.sentNodeId
+        ? [{ key: `tree:${node.teamId}:${node.sentNodeId}`, kind: "message" }]
+        : [{ key: `chip:${node.teamId}:${node.agentId}`, kind: "model" }];
       const messageEventId = node.anchorEventId || node.eventId;
       if (messageEventId) sources.push({ key: `message:${node.teamId}:${node.agentId}:${messageEventId}`, kind: "message" });
       for (const source of sources) {
@@ -161,8 +174,13 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
     const panel = scroll.current?.getBoundingClientRect();
     setTip({ node, x: Math.max(8, (panel?.left || bounds.left) - 248), y: Math.max(48, Math.min(innerHeight - 170, bounds.top - 12)) });
   };
-  const choose = (node: TraceNode) => { setShowTeamEvents(false); setDetail(node); if (node.agentId) onSelectAgent(node.teamId, node.agentId); };
+  const choose = (node: TraceNode) => {
+    setShowTeamEvents(false);
+    if (node.tunnelId && onOpenTunnel) { setDetail(undefined); onOpenTunnel(node.teamId, node.tunnelId); return; }
+    setDetail(node); if (node.agentId) onSelectAgent(node.teamId, node.agentId);
+  };
   const legend: TraceKind[] = ["reply", "checkpoint", "start", "merge", "artifact", "tool", "model", "wait", "complete", "error", "cancelled", "message"];
+  if (visibleTeams.some((team) => team.tunnels?.length)) legend.push("tunnel");
   return <aside className="lp-trajectory wt-panel" aria-label="工作树与泳道">
     <header className="wt-heading"><strong>工作树 · 泳道</strong><span>{visible.length} 个角色 · {visible.filter((lane) => lane.agent.status === "running").length} 运行中</span></header>
     <div className="wt-heads-scroll" ref={heads} style={{ maxWidth: width || undefined }} onScroll={(event) => {
@@ -179,7 +197,15 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
           <span className="wt-lane-state">{statusLabels[lane.agent.status]}</span>
         </button>;
       })}
-    </div></div>
+    </div>
+      {activeTunnels.length > 0 && <div className="wt-tunnels" style={{ width: canvasWidth }} aria-label="正在协商的角色">
+        {activeTunnels.map(({ team, tunnel, left, width: span, names }) => <div key={tunnel.id}>
+          <button type="button" className="wt-tunnel-rail" style={{ marginLeft: left, width: span }}
+            title={`${names} · ${tunnel.topic}`} aria-label={`打开协商 · ${names} · ${tunnel.topic}`}
+            onClick={() => onOpenTunnel?.(team.id, tunnel.id)}><span>{tunnel.topic}</span></button>
+        </div>)}
+      </div>}
+    </div>
     <div className="wt-filter">
       <button type="button" className={focused ? "selected" : ""} aria-pressed={focused} disabled={!activeTeamId} onClick={() => setScope("team")}>当前任务</button>
       <button type="button" className={!focused ? "selected" : ""} aria-pressed={!focused} onClick={() => setScope("all")}>全部泳道</button>
@@ -194,6 +220,9 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
     }}>
       {!visible.length ? <p className="wt-empty">创建角色后，会在这里显示各自的泳道。</p> : <div className="wt-tree-space" style={{ width: canvasWidth, height }}>
         <svg className="wt-rails" width={canvasWidth} height={height} aria-hidden="true">
+          <defs><marker id={arrowId} viewBox="0 0 8 8" refX="4" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M1 1 L7 4 L1 7" fill="none" stroke="#087c93" strokeWidth="1.5" />
+          </marker></defs>
           {columns.map(({ lane, left, width: columnWidth, rail }) => <g key={lane.id} stroke={lane.color} fill="none" strokeWidth="1.6">
             <path className="wt-lane-divider" d={`M${left + columnWidth} 0 V${height}`} />
             {lane.nodes.flatMap((node) => node.parentIds.map((parentId) => {
@@ -204,6 +233,12 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
                 ? `M${rail} ${parent.node.y} V${node.y}`
                 : `M${parent.x} ${parent.node.y} C${parent.x} ${mid},${rail} ${mid},${rail} ${node.y}`;
               const kind = node.parentKinds[parentId];
+              if (kind === "tunnel") {
+                const midX = (parent.x + rail) / 2;
+                return <path key={node.id} d={`M${parent.x} ${parent.node.y} Q${parent.x} ${mid},${midX} ${mid} T${rail} ${node.y}`}
+                  className="wt-tunnel-edge" data-live={Date.now() - Date.parse(node.at) < 6500} markerMid={`url(#${arrowId})`}
+                  data-edge-kind="tunnel" data-tunnel-id={node.tunnelId} data-edge-from-lane={parent.laneId} data-edge-to-lane={lane.id} />;
+              }
               return <path key={JSON.stringify([parentId, node.id])} d={path} opacity={node.kind === "tool" ? .55 : .8}
                 strokeDasharray={kind === "handoff" ? "5 3" : undefined} data-edge-kind={kind}
                 data-trace-parent={parentId} data-trace-child={node.id} data-edge-from-lane={parent.laneId} data-edge-to-lane={lane.id} />;

@@ -7,6 +7,12 @@
 .wt-heading > span { margin-left:auto; color:var(--wt-muted); font-size:9px; white-space:nowrap; }
 .wt-heads-scroll { flex:none; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; border-bottom:1px solid var(--wt-line); }
 .wt-heads-scroll::-webkit-scrollbar { display:none; }
+.wt-tunnels { max-height:82px; overflow-y:auto; border-top:1px solid var(--wt-line); padding:3px 0; }
+.wt-tunnels > div { display:flex; height:22px; align-items:center; }
+.wt-panel .wt-tunnel-rail { position:relative; height:18px; padding:0 9px; border:0; border-radius:0; background:linear-gradient(#44a7ad,#44a7ad) center/100% 1px no-repeat; color:#176b75; text-align:center; font-size:10px; }
+.wt-tunnel-rail::before,.wt-tunnel-rail::after { content:""; position:absolute; top:6px; width:6px; height:6px; border-radius:50%; background:#44a7ad; }
+.wt-tunnel-rail::before { left:0; } .wt-tunnel-rail::after { right:0; }
+.wt-tunnel-rail span { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 5px; background:var(--wt-bg); vertical-align:middle; }
 .wt-lane-heads { display:grid; min-width:100%; }
 .wt-panel .wt-lane-head { padding:8px 10px 7px; display:grid; gap:4px; min-width:0; border:0; border-right:1px solid var(--wt-line); background:transparent; text-align:left; border-radius:0; }
 .wt-lane-head:last-child { border-right:0; }
@@ -31,6 +37,10 @@
 .wt-scroll { flex:1; min-height:160px; overflow:auto; position:relative; scrollbar-width:thin; scrollbar-color:#d3e1e7 transparent; }
 .wt-tree-space { position:relative; min-height:100%; }
 .wt-rails { position:absolute; inset:0; pointer-events:none; }
+.wt-tunnel-edge { stroke:#087c93; stroke-width:2; stroke-dasharray:5 3; }
+.wt-tunnel { color:#087c93; font-size:15px; line-height:1; }
+@media (prefers-reduced-motion:no-preference) { .wt-tunnel-edge[data-live=true] { animation:wt-transfer 1s linear 3; } }
+@keyframes wt-transfer { to { stroke-dashoffset:-32; } }
 .wt-lane-divider { stroke:var(--wt-line); stroke-width:.7; stroke-dasharray:1 5; opacity:.7; }
 .wt-panel .wt-node { position:absolute; z-index:2; display:flex; align-items:flex-start; gap:3px; padding:0 5px 0 0; height:auto; min-height:23px; border:0; border-radius:0; background:transparent; text-align:left; }
 .wt-marker { position:relative; display:grid; place-items:center; width:18px; height:20px; flex:none; }

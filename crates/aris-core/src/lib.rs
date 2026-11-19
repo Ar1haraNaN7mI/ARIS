@@ -26,9 +26,11 @@ pub mod scheduler;
 mod session;
 pub mod settings;
 mod startup_profile;
+pub mod synthesis;
 mod system_prompt;
 pub mod task;
 pub mod templates;
+pub mod tunnel;
 pub mod verification;
 pub mod web_crawl;
 pub mod worker;
@@ -234,6 +236,7 @@ impl Runtime {
         runtime.scheduler.attach_runtime(&runtime);
         runtime.teams.attach_tasks(&runtime.tasks);
         runtime.teams.reconcile_tasks(&runtime.tasks)?;
+        tunnel::register(&runtime);
         if let Err(err) = runtime.workers.recover_stale_runs() {
             tracing::warn!(error = %err, "failed to recover stale worker runs");
         }

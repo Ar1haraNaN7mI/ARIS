@@ -43,6 +43,10 @@ async fn handle(runtime: Arc<Runtime>, method: &str, params: &Value) -> Result<V
         }
         "teams/list" => json!({"teams":runtime.teams.list()?}),
         "teams/get" => json!({"team":runtime.teams.get(string(params,"id")?)?}),
+        "teams/deliverable" => {
+            let team = runtime.teams.get(string(params, "id")?)?;
+            json!({"delivery":aris_core::synthesis::deliverable(&runtime, &team)?})
+        }
         "teams/plan" => json!({"team":crate::team_planner::plan(&runtime,params).await?}),
         "teams/admin" => {
             json!({"accepted":true,"team":crate::team_planner::admin(runtime.clone(),params)?})
