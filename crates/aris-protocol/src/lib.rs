@@ -350,6 +350,16 @@ impl GoalSpec {
 
 /// Durable task identity and current state.  Mutable execution details are
 /// recorded as events/checkpoints instead of being silently overwritten.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamTaskOwner {
+    pub subagent_id: String,
+    pub team_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub workspace: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskRecord {
     #[serde(default = "new_id")]
@@ -365,6 +375,9 @@ pub struct TaskRecord {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub parent_task_id: Option<String>,
+    /// Team-owned tasks are dispatched only by their dependency coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<TeamTaskOwner>,
     #[serde(default)]
     pub policy_snapshot: Value,
     #[serde(default)]
@@ -383,6 +396,7 @@ impl TaskRecord {
             created_at: now,
             updated_at: now,
             parent_task_id: None,
+            owner: None,
             policy_snapshot: Value::Object(serde_json::Map::new()),
             retry_policy: RetryPolicy::default(),
         })
@@ -403,6 +417,22 @@ impl TaskRecord {
         }
         self.goal.validate()?;
         self.retry_policy.validate()?;
+        if let Some(owner) = &self.owner {
+            if [
+                &owner.subagent_id,
+                &owner.team_id,
+                &owner.agent_id,
+                &owner.workspace,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            {
+                return Err("team task ownership fields must not be empty".into());
+            }
+            if self.session_id.is_none() {
+                return Err("team-owned task requires a session".into());
+            }
+        }
         if self
             .session_id
             .as_deref()

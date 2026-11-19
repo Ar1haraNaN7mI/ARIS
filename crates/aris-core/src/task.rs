@@ -514,6 +514,13 @@ impl TaskStore {
         tasks
     }
 
+    pub fn is_team_session(&self, session_id: &str) -> bool {
+        self.tasks
+            .read()
+            .values()
+            .any(|task| task.session_id.as_deref() == Some(session_id) && task.owner.is_some())
+    }
+
     pub fn transition_task(&self, id: &str, next: TaskState) -> Result<TaskRecord> {
         let _projection_guard = self.projection_guard.lock();
         let mut tasks = self.tasks.write();
@@ -851,14 +858,17 @@ impl TaskStore {
             .read()
             .values()
             .filter(|run| {
-                matches!(
-                    run.state,
-                    RunState::Running
-                        | RunState::WaitingApproval
-                        | RunState::WaitingEvent
-                        | RunState::Paused
-                ) && now.signed_duration_since(run.heartbeat_at.unwrap_or(run.updated_at))
-                    >= stale_after
+                self.task(&run.task_id)
+                    .is_none_or(|task| task.owner.is_none())
+                    && matches!(
+                        run.state,
+                        RunState::Running
+                            | RunState::WaitingApproval
+                            | RunState::WaitingEvent
+                            | RunState::Paused
+                    )
+                    && now.signed_duration_since(run.heartbeat_at.unwrap_or(run.updated_at))
+                        >= stale_after
             })
             .map(|run| run.id.clone())
             .collect();
@@ -882,16 +892,19 @@ impl TaskStore {
             .read()
             .values()
             .filter(|run| {
-                matches!(
-                    run.state,
-                    RunState::Running
-                        | RunState::WaitingApproval
-                        | RunState::WaitingEvent
-                        | RunState::Paused
-                ) && run
-                    .worker_id
-                    .as_deref()
-                    .is_some_and(|worker_id| worker_id != current_worker_id)
+                self.task(&run.task_id)
+                    .is_none_or(|task| task.owner.is_none())
+                    && matches!(
+                        run.state,
+                        RunState::Running
+                            | RunState::WaitingApproval
+                            | RunState::WaitingEvent
+                            | RunState::Paused
+                    )
+                    && run
+                        .worker_id
+                        .as_deref()
+                        .is_some_and(|worker_id| worker_id != current_worker_id)
             })
             .map(|run| run.id.clone())
             .collect();
@@ -902,6 +915,38 @@ impl TaskStore {
         Ok(recovered)
     }
 
+    /// Only call after acquiring the owning team's cross-process execution
+    /// lock. Generic worker/scheduler recovery must never steal a team's run.
+    pub(crate) fn interrupt_team_task(&self, task_id: &str) -> Result<()> {
+        let task = self
+            .task(task_id)
+            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+        anyhow::ensure!(task.owner.is_some(), "task is not team-owned");
+        if let Some(run) = self.latest_run_for_task(task_id) {
+            if matches!(
+                run.state,
+                RunState::Starting
+                    | RunState::Running
+                    | RunState::WaitingApproval
+                    | RunState::WaitingEvent
+                    | RunState::Paused
+            ) {
+                self.recover_stale_run(&run.id, Utc::now())?;
+            }
+        }
+        let current = self.task(task_id).unwrap();
+        if matches!(
+            current.state,
+            TaskState::Running
+                | TaskState::WaitingApproval
+                | TaskState::WaitingEvent
+                | TaskState::Paused
+        ) {
+            self.transition_task(task_id, TaskState::Failed)?;
+        }
+        Ok(())
+    }
+
     fn recover_stale_run(&self, id: &str, now: DateTime<Utc>) -> Result<RunRecord> {
         let _projection_guard = self.projection_guard.lock();
         let mut runs = self.runs.write();
@@ -910,7 +955,8 @@ impl TaskStore {
             .ok_or_else(|| anyhow::anyhow!("run not found: {id}"))?;
         if !matches!(
             run.state,
-            RunState::Running
+            RunState::Starting
+                | RunState::Running
                 | RunState::WaitingApproval
                 | RunState::WaitingEvent
                 | RunState::Paused
@@ -942,7 +988,7 @@ impl TaskStore {
             ) {
                 let previous_task = task.clone();
                 let retryable = updated.attempt < task.retry_policy.max_attempts;
-                let next_state = if retryable {
+                let next_state = if retryable && task.owner.is_none() {
                     TaskState::Queued
                 } else {
                     TaskState::Failed

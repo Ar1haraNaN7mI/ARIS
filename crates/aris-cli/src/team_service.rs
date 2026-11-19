@@ -55,7 +55,7 @@ async fn handle(runtime: Arc<Runtime>, method: &str, params: &Value) -> Result<V
             json!({"team":runtime.teams.create(&runtime,spec)?})
         }
         "teams/run" => {
-            json!({"accepted":true,"team":runtime.teams.start(runtime.clone(),string(params,"id")?)?})
+            json!({"accepted":true,"team":runtime.teams.start_all(runtime.clone(),string(params,"id")?)?})
         }
         "teams/cancel" => json!({"team":runtime.teams.cancel(string(params,"id")?)?}),
         "teams/message" => {

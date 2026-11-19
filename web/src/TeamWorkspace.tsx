@@ -82,7 +82,7 @@ export function TeamWorkspace({ initialData, latestProfile, onChat }: { initialD
     if (!profiles.length) { setLocalError("请先连接一个模型，再发送消息。"); setMode("models"); return; }
     const created = selectedTemplate ? await state.create(templateDraft(selectedTemplate, goal, profiles, newProfile)) : await state.admin(goal, undefined, newProfile || undefined);
     if (!created) return;
-    selectTeam(created.id); setQuickGoal("");
+    selectTeam(created.id, !selectedTemplate ? adminAgent(created)?.id : undefined); setQuickGoal("");
     if (selectedTemplate) await state.run(created.id);
     return created;
   }

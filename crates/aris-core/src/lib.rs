@@ -175,9 +175,6 @@ impl Runtime {
             std::time::Duration::from_secs(config.agent.worker_heartbeat_secs.max(1)),
             std::time::Duration::from_secs(config.agent.worker_stale_secs.max(2)),
         ));
-        if let Err(err) = workers.recover_stale_runs() {
-            tracing::warn!(error = %err, "failed to recover stale worker runs");
-        }
         let scheduler = Arc::new(TaskScheduler::new(
             tasks.clone(),
             config.agent.scheduler_enabled,
@@ -235,6 +232,11 @@ impl Runtime {
             task_reservations: Mutex::new(HashSet::new()),
         });
         runtime.scheduler.attach_runtime(&runtime);
+        runtime.teams.attach_tasks(&runtime.tasks);
+        runtime.teams.reconcile_tasks(&runtime.tasks)?;
+        if let Err(err) = runtime.workers.recover_stale_runs() {
+            tracing::warn!(error = %err, "failed to recover stale worker runs");
+        }
 
         runtime
             .prompt

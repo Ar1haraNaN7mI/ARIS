@@ -222,7 +222,7 @@ impl TaskScheduler {
     fn promote_retries(&self, runtime: &Arc<Runtime>) {
         let now = Utc::now();
         for task in self.tasks.tasks() {
-            if task.state != TaskState::Failed {
+            if task.owner.is_some() || task.state != TaskState::Failed {
                 continue;
             }
             let Some(run) = self.tasks.latest_run_for_task(&task.id) else {
@@ -261,7 +261,8 @@ impl TaskScheduler {
     fn recover_stranded_tasks(&self, runtime: &Arc<Runtime>) {
         let active = self.state.lock().active.clone();
         for task in self.tasks.tasks() {
-            if task.state != TaskState::Running
+            if task.owner.is_some()
+                || task.state != TaskState::Running
                 || active.contains(&task.id)
                 || runtime.is_task_reserved(&task.id)
             {
@@ -321,7 +322,8 @@ impl TaskScheduler {
 
     fn fail_exhausted_queued(&self, runtime: &Arc<Runtime>) {
         for task in self.tasks.tasks() {
-            if task.state != TaskState::Queued
+            if task.owner.is_some()
+                || task.state != TaskState::Queued
                 || runtime.is_task_reserved(&task.id)
                 || runtime.active_agents.lock().contains_key(&task.id)
             {
@@ -501,7 +503,9 @@ fn queued_candidates(
 ) -> Vec<aris_protocol::TaskRecord> {
     tasks
         .iter()
-        .filter(|task| task.state == TaskState::Queued && task.session_id.is_some())
+        .filter(|task| {
+            task.owner.is_none() && task.state == TaskState::Queued && task.session_id.is_some()
+        })
         .take(capacity)
         .cloned()
         .collect()

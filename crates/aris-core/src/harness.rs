@@ -1,6 +1,7 @@
 //! Durable multi-agent workspaces. File snapshots never touch the user's Git index.
 use crate::{AgentEvent, AgentHandle, AgentLoop, Runtime};
 use anyhow::{bail, ensure, Context, Result};
+use aris_protocol::{GoalSpec, RetryPolicy, TaskRecord, TaskState, TeamTaskOwner};
 use chrono::Utc;
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -10,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -41,6 +42,13 @@ pub struct TeamAgent {
     pub files: Vec<String>,
     #[serde(default)]
     pub session_id: String,
+    /// Stable native identity; the existing session is the subagent conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default = "pending")]
     pub status: String,
     #[serde(default)]
@@ -143,6 +151,8 @@ pub struct Team {
     pub admin: Option<TeamAdmin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_budget: Option<TeamExecutionBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_agent_ids: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamSpec {
@@ -159,6 +169,9 @@ pub struct TeamStore {
     transaction: Mutex<()>,
     handles: Mutex<HashMap<String, Vec<AgentHandle>>>,
     live_outputs: Mutex<HashMap<(String, String), String>>,
+    /// Disposable lookup cache; Team.agents remains the only role registry.
+    session_ownership: Mutex<HashMap<String, bool>>,
+    tasks: Mutex<Option<Weak<crate::TaskStore>>>,
 }
 
 impl TeamStore {
@@ -170,6 +183,8 @@ impl TeamStore {
             transaction: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
             live_outputs: Mutex::new(HashMap::new()),
+            session_ownership: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(None),
         })
     }
     fn directory(&self, id: &str) -> Result<PathBuf> {
@@ -244,6 +259,19 @@ impl TeamStore {
             && !self.handles.lock().contains_key(id)
         {
             if let Ok(_lease) = self.run_lock(id) {
+                if let Some(tasks) = self.tasks.lock().as_ref().and_then(Weak::upgrade) {
+                    for agent in &team.agents {
+                        if let Some(task) = agent.task_id.as_deref().and_then(|id| tasks.task(id)) {
+                            if task.owner.as_ref().is_some_and(|owner| {
+                                owner.team_id == team.id
+                                    && owner.agent_id == agent.id
+                                    && Some(&owner.subagent_id) == agent.subagent_id.as_ref()
+                            }) {
+                                tasks.interrupt_team_task(&task.id)?;
+                            }
+                        }
+                    }
+                }
                 team.status = "failed".into();
                 if let Some(admin) = &mut team.admin {
                     if admin.phase == "planning" {
@@ -298,6 +326,7 @@ impl TeamStore {
         let mut team = self.read(id)?;
         update(&mut team)?;
         self.save(&team)?;
+        self.cache_team_sessions(&team);
         Ok(team)
     }
     fn event(team: &mut Team, agent_id: Option<&str>, kind: &str, message: &str) {
@@ -307,6 +336,218 @@ impl TeamStore {
             kind: kind.into(),
             message: message.into(),
         });
+    }
+    /// Team.agents is the durable subagent registry. No second conversation or
+    /// shadow role store is created. Legacy roles acquire an identity in place.
+    fn register_workers(team: &mut Team) {
+        let parent = team.admin.as_ref().map(|admin| admin.session_id.as_str());
+        for agent in &mut team.agents {
+            if Some(agent.session_id.as_str()) == parent {
+                continue;
+            }
+            if agent.subagent_id.is_none() {
+                agent.subagent_id = Some(new_id());
+            }
+        }
+    }
+    fn task_owner(&self, team: &Team, agent: &TeamAgent) -> Result<TeamTaskOwner> {
+        Ok(TeamTaskOwner {
+            subagent_id: agent
+                .subagent_id
+                .clone()
+                .context("subagent is not registered")?,
+            team_id: team.id.clone(),
+            agent_id: agent.id.clone(),
+            parent_session_id: team.admin.as_ref().map(|admin| admin.session_id.clone()),
+            workspace: self.workspace.to_string_lossy().into_owned(),
+        })
+    }
+    /// Ordinary chat/task entry points must not bypass a team's frozen model,
+    /// dependency ordering, artifact leases or cancellation boundaries.
+    pub fn owns_session(&self, session_id: &str) -> Result<bool> {
+        if let Some(owned) = self.session_ownership.lock().get(session_id) {
+            return Ok(*owned);
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_dir() && Uuid::parse_str(&id).is_ok() {
+                let Ok(team) = self.read(&id) else { continue };
+                if team
+                    .agents
+                    .iter()
+                    .any(|agent| agent.session_id == session_id)
+                    || team
+                        .admin
+                        .as_ref()
+                        .is_some_and(|admin| admin.session_id == session_id)
+                {
+                    self.cache_team_sessions(&team);
+                    return Ok(true);
+                }
+            }
+        }
+        self.session_ownership
+            .lock()
+            .insert(session_id.into(), false);
+        Ok(false)
+    }
+    fn cache_team_sessions(&self, team: &Team) {
+        let mut cache = self.session_ownership.lock();
+        for agent in &team.agents {
+            cache.insert(agent.session_id.clone(), true);
+        }
+        if let Some(admin) = &team.admin {
+            cache.insert(admin.session_id.clone(), true);
+        }
+    }
+    /// Run before the ordinary scheduler starts. Historical task records are
+    /// linked by their already-persisted session, without replaying any work.
+    pub(crate) fn reconcile_tasks(&self, tasks: &crate::TaskStore) -> Result<()> {
+        let mut ids = Vec::new();
+        let mut historical: HashMap<String, Vec<TaskRecord>> = HashMap::new();
+        for task in tasks.tasks() {
+            if let Some(session_id) = &task.session_id {
+                historical.entry(session_id.clone()).or_default().push(task);
+            }
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_dir() || Uuid::parse_str(&id).is_err() {
+                continue;
+            }
+            let _guard = self.transaction.lock();
+            let _state = self.state_lock(&id)?;
+            let mut team = match self.read(&id) {
+                Ok(team) => team,
+                Err(error) => {
+                    tracing::warn!(team_id=%id, %error, "skipping unreadable historical team");
+                    continue;
+                }
+            };
+            let before = team
+                .agents
+                .iter()
+                .map(|agent| {
+                    (
+                        agent.subagent_id.clone(),
+                        agent.task_id.clone(),
+                        agent.run_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Self::register_workers(&mut team);
+            let owners: HashMap<_, _> = team
+                .agents
+                .iter()
+                .filter(|agent| agent.subagent_id.is_some())
+                .map(|agent| Ok((agent.id.clone(), self.task_owner(&team, agent)?)))
+                .collect::<Result<_>>()?;
+            for agent in &mut team.agents {
+                let Some(owner) = owners.get(&agent.id) else {
+                    continue;
+                };
+                let Some(history) = historical.get(&agent.session_id) else {
+                    continue;
+                };
+                for task in history {
+                    if let Some(existing) = &task.owner {
+                        ensure!(
+                            existing.subagent_id == owner.subagent_id
+                                && existing.team_id == owner.team_id
+                                && existing.agent_id == owner.agent_id,
+                            "task belongs to another subagent"
+                        );
+                    } else {
+                        tasks.update_task(&task.id, |record| record.owner = Some(owner.clone()))?;
+                    }
+                }
+                if let Some(task) = history.iter().max_by(|left, right| {
+                    left.updated_at
+                        .cmp(&right.updated_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                }) {
+                    agent.task_id = Some(task.id.clone());
+                    agent.run_id = tasks.latest_run_for_task(&task.id).map(|run| run.id);
+                }
+            }
+            let changed = team.agents.iter().zip(before).any(|(agent, previous)| {
+                (
+                    agent.subagent_id.clone(),
+                    agent.task_id.clone(),
+                    agent.run_id.clone(),
+                ) != previous
+            });
+            if changed {
+                self.save(&team)?;
+            }
+            self.cache_team_sessions(&team);
+            ids.push(team.id.clone());
+        }
+        // Identity migration happens first, so get() can reconcile the real
+        // task/run only while it owns the released execution lock.
+        for id in ids {
+            self.get(&id)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn attach_tasks(&self, tasks: &Arc<crate::TaskStore>) {
+        *self.tasks.lock() = Some(Arc::downgrade(tasks));
+    }
+    fn prepare_task(
+        &self,
+        runtime: &Runtime,
+        team: &Team,
+        agent: &TeamAgent,
+        prompt: &str,
+    ) -> Result<TaskRecord> {
+        let owner = self.task_owner(team, agent)?;
+        let reusable = agent
+            .task_id
+            .as_deref()
+            .and_then(|id| runtime.tasks.task(id))
+            .filter(|task| {
+                task.owner.as_ref() == Some(&owner)
+                    && task.session_id.as_deref() == Some(&agent.session_id)
+                    && task.goal.outcome == prompt
+                    && matches!(
+                        task.state,
+                        TaskState::Queued | TaskState::Paused | TaskState::Failed
+                    )
+            });
+        let task = if let Some(task) = reusable {
+            task
+        } else {
+            let mut task = TaskRecord::new_with_retry_policy(
+                GoalSpec::new(prompt),
+                RetryPolicy {
+                    max_attempts: runtime.config.agent.retry_max_attempts,
+                    backoff_secs: runtime.config.agent.retry_backoff_secs,
+                    max_backoff_secs: runtime.config.agent.retry_max_backoff_secs,
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            task.session_id = Some(agent.session_id.clone());
+            task.parent_task_id = owner
+                .parent_session_id
+                .as_deref()
+                .and_then(|id| runtime.tasks.task_for_session(id))
+                .map(|parent| parent.id);
+            task.owner = Some(owner);
+            runtime.tasks.create_task(task)?
+        };
+        self.mutate(&team.id, |team| {
+            let current = team
+                .agents
+                .iter_mut()
+                .find(|candidate| candidate.id == agent.id)
+                .context("agent missing")?;
+            current.task_id = Some(task.id.clone());
+            current.run_id = None;
+            Ok(())
+        })?;
+        Ok(task)
     }
     pub fn create(&self, runtime: &Runtime, mut spec: TeamSpec) -> Result<Team> {
         ensure!(
@@ -344,6 +585,9 @@ impl TeamStore {
             }
             runtime.sessions.persist_now_result(&session)?;
             agent.session_id = session.read().id.clone();
+            agent.subagent_id = None;
+            agent.task_id = None;
+            agent.run_id = None;
             agent.status = pending();
             agent.output.clear();
             agent.error = None;
@@ -362,10 +606,13 @@ impl TeamStore {
             created_at: now(),
             admin: None,
             execution_budget: None,
+            dispatch_agent_ids: None,
         };
+        Self::register_workers(&mut team);
         Self::event(&mut team, None, "created", "Shared workspace created");
         let _guard = self.transaction.lock();
         self.save(&team)?;
+        self.cache_team_sessions(&team);
         Ok(team)
     }
     fn validate_files(&self, files: &[String]) -> Result<Vec<String>> {
@@ -687,6 +934,9 @@ impl TeamStore {
                 .find(|a| a.session_id == admin.session_id)
             {
                 controller.profile_id.clone_from(&admin.profile_id);
+                controller.subagent_id = None;
+                controller.task_id = None;
+                controller.run_id = None;
             }
             team.admin = Some(admin);
             team.status = "planning".into();
@@ -800,12 +1050,19 @@ impl TeamStore {
                 }
                 runtime.sessions.persist_now_result(&session)?;
                 agent.session_id = session.read().id.clone();
+                agent.subagent_id = None;
+                agent.task_id = None;
+                agent.run_id = None;
                 agent.status = pending();
                 agent.output.clear();
                 agent.error = None;
             }
             team.files = files;
+            for agent in &additions {
+                Self::event(team, Some(&agent.id), "subagent_created", &agent.name);
+            }
             team.agents.extend(additions);
+            Self::register_workers(team);
             for agent in &mut team.agents {
                 if agent.session_id == admin_session {
                     agent.status = "completed".into();
@@ -829,6 +1086,7 @@ impl TeamStore {
                 });
             }
             let delegated = !selected.is_empty();
+            team.dispatch_agent_ids = None;
             team.execution_budget = delegated.then(|| TeamExecutionBudget {
                 agent_ids: selected.into_iter().collect(),
                 max_agent_runs: 6,
@@ -946,6 +1204,15 @@ impl TeamStore {
         let lease = self.run_lock(id)?;
         self.start_reserved(runtime, id, lease)
     }
+    pub fn start_all(self: &Arc<Self>, runtime: Arc<Runtime>, id: &str) -> Result<Team> {
+        self.get(id)?;
+        let lease = self.run_lock(id)?;
+        self.mutate(id, |team| {
+            team.dispatch_agent_ids = None;
+            Ok(())
+        })?;
+        self.start_reserved(runtime, id, lease)
+    }
     /// Transfers the controller lease directly into execution with no unlock gap.
     pub fn start_reserved(
         self: &Arc<Self>,
@@ -974,6 +1241,7 @@ impl TeamStore {
             )?;
         }
         let team = self.mutate(id, |team| {
+            Self::register_workers(team);
             apply_queued_messages(team);
             ensure!(
                 team.agents
@@ -982,13 +1250,14 @@ impl TeamStore {
                 "all agents completed; send a message to continue"
             );
             self.capture(team, "Before run")?;
-            let budget = team.execution_budget.clone();
+            let selected: HashSet<_> = team
+                .agents
+                .iter()
+                .filter(|agent| selected_for_run(team, agent))
+                .map(|agent| agent.id.clone())
+                .collect();
             for agent in &mut team.agents {
-                if agent.status != "completed"
-                    && budget
-                        .as_ref()
-                        .is_none_or(|b| b.agent_ids.contains(&agent.id))
-                {
+                if agent.status != "completed" && selected.contains(&agent.id) {
                     agent.status = pending();
                     agent.error = None;
                     agent.output.clear();
@@ -1034,8 +1303,14 @@ impl TeamStore {
             if team.status == "cancelling" {
                 self.mutate(id, |t| {
                     t.status = "cancelled".into();
+                    let selected: HashSet<_> = t
+                        .agents
+                        .iter()
+                        .filter(|agent| selected_for_run(t, agent))
+                        .map(|agent| agent.id.clone())
+                        .collect();
                     for a in &mut t.agents {
-                        if a.status == "pending" {
+                        if a.status == "pending" && selected.contains(&a.id) {
                             a.status = "cancelled".into();
                         }
                     }
@@ -1068,11 +1343,14 @@ impl TeamStore {
                         .filter(|a| selected_for_run(t, a))
                         .all(|a| a.status == "completed");
                     t.status = if complete { "completed" } else { "failed" }.into();
-                    let budget = t.execution_budget.clone();
+                    let selected: HashSet<_> = t
+                        .agents
+                        .iter()
+                        .filter(|agent| selected_for_run(t, agent))
+                        .map(|agent| agent.id.clone())
+                        .collect();
                     for a in &mut t.agents {
-                        if a.status == "pending"
-                            && budget.as_ref().is_none_or(|b| b.agent_ids.contains(&a.id))
-                        {
+                        if a.status == "pending" && selected.contains(&a.id) {
                             a.status = "failed".into();
                             a.error = Some("A dependency did not complete".into());
                         }
@@ -1160,8 +1438,11 @@ impl TeamStore {
             }
             let session = runtime.sessions.get_or_load(&agent.session_id)?;
             let prompt = agent_prompt(&team, &agent);
+            let task = self.prepare_task(&runtime, &team, &agent, &prompt)?;
             let (tx, mut rx) = mpsc::channel(256);
-            let handle = runner.run_turn(session, prompt, tx).await?;
+            let handle = runner
+                .run_team_task(task.id.clone(), session, prompt, tx)
+                .await?;
             {
                 self.handles
                     .lock()
@@ -1197,6 +1478,24 @@ impl TeamStore {
                     }
                 };
                 match event {
+                    AgentEvent::TurnStarted(_) => {
+                        let run_id = runtime
+                            .tasks
+                            .latest_run_for_task(&task.id)
+                            .map(|run| run.id);
+                        if let Err(failure) = self.mutate(id, |team| {
+                            let current = team
+                                .agents
+                                .iter_mut()
+                                .find(|candidate| candidate.id == agent.id)
+                                .context("subagent missing")?;
+                            current.run_id = run_id;
+                            Ok(())
+                        }) {
+                            error = Some(failure.to_string());
+                            handle.cancel();
+                        }
+                    }
                     AgentEvent::TextDelta(text) => {
                         output.push_str(&text);
                         self.live_outputs
@@ -1249,6 +1548,17 @@ impl TeamStore {
                     _ => {}
                 }
             }
+            let native_task = runtime
+                .tasks
+                .task(&task.id)
+                .context("subagent task missing")?;
+            let latest_run = runtime
+                .tasks
+                .latest_run_for_task(&task.id)
+                .map(|run| run.id);
+            if native_task.state == TaskState::Failed && error.is_none() {
+                error = Some("Native subagent task failed".into());
+            }
             self.mutate(id, |t| {
                 let cancelling = t.status == "cancelling";
                 let current = t
@@ -1257,9 +1567,14 @@ impl TeamStore {
                     .find(|a| a.id == agent.id)
                     .context("agent missing")?;
                 current.output = output;
+                current.run_id = latest_run;
                 current.status = if cancelling {
                     "cancelled"
+                } else if native_task.state == TaskState::Cancelled {
+                    "cancelled"
                 } else if error.is_some() {
+                    "failed"
+                } else if native_task.state != TaskState::Completed {
                     "failed"
                 } else {
                     "completed"
@@ -1281,13 +1596,33 @@ impl TeamStore {
                 .lock()
                 .remove(&(id.into(), agent.id.clone()));
             self.mutate(id, |t| {
+                let cancelling = t.status == "cancelling";
                 let a = t
                     .agents
                     .iter_mut()
                     .find(|a| a.id == agent.id)
                     .context("agent missing")?;
-                a.status = "failed".into();
+                a.status = if cancelling { "cancelled" } else { "failed" }.into();
                 a.error = Some(error.to_string());
+                if let Some(task) = a.task_id.as_deref().and_then(|id| runtime.tasks.task(id)) {
+                    if !matches!(
+                        task.state,
+                        TaskState::Completed | TaskState::Cancelled | TaskState::Failed
+                    ) {
+                        runtime.tasks.transition_task(
+                            &task.id,
+                            if cancelling {
+                                TaskState::Cancelled
+                            } else {
+                                TaskState::Failed
+                            },
+                        )?;
+                    }
+                    a.run_id = runtime
+                        .tasks
+                        .latest_run_for_task(&task.id)
+                        .map(|run| run.id);
+                }
                 Self::event(t, Some(&agent.id), "agent_error", &error.to_string());
                 Ok(())
             })?;
@@ -1295,6 +1630,10 @@ impl TeamStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "harness_tests.rs"]
+mod native_tests;
 
 fn default_cascade() -> bool {
     true
@@ -1340,6 +1679,15 @@ fn apply_queued_messages(team: &mut Team) {
             agent.status = pending();
             agent.error = None;
             agent.output.clear();
+        }
+    }
+    if !matches!(team.status.as_str(), "running" | "cancelling") {
+        team.dispatch_agent_ids = Some(affected.iter().cloned().collect());
+    } else if let Some(scope) = &mut team.dispatch_agent_ids {
+        for id in &affected {
+            if !scope.contains(id) {
+                scope.push(id.clone());
+            }
         }
     }
     for message in &mut team.messages {
@@ -1448,7 +1796,13 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
         }
         if !selected_for_run(team, agent)
             || agent.status != "pending"
-            || !agent.depends_on.iter().all(|d| complete.contains(d))
+            || !agent.depends_on.iter().all(|d| {
+                complete.contains(d)
+                    || team
+                        .dispatch_agent_ids
+                        .as_ref()
+                        .is_some_and(|scope| !scope.contains(d))
+            })
         {
             continue;
         }
@@ -1466,6 +1820,10 @@ fn selected_for_run(team: &Team, agent: &TeamAgent) -> bool {
     team.execution_budget
         .as_ref()
         .is_none_or(|b| b.agent_ids.contains(&agent.id))
+        && team
+            .dispatch_agent_ids
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&agent.id))
 }
 
 #[cfg(test)]
@@ -1489,6 +1847,7 @@ mod tests {
             created_at: now(),
             admin: None,
             execution_budget: None,
+            dispatch_agent_ids: None,
         }
     }
     #[test]

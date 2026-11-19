@@ -172,7 +172,7 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
         const selected = activeTeamId === lane.team.id && selectedAgentId === lane.agent.id;
         const name = lane.kind === "admin" ? `${lane.agent.name} · 管理员` : lane.agent.name;
         return <button type="button" key={lane.id} className="wt-lane-head" data-lane-id={lane.id} data-lane-team={lane.team.id} data-lane-agent={lane.agent.id} data-current={selected} data-status={lane.agent.status}
-          aria-pressed={selected} title={`${lane.team.name} · ${name} · ${lane.model}`} style={{ "--lc": lane.color } as CSSProperties} onClick={() => { setDetail(undefined); setShowTeamEvents(false); onSelectAgent(lane.team.id, lane.agent.id); }}>
+          data-subagent-id={lane.agent.subagent_id} aria-pressed={selected} title={`${lane.team.name} · ${name} · ${lane.model}`} style={{ "--lc": lane.color } as CSSProperties} onClick={() => { setDetail(undefined); setShowTeamEvents(false); onSelectAgent(lane.team.id, lane.agent.id); }}>
           {!focused && visibleTeams.length > 1 && <small className="wt-team-name">{lane.team.name}</small>}
           <span className="wt-lane-name"><i /><span>{name}</span></span>
           <span className="wt-lane-model"><AgentGlyph profileId={lane.agent.profile_id} profiles={profiles} size={11} /><span>{lane.model}</span></span>

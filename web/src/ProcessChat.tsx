@@ -67,6 +67,19 @@ function writtenFile(event?: SessionEvent) {
   const record = args as Record<string, unknown>;
   return typeof record.path === "string" ? record.path : typeof record.file_path === "string" ? record.file_path : undefined;
 }
+const adminTools = new Map([["create_sub_agents", "创建子智能体"], ["dispatch_sub_agents", "分派给子智能体"]]);
+function recipientsFromReceipt(team: Team, result?: SessionEvent): TeamAgent[] {
+  if (!result?.ok || !result.content) return [];
+  try {
+    const receipt = JSON.parse(result.content);
+    if (receipt?.team_id !== team.id || !Array.isArray(receipt.agents)) return [];
+    const recipients = new Map<string, string>();
+    for (const actor of receipt.agents) {
+      if (typeof actor?.agent_id === "string" && typeof actor?.session_id === "string") recipients.set(actor.agent_id, actor.session_id);
+    }
+    return team.agents.filter((actor) => actor.session_id && actor.session_id !== team.admin?.session_id && recipients.get(actor.id) === actor.session_id);
+  } catch { return []; }
+}
 export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }: { team: Team; sessions: Record<string, SessionResult>; profiles: ModelProfile[]; agentId?: string; onSelectAgent: (id: string) => void }) {
   const entries = useMemo(() => conversationEntries(team, sessions, agentId, profiles), [team, sessions, agentId, profiles]);
   const activeAgents = conversationAgents(team).filter((agent) => agent.status === "running" && (!agentId || agent.id === agentId));
@@ -86,7 +99,25 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
       const live = !result && !entry.tool.turnEnded && agent?.status === "running";
       const duration = result ? Date.parse(result.at) - Date.parse(event.at) : NaN;
       const file = result?.ok === true ? writtenFile(event) : undefined;
-      return <div key={entry.id} {...attrs} className="lp-process-row" style={{ "--model-color": color, "--light-color": color } as CSSProperties}><details className={`lp-tool-step ${live ? "running" : ""} ${result?.ok === false ? "failed" : ""}`}><summary>{live && <RunningBorder />}<span className={`lp-step-marker ${result?.ok === false ? "failed" : ""}`} /><strong>{event.name || result?.name || "工具调用"}</strong><span className="lp-tool-owner">{agent?.name}</span><small>{live ? "执行中" : result ? result.ok === false ? "失败" : "已完成" : "未返回"}{Number.isFinite(duration) && duration >= 0 && ` · ${duration < 1000 ? `${duration} ms` : `${(duration / 1000).toFixed(1)} s`}`}</small></summary><div className="lp-tool-body">{event.type === "tool_call" && <details open><summary>输入参数</summary><pre>{pretty(event.arguments)}</pre></details>}{result && <details open><summary>工具返回</summary><pre>{pretty(result.content)}</pre></details>}</div></details>{file && <div className="lp-delivery"><FileTextIcon /><span>产物 · <code>{file}</code></span></div>}</div>;
+      const toolName = event.name || result?.name || "";
+      const adminTool = team.admin && agent?.session_id === team.admin.session_id ? adminTools.get(toolName) : undefined;
+      const recipients = adminTool ? recipientsFromReceipt(team, result) : [];
+      return <div key={entry.id} {...attrs} className="lp-process-row" style={{ "--model-color": color, "--light-color": color } as CSSProperties}>
+        <details className={`lp-tool-step ${live ? "running" : ""} ${result?.ok === false ? "failed" : ""}`}>
+          <summary>{live && <RunningBorder />}<span className={`lp-step-marker ${result?.ok === false ? "failed" : ""}`} />
+            <strong>{adminTool || toolName || "工具调用"}</strong><span className="lp-tool-owner">{agent?.name}</span>
+            <small>{live ? "执行中" : result ? result.ok === false ? "失败" : "已完成" : "未返回"}{Number.isFinite(duration) && duration >= 0 && ` · ${duration < 1000 ? `${duration} ms` : `${(duration / 1000).toFixed(1)} s`}`}</small>
+          </summary>
+          <div className="lp-tool-body">
+            {event.type === "tool_call" && <details open><summary>输入参数</summary><pre>{pretty(event.arguments)}</pre></details>}
+            {result && <details open><summary>工具返回</summary><pre>{pretty(result.content)}</pre></details>}
+          </div>
+        </details>
+        {recipients.length > 0 && <div className="lp-agent-receipts">{recipients.map((actor) =>
+          <button type="button" key={actor.id} aria-label={`打开${actor.name}的会话`} onClick={() => onSelectAgent(actor.id)}>{actor.name} ↗</button>
+        )}</div>}
+        {file && <div className="lp-delivery"><FileTextIcon /><span>产物 · <code>{file}</code></span></div>}
+      </div>;
     }
     if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{agent?.name} · {entry.noteLabel || (agent?.error === entry.note ? "执行失败" : "运行记录")}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
     return <article className={`lp-assistant-message ${entry.partial ? "running" : ""}`} key={entry.id} {...attrs} style={{ "--model-color": color, "--light-color": color } as CSSProperties}>{entry.partial && <RunningBorder />}<div className="lp-message-who"><AgentGlyph family={entry.identity?.family || "unknown"} /><button title={entry.identity?.modelId || "历史模型未记录"} onClick={() => agent && onSelectAgent(agent.id)}>{agent?.name}</button>{entry.identity?.modelId && <small className="lp-message-model">{entry.identity.modelId}</small>}<time>{formatTime(entry.at)}</time>{entry.partial && <span className="lp-writing">正在回复</span>}</div>{entry.event?.reasoning && <details className="lp-reasoning"><summary>思考过程</summary><pre>{entry.event.reasoning}</pre></details>}{entry.event?.text && <Body text={entry.event.text} />}</article>;

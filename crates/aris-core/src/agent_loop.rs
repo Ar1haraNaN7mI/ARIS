@@ -6,6 +6,7 @@ use crate::{
     compact_tool_description, compact_tool_result, compact_tool_schema, select_tools_for_query,
 };
 use crate::{ApprovalScope, Runtime};
+use anyhow::Context;
 use aris_llm::{FinishReason, LlmEvent, LlmRequestOptions, ToolFunctionSpec, ToolSpec};
 use aris_protocol::{
     CheckpointRecord, EventEnvelope, EventSource, GoalSpec, RetryPolicy, RunState, TaskRecord,
@@ -236,6 +237,11 @@ impl AgentLoop {
         user_text: String,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> anyhow::Result<AgentHandle> {
+        anyhow::ensure!(
+            !self.runtime.tasks.is_team_session(&session.read().id)
+                && !self.runtime.teams.owns_session(&session.read().id)?,
+            "Team conversations must be continued through teams/message or teams/admin"
+        );
         self.spawn_turn(session, user_text, event_tx, None).await
     }
 
@@ -248,6 +254,76 @@ impl AgentLoop {
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> anyhow::Result<AgentHandle> {
         let task_id = task_id.into();
+        anyhow::ensure!(
+            self.runtime
+                .tasks
+                .task(&task_id)
+                .is_none_or(|task| task.owner.is_none()),
+            "Team-owned tasks must be resumed through their team coordinator"
+        );
+        anyhow::ensure!(
+            !self.runtime.tasks.is_team_session(&session.read().id)
+                && !self.runtime.teams.owns_session(&session.read().id)?,
+            "Team conversations must be continued through their team coordinator"
+        );
+        self.spawn_reserved_task(task_id, session, user_text, event_tx)
+            .await
+    }
+
+    /// Only the dependency coordinator can invoke a registered subagent. The
+    /// profile and conversation come from the persisted role, never a caller.
+    pub(crate) async fn run_team_task(
+        &self,
+        task_id: String,
+        session: Arc<RwLock<Session>>,
+        user_text: String,
+        event_tx: mpsc::Sender<AgentEvent>,
+    ) -> anyhow::Result<AgentHandle> {
+        let task = self
+            .runtime
+            .tasks
+            .task(&task_id)
+            .context("team task missing")?;
+        let owner = task.owner.as_ref().context("team task ownership missing")?;
+        let team = self.runtime.teams.get(&owner.team_id)?;
+        let agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.id == owner.agent_id)
+            .context("subagent missing")?;
+        anyhow::ensure!(
+            team.status == "running" && agent.status == "running",
+            "subagent is not scheduled"
+        );
+        anyhow::ensure!(
+            agent.subagent_id.as_deref() == Some(&owner.subagent_id)
+                && agent.task_id.as_deref() == Some(&task_id)
+                && task.session_id.as_deref() == Some(&agent.session_id)
+                && session.read().id == agent.session_id,
+            "subagent task/session binding mismatch"
+        );
+        anyhow::ensure!(
+            self.profile
+                .as_ref()
+                .is_some_and(|profile| profile.id == agent.profile_id),
+            "subagent must use its assigned model profile"
+        );
+        anyhow::ensure!(
+            std::path::Path::new(&owner.workspace).canonicalize()?
+                == self.runtime.workspace_root.canonicalize()?,
+            "subagent workspace mismatch"
+        );
+        self.spawn_reserved_task(task_id, session, user_text, event_tx)
+            .await
+    }
+
+    async fn spawn_reserved_task(
+        &self,
+        task_id: String,
+        session: Arc<RwLock<Session>>,
+        user_text: String,
+        event_tx: mpsc::Sender<AgentEvent>,
+    ) -> anyhow::Result<AgentHandle> {
         self.runtime.reserve_task(task_id.clone());
         match self
             .spawn_turn(session, user_text, event_tx, Some(task_id.clone()))
@@ -689,7 +765,7 @@ async fn run_turn_inner(
         let (llm_tx, mut llm_rx) = mpsc::channel(256);
         let llm = turn_llm.clone();
         let tools_for_llm = tool_specs.clone();
-        let cancel_for_llm = cancel_rx.clone();
+        let mut cancel_for_llm = cancel_rx.clone();
         let request_options = if model_policy.max_tokens.is_some()
             || model_policy.temperature.is_some()
             || model_policy.thinking.is_some()
@@ -706,14 +782,25 @@ async fn run_turn_inner(
             None
         };
         let llm_task = tokio::spawn(async move {
-            llm.stream_chat_cancellable_with_options(
+            let stream_cancel = cancel_for_llm.clone();
+            let request = llm.stream_chat_cancellable_with_options(
                 &messages,
                 &tools_for_llm,
                 llm_tx,
-                Some(cancel_for_llm),
+                Some(stream_cancel),
                 request_options,
-            )
-            .await
+            );
+            // Some gateways do not send response headers until generation has
+            // finished. Cancellation must also interrupt that first-byte wait.
+            tokio::select! {
+                result = request => result,
+                _ = async {
+                    loop {
+                        if *cancel_for_llm.borrow() { break; }
+                        if cancel_for_llm.changed().await.is_err() { break; }
+                    }
+                } => Err(aris_llm::LlmError::Api("cancelled".into())),
+            }
         });
 
         // Stream path: forward to UI immediately; do NOT append per-token chunk

@@ -27,6 +27,24 @@ it("routes a no-role home message through admin exactly once without a second ru
   expect(mocks.admin).toHaveBeenCalledTimes(1); expect(mocks.run).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
   expect(mocks.harness).toHaveBeenCalledWith(undefined, undefined, false);
 });
+it("opens the coordinator conversation and gives each spawned worker a peer lane with its own target", async () => {
+  const coordinator = { ...worker, id: "admin", name: "ARIS", role: "admin", session_id: "controller-session" };
+  const writer = { ...worker, id: "writer", name: "Writer", session_id: "writer-session", subagent_id: "sub-writer", depends_on: [worker.id] };
+  const team: Team = { ...base, agents: [coordinator, { ...worker, subagent_id: "sub-research" }, writer],
+    admin: { session_id: coordinator.session_id, profile_id: "astra", model_id: "actual-astra", family: "gpt", phase: "delegated", response: "I assigned both workers." } };
+  mocks.admin.mockImplementationOnce(async () => { mocks.state = { ...mocks.state, teams: [team], team }; return team; });
+  const view = render(<TeamWorkspace onChat={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("新消息"), { target: { value: "Delegate two tasks" } });
+  fireEvent.keyDown(screen.getByLabelText("新消息"), { key: "Enter" });
+  await waitFor(() => expect(view.container.querySelector('[data-relay-agent="admin"]')?.getAttribute("aria-pressed")).toBe("true"));
+  const rows = view.container.querySelectorAll(".lp-relay-row");
+  expect(rows).toHaveLength(3);
+  expect(Array.from(rows).map((row) => row.getAttribute("data-relay-session"))).toEqual(["controller-session", "worker-session", "writer-session"]);
+  expect(Array.from(rows).every((row) => row.querySelectorAll("[data-relay-agent]").length === 1)).toBe(true);
+  fireEvent.click(rows[2].querySelector("button")!);
+  expect(screen.getByLabelText("发送给 Writer")).toBeTruthy();
+  expect(screen.queryByText("I assigned both workers.")).toBeNull();
+});
 it("sends a selected worker's continuation directly to its original session route", async () => {
   const view = render(<TeamWorkspace onChat={vi.fn()} />);
   fireEvent.click(view.container.querySelector(".lp-session-row")!);

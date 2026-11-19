@@ -97,6 +97,7 @@ function teamNode(team: Team, event: Team["events"][number], occurrence: number,
     case "admin_failed": kind = "error"; label = "ARIS · 未完成"; break;
     case "admin_cancelled": kind = "cancelled"; label = "ARIS · 已停止"; break;
     case "admin_stopped": kind = "note"; label = "ARIS · 处理已停止"; break;
+    case "subagent_created": kind = "note"; label = `已创建 · ${agent?.name || event.message}`; break;
     case "agent_started": kind = "start"; label = agent ? `${agent.name} · 开始` : event.message; break;
     case "agent_finished":
       kind = /:\s*failed$/.test(event.message) ? "error" : /:\s*cancelled$/.test(event.message) ? "cancelled" : /:\s*completed$/.test(event.message) ? "complete" : "note";
@@ -149,7 +150,7 @@ function arrangeRoleLanes(lanes: TraceLane[]) {
     const previous = latest.get(lane.agent.id);
     node.y = 24;
     link(node, previous, "sequence");
-    const starting = node.teamEventKind === "agent_started" || (!previous && !node.handoffFrom);
+    const starting = node.teamEventKind === "agent_started" || (!previous && !node.handoffFrom && node.teamEventKind !== "subagent_created");
     if (starting && lane.kind !== "admin") {
       const priorInputs = consumed.get(lane.agent.id) || new Map<string, string>();
       let newInputs = 0;

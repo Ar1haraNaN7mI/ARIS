@@ -544,10 +544,16 @@ async fn handle_request(
             }))
         }
         "tasks/resume" => {
-            require_api_key(&runtime)?;
             let wait = optional_bool(&params, "wait")?.unwrap_or(false);
             let id = required_string(&params, "id")?;
             let task = resolve_task(&runtime, &id)?;
+            if let Some(owner) = &task.owner {
+                return Err(RpcFailure::invalid_params(format!(
+                    "Continue this subagent with teams/message (id={}, agent_id={}, cascade=false)",
+                    owner.team_id, owner.agent_id
+                )));
+            }
+            require_api_key(&runtime)?;
             if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
                 return Err(RpcFailure::invalid_params(format!(
                     "task {} is terminal ({:?})",
@@ -809,17 +815,36 @@ async fn handle_request(
             require_api_key(&runtime)?;
             let wait = optional_bool(&params, "wait")?.unwrap_or(false);
             let prompt = required_string(&params, "prompt")?;
+            let task_id = params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if task_id
+                .as_deref()
+                .and_then(|id| runtime.tasks.task(id))
+                .is_some_and(|task| task.owner.is_some())
+            {
+                return Err(RpcFailure::invalid_params(
+                    "Continue a subagent's task with teams/message",
+                ));
+            }
             let session = if let Some(session_id) = params.get("session_id").and_then(Value::as_str)
             {
                 resolve_session(&runtime, session_id)?
             } else {
                 runtime.sessions.create()
             };
-            let task_id = params
-                .get("task_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
             let session_id = session.read().id.clone();
+            if runtime.tasks.is_team_session(&session_id)
+                || runtime
+                    .teams
+                    .owns_session(&session_id)
+                    .map_err(|err| RpcFailure::internal(err.to_string()))?
+            {
+                return Err(RpcFailure::invalid_params(
+                    "Continue team conversations with teams/message or teams/admin",
+                ));
+            }
             let session_guard = SessionTurnGuard::acquire(&runtime, &session_id)?;
             // A delete may have completed between resolution and reservation.
             let session = runtime

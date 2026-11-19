@@ -9,6 +9,7 @@ export type KeiConfig = { base_url: string; profiles: ModelProfile[]; configured
 export type TeamAgent = {
   id: string; name: string; role: string; profile_id: string; prompt: string;
   depends_on: string[]; files: string[]; session_id?: string | null;
+  subagent_id?: string | null; task_id?: string | null; run_id?: string | null;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   output?: string | null; error?: string | null;
 };

@@ -2582,7 +2582,7 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
         .context("team id missing from response")?
         .to_owned();
     if method == "teams/plan" {
-        result = json!({"team":runtime.teams.start(runtime.clone(), &id)?});
+        result = json!({"team":runtime.teams.start_all(runtime.clone(), &id)?});
     }
     let mut interrupted = false;
     let mut event_cursor = result["team"]["events"].as_array().map_or(0, Vec::len);

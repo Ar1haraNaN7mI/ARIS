@@ -30,13 +30,37 @@ export function relayStages(team: Team) {
 }
 
 export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId, onSelect }: { teams: Team[]; profiles: ModelProfile[]; selectedTeamId?: string; selectedAgentId?: string; onSelect: (teamId: string, agentId?: string) => void }) {
-  return <section className="lp-relay" aria-label="任务协作顺序">{teams.map((team, index) => <div className={`lp-relay-row ${team.id === selectedTeamId ? "selected" : ""}`} key={team.id}>
-    <button className="lp-relay-label" title={team.name} onClick={() => onSelect(team.id)}><i style={{ background: ["#4c92d1", "#8976c4", "#38a38f", "#c29142"][index % 4] }} />{team.name}</button>
-    <div className="lp-relay-stages">{relayStages(team).map((stage, stageIndex) => <span className="lp-relay-stage" key={stageIndex}>{stageIndex > 0 && <span className="lp-relay-arrow">→</span>}{stage.map((agent, agentIndex) => {
-      const profile = profiles.find((item) => item.id === agent.profile_id);
-      return <span className="lp-relay-step" key={agent.id}>{agentIndex > 0 && <span className="lp-relay-parallel" title="并行">+</span>}<button className={`lp-model-chip ${agent.status} ${team.id === selectedTeamId && agent.id === selectedAgentId ? "selected" : ""}`} style={{ "--model-color": modelColors[profile?.family || "gpt"], "--light-color": modelColors[profile?.family || "gpt"] } as CSSProperties} title={`${agent.name} · ${profile?.model || agent.profile_id} · ${statusLabels[agent.status]}`} data-anchor-key={`chip:${team.id}:${agent.id}`} data-relay-team={team.id} data-relay-agent={agent.id} onClick={() => onSelect(team.id, agent.id)}>{agent.status === "running" && <RunningBorder />}<ModelGlyph family={profile?.family} /><span>{agent.name}</span>{agent.status === "completed" && <small>✓</small>}{agent.status === "running" && <i className="lp-chip-live" />}{agent.status === "failed" && <small className="lp-failed">!</small>}</button></span>;
-    })}</span>)}</div>
-  </div>)}{!teams.length && <div className="lp-relay-empty">会话开始后，模型与子任务将在这里同步展开。</div>}</section>;
+  return <section className="lp-relay" aria-label="智能体泳道">{teams.map((team, index) => {
+    const members = relayStages(team).flat();
+    const names = new Map(members.map((agent) => [agent.id, agent.name]));
+    return <div className="lp-relay-group" key={team.id}>
+      <button className={`lp-relay-label ${team.id === selectedTeamId ? "selected" : ""}`} title={team.name} onClick={() => onSelect(team.id)}>
+        <i style={{ background: ["#4c92d1", "#8976c4", "#38a38f", "#c29142"][index % 4] }} />{team.name}
+      </button>
+      <div className="lp-relay-lanes">{members.map((agent) => {
+        const profile = profiles.find((item) => item.id === agent.profile_id);
+        const isAdmin = !!team.admin && team.admin.session_id === agent.session_id;
+        const model = (isAdmin && team.admin?.model_id) || profile?.model || agent.profile_id;
+        const selected = team.id === selectedTeamId && agent.id === selectedAgentId;
+        const predecessors = agent.depends_on.map((id) => names.get(id) || id).join("、");
+        const color = modelColors[profile?.family || "gpt"];
+        return <div key={agent.id} className="lp-relay-row" data-relay-session={agent.session_id} data-subagent-id={agent.subagent_id}>
+          <button className={`lp-model-chip ${agent.status} ${selected ? "selected" : ""}`}
+            style={{ "--model-color": color, "--light-color": color } as CSSProperties}
+            title={`${agent.name} · ${model} · ${statusLabels[agent.status]}`} aria-pressed={selected}
+            data-anchor-key={`chip:${team.id}:${agent.id}`} data-relay-team={team.id} data-relay-agent={agent.id}
+            onClick={() => onSelect(team.id, agent.id)}>
+            {agent.status === "running" && <RunningBorder />}<ModelGlyph family={profile?.family} />
+            <span>{isAdmin ? `${agent.name} · 管理员` : agent.name}</span>
+            {agent.status === "completed" && <small>✓</small>}{agent.status === "running" && <i className="lp-chip-live" />}
+            {agent.status === "failed" && <small className="lp-failed">!</small>}
+          </button>
+          <small className="lp-relay-model" title={model}>{model}</small>
+          {predecessors && <small className="lp-relay-inputs" title={predecessors}>接收 {predecessors} 的交付</small>}
+        </div>;
+      })}</div>
+    </div>;
+  })}{!teams.length && <div className="lp-relay-empty">会话开始后，智能体会在这里各自展开。</div>}</section>;
 }
 
 export function ModelReel({ profiles, selected, onSelect, allowAuto = false }: { profiles: ModelProfile[]; selected?: string; onSelect: (id: string) => void; allowAuto?: boolean }) {

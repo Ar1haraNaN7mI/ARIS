@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { conversationEntries, ProcessChat } from "./ProcessChat";
 import { agentStages } from "./ProcessRelay";
@@ -10,6 +10,24 @@ afterEach(cleanup);
 const agent = (id: string, deps: string[] = []): TeamAgent => ({ id, name: id, role: id, profile_id: "gpt", prompt: "", files: [], depends_on: deps, status: "completed", session_id: `session-${id}` });
 const makeTeam = (): Team => ({ id: "t", name: "Task", goal: "Initial request", created_at: at(0), status: "completed", agents: [agent("a"), agent("b")], files: [], events: [], handoffs: [], checkpoints: [], messages: [{ id: "m", text: "Follow up", at: at(2), queued: true }] });
 describe("Process conversation uses real chronological records", () => {
+  it("opens only the worker sessions confirmed in the administrator's creation receipt", () => {
+    const team = makeTeam();
+    team.admin = { session_id: "session-a", profile_id: "gpt", model_id: "gpt", family: "gpt", phase: "delegated", response: "" };
+    team.agents.push(agent("c"));
+    const result = { team_id: team.id, agents: [{ agent_id: "b", session_id: "session-b", created: true }, { agent_id: "c", session_id: "old-session", created: true }] };
+    const session: SessionResult = { session: { id: "session-a", name: "ARIS", events: [
+      { id: "call", type: "tool_call", at: at(2), call_id: "spawn", name: "create_sub_agents", arguments: {} },
+      { id: "result", type: "tool_result", at: at(3), call_id: "spawn", name: "create_sub_agents", ok: true, content: JSON.stringify(result) },
+    ] }, state: null, task_id: null };
+    const select = vi.fn();
+    const view = render(<ProcessChat team={team} agentId="a" sessions={{ a: session }} profiles={[]} onSelectAgent={select} />);
+    fireEvent.click(screen.getByRole("button", { name: "打开b的会话" }));
+    expect(select).toHaveBeenCalledWith("b");
+    expect(screen.queryByRole("button", { name: "打开c的会话" })).toBeNull();
+    session.session.events[1] = { ...session.session.events[1], ok: false };
+    view.rerender(<ProcessChat team={team} agentId="a" sessions={{ a: session }} profiles={[]} onSelectAgent={select} />);
+    expect(screen.queryByRole("button", { name: "打开b的会话" })).toBeNull();
+  });
   it("interleaves historical replies with user messages across agents", () => {
     const team = makeTeam();
     const sessions = Object.fromEntries(["a", "b"].map((id, index) => [id, { session: { id: `session-${id}`, name: id, events: [{ id: "reply", type: "assistant_message", at: at(index ? 3 : 1), text: `${id} result` }] }, task_id: null, state: null } satisfies SessionResult]));
