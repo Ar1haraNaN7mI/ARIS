@@ -8,7 +8,8 @@ export type ModelProfile = {
 export type KeiConfig = { base_url: string; profiles: ModelProfile[]; configured: boolean };
 export type TunnelMessage = {
   id: string; seq: number; from: string; to: string; text: string; at: string;
-  kind: "message" | "proposal" | "accept"; proposal_id?: string | null;
+  kind: "message" | "notice" | "question" | "answer" | "proposal" | "accept" | "cowork_invite" | "cowork_accept" | "cowork_decline" | "cowork_result";
+  expects_reply?: boolean; reply_to?: string | null; proposal_id?: string | null; followup_closed_reason?: string | null;
 };
 export type TeamTunnel = {
   id: string; participants: string[]; topic: string; status: "open" | "closed" | "cancelled" | "interrupted";

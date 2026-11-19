@@ -1,5 +1,6 @@
 import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
 import { adminAgent, conversationAgents } from "./teamConversationModel";
+import { mirrorsReceivedTunnelMessage, tunnelMessageLabel } from "./tunnelMessages";
 import type { SessionEvent, SessionResult } from "./types";
 import { sessionModelIdentities, type SessionModelIdentity } from "./sessionModelIdentity";
 
@@ -58,6 +59,7 @@ function sessionNodes(team: Team, agent: TeamAgent, events: SessionEvent[], prof
   for (const event of events) {
     if (event.type === "turn_start" || event.type === "turn_end") { closeTurn(); continue; }
     if (!["user_message", "assistant_message", "tool_call", "tool_result", "system_note"].includes(event.type)) continue;
+    if (event.type === "system_note" && mirrorsReceivedTunnelMessage(team, agent.id, event.id)) continue;
     if (event.type === "tool_result" && event.call_id && pending.has(event.call_id)) {
       const node = pending.get(event.call_id)!;
       node.durationMs = Math.max(0, time(event.at) - time(node.at));
@@ -112,6 +114,7 @@ function teamNode(team: Team, event: Team["events"][number], occurrence: number,
     case "messages_applied": kind = "message"; label = "已接收补充要求"; break;
     case "model_changed": kind = "model"; label = compact(event.message); break;
     case "checkpoint": kind = "checkpoint"; label = checkpointLabel(event.message); break;
+    case "tunnel_resumed": kind = "start"; label = "继续处理协作请求"; break;
     case "agent_error": case "error": case "interrupted": kind = "error"; label = compact(event.message); break;
     case "cancelled": case "cancelling": kind = "cancelled"; label = event.kind === "cancelled" ? "执行已停止" : "正在停止"; break;
     case "finished": kind = event.message === "All agents completed" ? "complete" : "error"; label = kind === "complete" ? "流程完成" : "流程未完成"; break;
@@ -246,12 +249,12 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       if (!from || !to || from === to || !channel.participants.includes(message.from) || !channel.participants.includes(message.to)) continue;
       const sentId = nodeId(team.id, "tunnel", channel.id, message.id, "send");
       const receivedId = nodeId(team.id, "tunnel", channel.id, message.id, "receive");
-      const verb = message.kind === "accept" ? "同意" : message.kind === "proposal" ? "提议" : "发言";
+      const verb = tunnelMessageLabel(message);
       const base = { teamId: team.id, tunnelId: channel.id, at: message.at, kind: "tunnel" as const, source: "tunnel" as const, detail: message.text, y: 0 };
       from.nodes.push({ ...base, id: sentId, revision: sentId, laneId: from.id, agentId: from.agent.id, tunnelOrder: 2 * message.seq,
         label: `${verb} → ${to.label}`, parentIds: [], parentKinds: {} });
       to.nodes.push({ ...base, id: receivedId, revision: receivedId, laneId: to.id, agentId: to.agent.id, tunnelOrder: 2 * message.seq + 1,
-        sentNodeId: sentId, label: `来自 ${from.label} · ${verb}`, parentIds: [], parentKinds: {} });
+        sentNodeId: sentId, label: `${verb} ← ${from.label}`, parentIds: [], parentKinds: {} });
     }
     for (const handoff of team.handoffs) {
       const id = nodeId(team.id, "handoff", handoff.id);

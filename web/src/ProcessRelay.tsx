@@ -4,6 +4,7 @@ import { RunningBorder } from "./RunningBorder";
 import type { ModelFamily, ModelProfile, Team, TeamAgent } from "./teamTypes";
 import { statusLabels } from "./teamTypes";
 import { adminAgent, workerAgents } from "./teamConversationModel";
+import { tunnelMessageLabel } from "./tunnelMessages";
 
 export const modelColors: Record<ModelFamily, string> = { gpt: "#169785", gemini: "#7182d7", grok: "#516a7a", deepseek: "#4c89d8", glm: "#8b71bc", kimi: "#b38a32" };
 export function ModelGlyph({ family, className = "" }: { family?: ModelFamily; className?: string }) {
@@ -59,7 +60,7 @@ export function ProcessRelay({ teams, profiles, selectedTeamId, selectedAgentId,
           {predecessors && <small className="lp-relay-inputs" title={predecessors}>接收 {predecessors} 的交付</small>}
         </div>;
       })}{team.tunnels?.filter((t) => t.status === "open").map((t) => <button key={t.id} className="lp-tunnel-relay" data-live-tunnel={t.id} onClick={() => onOpenTunnel?.(team.id, t.id)}>
-        <span aria-hidden="true">⇄</span><strong>{t.participants.map((id) => names.get(id) || id).join(" · ")}</strong><span>协商中 · {t.topic}</span>
+        <span aria-hidden="true">⇄</span><strong>{t.participants.map((id) => names.get(id) || id).join(" · ")}</strong><span>{t.messages.length ? tunnelMessageLabel(t.messages[t.messages.length - 1]) : "协作通道"} · {t.topic}</span>
       </button>)}</div>
     </div>;
   })}{!teams.length && <div className="lp-relay-empty">会话开始后，智能体会在这里各自展开。</div>}</section>;

@@ -994,8 +994,8 @@ async fn run_turn_inner(
         let needs_tools =
             !tool_calls.is_empty() && assembled.finish_reason == FinishReason::ToolCalls;
         if !needs_tools {
-            let peer_arrived =
-                _step + 1 < max_steps && crate::tunnel::has_unread(&runtime, &task_id)?;
+            let peer_arrived = _step + 1 < max_steps
+                && crate::tunnel::has_unread_request_or_result(&runtime, &task_id)?;
             missing_files = match &output_check {
                 Some(check) => check.missing(&session.read())?,
                 None => vec![],

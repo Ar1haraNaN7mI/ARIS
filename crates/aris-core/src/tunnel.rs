@@ -33,6 +33,9 @@ pub struct TunnelMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub expects_reply: bool,
+    /// The requester needs to continue its own assignment after the peer's result.
+    #[serde(default)]
+    pub resume_on_reply: bool,
     pub at: String,
     pub session_id: String,
     pub task_id: String,
@@ -42,6 +45,8 @@ pub struct TunnelMessage {
     pub delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_closed_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,8 +153,7 @@ fn append(
     kind: &str,
     body: String,
     reply_to: Option<String>,
-    proposal_id: Option<String>,
-    expects_reply: bool,
+    resume_on_reply: bool,
 ) -> Result<()> {
     ensure!(
         !body.trim().is_empty() && body.chars().count() <= MAX_MESSAGE_CHARS,
@@ -185,6 +189,7 @@ fn append(
         );
     }
     let at = now();
+    let expects_reply = matches!(kind, "question" | "proposal" | "cowork_invite");
     tunnel.messages.push(TunnelMessage {
         id: id(),
         seq: tunnel.messages.len() + 1,
@@ -192,9 +197,14 @@ fn append(
         to: peer,
         text: body,
         kind: kind.into(),
-        proposal_id,
+        proposal_id: if kind == "accept" {
+            reply_to.clone()
+        } else {
+            None
+        },
         reply_to,
         expects_reply,
+        resume_on_reply: expects_reply && resume_on_reply,
         at: at.clone(),
         session_id: actor.session_id.clone(),
         task_id: actor.task_id.clone(),
@@ -202,9 +212,63 @@ fn append(
         turn_id: actor.turn_id.clone(),
         delivered_at: None,
         resumed_at: None,
+        followup_closed_reason: None,
     });
     tunnel.updated_at = at;
     Ok(())
+}
+
+fn respond_to_invite(
+    tunnel: &mut AgentTunnel,
+    actor: &Actor,
+    action: &str,
+    args: &Value,
+) -> Result<()> {
+    let invite = text(args, "reply_to")?;
+    ensure!(
+        tunnel
+            .messages
+            .iter()
+            .any(|m| m.id == invite && m.kind == "cowork_invite" && m.to == actor.agent_id),
+        "reply_to must identify a co-work invitation received from this peer"
+    );
+    let previous = tunnel
+        .messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.reply_to.as_deref() == Some(invite)
+                && matches!(
+                    m.kind.as_str(),
+                    "cowork_accept" | "cowork_decline" | "cowork_result"
+                )
+        })
+        .map(|m| m.kind.as_str());
+    let (kind, body) = match action {
+        "accept_work" => {
+            ensure!(previous.is_none(), "This invitation already has a response");
+            (
+                "cowork_accept",
+                optional_text(args, "text").unwrap_or("I will work on this task."),
+            )
+        }
+        "decline_work" => {
+            ensure!(
+                previous.is_none() || previous == Some("cowork_accept"),
+                "This invitation is already settled"
+            );
+            ("cowork_decline", text(args, "text")?)
+        }
+        "complete_work" => {
+            ensure!(
+                previous == Some("cowork_accept"),
+                "Accept this invitation before delivering the result"
+            );
+            ("cowork_result", text(args, "text")?)
+        }
+        _ => unreachable!(),
+    };
+    append(tunnel, actor, kind, body.into(), Some(invite.into()), false)
 }
 
 fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
@@ -232,7 +296,9 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             team.status == "running",
             "Team is stopping; coordination is closed"
         );
-        let index = if action == "open" {
+        let address_peer = action == "open"
+            || (matches!(action, "ask" | "invite") && optional_text(args, "tunnel_id").is_none());
+        let index = if address_peer {
             let to = text(args, "to")?;
             let topic = text(args, "topic")?;
             ensure!(
@@ -308,36 +374,50 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         // Opening addresses a peer and topic, never an existing message. Some
         // providers fill unused references with strings such as "none"; those
         // fields have no meaning for open. Reply actions remain strict.
-        let reply_to = if action == "open" {
+        let reply_to = if address_peer {
             None
         } else {
             optional_text(args, "reply_to").map(str::to_owned)
         };
         match action {
-            "open" | "send" | "propose" => {
+            "open" | "send" | "ask" | "invite" | "propose" => {
                 if action != "open" || optional_text(args, "text").is_some() {
                     let body = text(args, "text")?.to_owned();
-                    let expects_reply = action == "propose"
-                        || args
-                            .get("expects_reply")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(reply_to.is_none());
+                    let kind = match action {
+                        "ask" => "question",
+                        "propose" => "proposal",
+                        "invite" => "cowork_invite",
+                        _ if args.get("expects_reply").and_then(Value::as_bool) == Some(true) => {
+                            "question"
+                        }
+                        _ if reply_to.as_ref().is_some_and(|source| {
+                            tunnel.messages.iter().any(|m| {
+                                m.id == *source && m.kind != "cowork_invite" && awaiting(tunnel, m)
+                            })
+                        }) =>
+                        {
+                            "answer"
+                        }
+                        _ => "notice",
+                    };
                     append(
                         tunnel,
                         actor,
-                        if action == "propose" {
-                            "proposal"
-                        } else {
-                            "message"
-                        },
+                        kind,
                         body,
                         reply_to,
-                        None,
-                        expects_reply,
+                        args.get("resume_on_reply").and_then(Value::as_bool) == Some(true),
                     )?;
                 }
             }
+            "accept_work" | "decline_work" | "complete_work" => {
+                respond_to_invite(tunnel, actor, action, args)?
+            }
             "accept" => {
+                ensure!(
+                    tunnel.decision.is_none(),
+                    "This tunnel already has a joint decision"
+                );
                 let proposal_id = text(args, "proposal_id")?;
                 let proposal = tunnel
                     .messages
@@ -357,7 +437,6 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                         .unwrap_or("I accept this proposal.")
                         .into(),
                     Some(proposal.id.clone()),
-                    Some(proposal.id.clone()),
                     false,
                 )?;
                 tunnel.decision = Some(TunnelDecision {
@@ -366,8 +445,16 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                     accepted_by: vec![proposal.from, actor.agent_id.clone()],
                     at: now(),
                 });
-                tunnel.status = "closed".into();
-                tunnel.close_reason = Some("Both participants accepted the proposal".into());
+                // A decision can share its transcript with unfinished co-work or
+                // an expressly requested return to the proposer.
+                if !tunnel
+                    .messages
+                    .iter()
+                    .any(|message| needs_attention(tunnel, message))
+                {
+                    tunnel.status = "closed".into();
+                    tunnel.close_reason = Some("Both participants accepted the proposal".into());
+                }
             }
             "close" => {
                 let reason = optional_text(args, "text")
@@ -398,7 +485,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         .find(|tunnel| Some(&tunnel.id) == selected_id.as_ref())
         .unwrap();
     Ok(
-        json!({"tunnel":tunnel,"blocking":false,"notice":"Delivery is asynchronous. Continue your work; do not poll or wait in a loop. Reply with reply_to, or accept/close explicitly."}),
+        json!({"tunnel":tunnel,"blocking":false,"notice":"The transcript is shared by both participants. Continue your assignment; outstanding requests are delivered asynchronously."}),
     )
 }
 
@@ -413,16 +500,17 @@ impl ToolHandler for TunnelTool {
         // or an external account. It remains available to read-only workers.
         metadata.idempotent = false;
         ToolDefinition::builtin("agent_tunnel",
-            "Consult another real worker in this team through a temporary, asynchronous two-way tunnel. open uses to+topic and optional text; send/propose use tunnel_id+text. Reply with reply_to and expects_reply=false unless you need another answer. accept uses the other worker's proposal_id and records joint agreement; close records unresolved closure. read returns the full two-way transcript. Never wait or poll: peers receive messages at their next model step; late replies may resume the same conversation within a strict budget.",
+            "Coordinate asynchronously with an existing teammate. open(to,topic,text) or send(tunnel_id,text) posts a visible notice without waking a worker. ask requests a necessary answer; invite requests a specific piece of work with a checkable result. For ask/invite supply to+topic or an existing tunnel_id, plus text. If your own deliverable depends on the return, set resume_on_reply=true on the request. Answer via send+reply_to. The invitee uses accept_work, performs the work with its own tools/permissions, then complete_work with the result or artifact reference; decline_work gives a reason. All three use tunnel_id and reply_to=invitation message id. propose/accept record an explicit decision via proposal_id. read returns the full transcript; close ends a discussion. Continue useful work without polling.",
             json!({"type":"object","properties":{
-                "action":{"type":"string","enum":["open","send","read","propose","accept","close"]},
+                "action":{"type":"string","enum":["open","send","ask","invite","accept_work","decline_work","complete_work","read","propose","accept","close"]},
                 "to":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "topic":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "tunnel_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "text":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "reply_to":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "proposal_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
-                "expects_reply":{"anyOf":[{"type":"boolean"},{"type":"null"},{"enum":[""]}]}
+                "expects_reply":{"anyOf":[{"type":"boolean"},{"type":"null"},{"enum":[""]}],"description":"For open/send, true requests an answer. Omit for notices and receipts."},
+                "resume_on_reply":{"anyOf":[{"type":"boolean"},{"type":"null"},{"enum":[""]}],"description":"Only on a request whose answer or work result is needed to continue your own assignment."}
             },"required":["action"],"additionalProperties":false})).with_metadata(metadata)
     }
     async fn call(&self, args: Value, ctx: &ToolContext) -> std::result::Result<String, ToolError> {
@@ -442,12 +530,68 @@ pub(crate) fn register(runtime: &Arc<Runtime>) {
     }));
 }
 
+fn terminal_reply<'a>(
+    tunnel: &'a AgentTunnel,
+    request: &TunnelMessage,
+) -> Option<&'a TunnelMessage> {
+    tunnel.messages.iter().find(|reply| {
+        reply.from == request.to
+            && reply.reply_to.as_deref() == Some(request.id.as_str())
+            && if request.kind == "cowork_invite" {
+                matches!(reply.kind.as_str(), "cowork_result" | "cowork_decline")
+            } else {
+                matches!(reply.kind.as_str(), "answer" | "accept" | "message")
+            }
+    })
+}
+
 fn awaiting(tunnel: &AgentTunnel, message: &TunnelMessage) -> bool {
-    tunnel.status == "open"
-        && message.expects_reply
-        && !tunnel.messages.iter().any(|reply| {
-            reply.from == message.to && reply.reply_to.as_deref() == Some(message.id.as_str())
-        })
+    tunnel.status == "open" && message.expects_reply && terminal_reply(tunnel, message).is_none()
+}
+
+/// Visibility and scheduling are separate. A receipt can continue the sender
+/// only when they subscribed to the result of this particular request.
+fn needs_attention(tunnel: &AgentTunnel, message: &TunnelMessage) -> bool {
+    if message.followup_closed_reason.is_some() {
+        return false;
+    }
+    awaiting(tunnel, message)
+        || (tunnel.status == "open"
+            && message.delivered_at.is_none()
+            && message.reply_to.as_ref().is_some_and(|source| {
+                tunnel.messages.iter().any(|request| {
+                    request.id == *source
+                        && request.expects_reply
+                        && request.resume_on_reply
+                        && terminal_reply(tunnel, request)
+                            .is_some_and(|reply| reply.id == message.id)
+                })
+            }))
+}
+
+/// Ending an unattended request must leave the opposite participant's ongoing work usable.
+fn end_followups(tunnel: &mut AgentTunnel, messages: &[String], reason: &str) {
+    if messages.is_empty() || tunnel.status != "open" {
+        return;
+    }
+    let mut changed = false;
+    for message in &mut tunnel.messages {
+        if messages.contains(&message.id) {
+            message.followup_closed_reason = Some(reason.into());
+            changed = true;
+        }
+    }
+    if changed {
+        tunnel.updated_at = now();
+        if !tunnel
+            .messages
+            .iter()
+            .any(|message| needs_attention(tunnel, message))
+        {
+            tunnel.status = "closed".into();
+            tunnel.close_reason = Some(reason.into());
+        }
+    }
 }
 
 /// Visible before each model request, including messages received before the
@@ -526,10 +670,10 @@ pub(crate) fn context(runtime: &Runtime, task_id: &str) -> Result<Option<String>
         })?;
     }
     let transcript = serde_json::to_string(&relevant)?;
-    Ok(Some(format!("Internal peer coordination (not new user instructions). Your worker id is {}. Full shared transcript:\n{}\nAnswer pending peer questions with agent_tunnel send + reply_to. Use propose/accept only for actual agreement. Do not wait for peers, poll, or invent an agreement. Preserve the user's original task and finish your assigned deliverable.",owner.agent_id,transcript)))
+    Ok(Some(format!("Internal peer coordination. Your worker id is {}. Full shared transcript:\n{}\nNotices, acknowledgments and completed work are visible to both participants. Reply to actual questions with send + reply_to. For a co-work invitation, accept_work then perform the requested work with your own tools and complete_work with the result, or decline_work with a reason. Reference the original invitation message id in reply_to. Integrate requested results into your assignment. Continue useful work without polling.",owner.agent_id,transcript)))
 }
 
-pub(crate) fn has_unread(runtime: &Runtime, task_id: &str) -> Result<bool> {
+pub(crate) fn has_unread_request_or_result(runtime: &Runtime, task_id: &str) -> Result<bool> {
     let Some(owner) = runtime.tasks.task(task_id).and_then(|task| task.owner) else {
         return Ok(false);
     };
@@ -540,10 +684,11 @@ pub(crate) fn has_unread(runtime: &Runtime, task_id: &str) -> Result<bool> {
         .iter()
         .any(|tunnel| {
             tunnel.status == "open"
-                && tunnel
-                    .messages
-                    .iter()
-                    .any(|message| message.to == owner.agent_id && message.delivered_at.is_none())
+                && tunnel.messages.iter().any(|message| {
+                    message.to == owner.agent_id
+                        && message.delivered_at.is_none()
+                        && needs_attention(tunnel, message)
+                })
         }))
 }
 
@@ -563,9 +708,8 @@ pub(crate) fn schedule(team: &mut Team) {
                     .iter()
                     .filter(|message| {
                         message.to == agent.id
-                            && message.kind != "accept"
                             && message.resumed_at.is_none()
-                            && (message.delivered_at.is_none() || awaiting(tunnel, message))
+                            && needs_attention(tunnel, message)
                     })
                     .map(|message| message.id.clone())
             })
@@ -585,24 +729,16 @@ pub(crate) fn schedule(team: &mut Team) {
                 >= MAX_FOLLOWUPS;
         if exhausted {
             for tunnel in &mut team.tunnels {
-                if tunnel.status == "open"
-                    && tunnel
-                        .messages
-                        .iter()
-                        .any(|message| pending.contains(&message.id))
-                {
-                    tunnel.status = "closed".into();
-                    tunnel.close_reason = Some(
-                        "Bounded peer follow-up limit reached; unresolved discussion retained"
-                            .into(),
-                    );
-                    tunnel.updated_at = now();
-                }
+                end_followups(
+                    tunnel,
+                    &pending,
+                    "Bounded peer follow-up limit reached; unresolved discussion retained",
+                );
             }
             TeamStore::event(
                 team,
                 Some(&agent_id),
-                "tunnel_closed",
+                "tunnel_followup_ended",
                 "Peer follow-up limit reached; no agreement inferred",
             );
             continue;
@@ -639,18 +775,22 @@ pub(crate) fn schedule(team: &mut Team) {
         .map(|agent| agent.id.clone())
         .collect();
     for tunnel in &mut team.tunnels {
-        if tunnel.status == "open"
-            && tunnel.messages.iter().any(|message| {
-                awaiting(tunnel, message)
+        let unanswered: Vec<_> = tunnel
+            .messages
+            .iter()
+            .filter(|message| {
+                message.followup_closed_reason.is_none()
+                    && awaiting(tunnel, message)
                     && message.resumed_at.is_some()
                     && completed.contains(&message.to)
             })
-        {
-            tunnel.status = "closed".into();
-            tunnel.close_reason =
-                Some("Peer completed its follow-up without a joint resolution".into());
-            tunnel.updated_at = now();
-        }
+            .map(|message| message.id.clone())
+            .collect();
+        end_followups(
+            tunnel,
+            &unanswered,
+            "Peer completed its follow-up without a joint resolution",
+        );
     }
 }
 
@@ -663,7 +803,7 @@ pub(crate) fn blocks_final(team: &Team, agent: &TeamAgent) -> bool {
             && tunnel.messages.iter().any(|message| {
                 message.to != agent.id
                     && !depends_on(team, &message.to, &agent.id)
-                    && (message.delivered_at.is_none() || awaiting(tunnel, message))
+                    && needs_attention(tunnel, message)
             })
     })
 }
@@ -794,6 +934,168 @@ mod tests {
     }
 
     #[test]
+    fn unread_notice_is_visible_to_both_peers_without_waking_either() {
+        let (fixture, team, _lease) = setup();
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        let runtime = &fixture.runtime;
+        let opened = perform(
+            runtime,
+            &a,
+            &json!({
+                "action":"open","to":"b","topic":"审批口径","text":"已采纳预算测算。"
+            }),
+        )
+        .unwrap();
+        let read = json!({"action":"read","tunnel_id":opened["tunnel"]["id"]});
+        assert_eq!(
+            perform(runtime, &a, &read).unwrap(),
+            perform(runtime, &b, &read).unwrap()
+        );
+        let mut current = runtime.teams.get(&team.id).unwrap();
+        let message = &current.tunnels[0].messages[0];
+        assert_eq!(message.kind, "notice");
+        assert!(message.delivered_at.is_none());
+        current.agents[1].status = "completed".into();
+        current.agents[1].output = "original financial analysis".into();
+        schedule(&mut current);
+        assert!(current.tunnel_turns.is_empty());
+        assert_eq!(current.agents[1].output, "original financial analysis");
+        assert!(!blocks_final(&current, &current.agents[2]));
+
+        let question = perform(
+            runtime,
+            &a,
+            &json!({
+                "action":"ask","tunnel_id":opened["tunnel"]["id"],"text":"请给出净额。"
+            }),
+        )
+        .unwrap();
+        let answer = perform(
+            runtime,
+            &b,
+            &json!({
+                "action":"send","tunnel_id":opened["tunnel"]["id"],
+                "reply_to":question["tunnel"]["messages"][1]["id"],"text":"净额 500 元。"
+            }),
+        )
+        .unwrap();
+        assert_eq!(answer["tunnel"]["messages"][2]["kind"], "answer");
+        let receipt = perform(
+            runtime,
+            &a,
+            &json!({
+                "action":"send","tunnel_id":opened["tunnel"]["id"],
+                "reply_to":answer["tunnel"]["messages"][2]["id"],"text":"已采纳。"
+            }),
+        )
+        .unwrap();
+        assert_eq!(receipt["tunnel"]["messages"][3]["kind"], "notice");
+        let mut current = runtime.teams.get(&team.id).unwrap();
+        current
+            .agents
+            .iter_mut()
+            .for_each(|a| a.status = "completed".into());
+        schedule(&mut current);
+        assert!(current.tunnel_turns.is_empty());
+    }
+
+    #[test]
+    fn cowork_tracks_the_invited_workers_acceptance_and_result() {
+        for continue_with_result in [false, true] {
+            let (fixture, team, _lease) = setup();
+            let runtime = &fixture.runtime;
+            let a = participant(&team, "a");
+            let b = participant(&team, "b");
+            let opened = perform(runtime, &a, &json!({
+                "action":"invite","to":"b","topic":"现金预算","text":"用历史数据复算预算并返回公式",
+                "resume_on_reply":continue_with_result
+            })).unwrap();
+            let channel = &opened["tunnel"]["id"];
+            let invitation = &opened["tunnel"]["messages"][0]["id"];
+            let respond = |who: &Actor, action: &str| {
+                perform(
+                    runtime,
+                    who,
+                    &json!({
+                        "action":action, "tunnel_id":channel, "reply_to":invitation, "text":"1200 × 2 = 2400"
+                    }),
+                )
+            };
+            let mut current = runtime.teams.get(&team.id).unwrap();
+            current.agents[1].status = "completed".into();
+            schedule(&mut current);
+            assert_eq!(current.tunnel_turns.get("b"), Some(&1));
+            assert!(respond(&a, "accept_work").is_err());
+            assert!(respond(&b, "complete_work").is_err());
+            respond(&b, "accept_work").unwrap();
+            assert!(respond(&b, "accept_work").is_err());
+            let current = runtime.teams.get(&team.id).unwrap();
+            assert!(blocks_final(&current, &current.agents[2]));
+            assert!(!needs_attention(
+                &current.tunnels[0],
+                &current.tunnels[0].messages[1]
+            ));
+            respond(&b, "complete_work").unwrap();
+            assert!(respond(&b, "complete_work").is_err());
+            assert!(respond(&b, "decline_work").is_err());
+            let mut current = runtime.teams.get(&team.id).unwrap();
+            let result = &current.tunnels[0].messages[2];
+            assert_eq!(result.kind, "cowork_result");
+            assert_eq!(result.task_id, b.task_id);
+            assert_eq!(result.reply_to.as_deref(), invitation.as_str());
+            assert_eq!(result.text, "1200 × 2 = 2400");
+            current.agents[0].status = "completed".into();
+            current.agents[1].status = "completed".into();
+            schedule(&mut current);
+            assert_eq!(current.tunnel_turns.contains_key("a"), continue_with_result);
+            assert!(!current.tunnel_turns.contains_key("b"));
+        }
+    }
+
+    #[test]
+    fn exhausted_request_leaves_reverse_cowork_open_for_its_result() {
+        let (fixture, team, _lease) = setup();
+        let runtime = &fixture.runtime;
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        let asked = perform(
+            runtime,
+            &a,
+            &json!({"action":"ask","to":"b","topic":"review","text":"Confirm the time window"}),
+        )
+        .unwrap();
+        let tunnel = &asked["tunnel"]["id"];
+        let invited = perform(runtime,&b,&json!({"action":"invite","tunnel_id":tunnel,"text":"Cross-check the total independently"})).unwrap();
+        let invite = &invited["tunnel"]["messages"][1]["id"];
+        perform(
+            runtime,
+            &a,
+            &json!({"action":"accept_work","tunnel_id":tunnel,"reply_to":invite}),
+        )
+        .unwrap();
+        let current = runtime
+            .teams
+            .mutate(&team.id, |team| {
+                team.agents[1].status = "completed".into();
+                team.tunnel_turns
+                    .insert("b".into(), MAX_FOLLOWUPS_PER_AGENT);
+                schedule(team);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(current.tunnels[0].status, "open");
+        assert!(current.tunnels[0].messages[0]
+            .followup_closed_reason
+            .is_some());
+        assert!(current.tunnels[0].messages[1]
+            .followup_closed_reason
+            .is_none());
+        let result = perform(runtime,&a,&json!({"action":"complete_work","tunnel_id":tunnel,"reply_to":invite,"text":"Checked 25 trial rows."})).unwrap();
+        assert_eq!(result["tunnel"]["messages"][3]["kind"], "cowork_result");
+    }
+
+    #[test]
     fn asynchronous_delivery_resumes_once_and_unanswered_followup_does_not_deadlock_final() {
         let (fixture, team, _lease) = setup();
         let runtime = &fixture.runtime;
@@ -801,7 +1103,7 @@ mod tests {
         perform(
             runtime,
             &a,
-            &json!({"action":"open","to":"b","topic":"question","text":"Which count is correct?"}),
+            &json!({"action":"ask","to":"b","topic":"question","text":"Which count is correct?"}),
         )
         .unwrap();
         let mut current = runtime.teams.get(&team.id).unwrap();
@@ -852,7 +1154,7 @@ mod tests {
         let next = perform(
             runtime,
             &a,
-            &json!({"action":"open","to":"b","topic":"new question","text":"Please answer"}),
+            &json!({"action":"open","to":"b","topic":"new question","text":"Please answer","expects_reply":true}),
         )
         .unwrap();
         let mut current = runtime.teams.get(&team.id).unwrap();
@@ -915,7 +1217,7 @@ mod tests {
             let opened = perform(runtime, &a, &args).unwrap();
             let id = opened["tunnel"]["id"].as_str().unwrap();
             assert!(opened["tunnel"]["messages"][0].get("reply_to").is_none());
-            assert_eq!(opened["tunnel"]["messages"][0]["expects_reply"], true);
+            assert_eq!(opened["tunnel"]["messages"][0]["expects_reply"], false);
             let read = perform(runtime, &a, &json!({"action":"read","tunnel_id":empty})).unwrap();
             assert!(!read["tunnels"].as_array().unwrap().is_empty());
             assert!(perform(
@@ -1014,7 +1316,7 @@ mod tests {
             .is_none());
         assert_eq!(
             semantic_open["tunnel"]["messages"][0]["expects_reply"],
-            true
+            false
         );
         for action in ["send", "propose"] {
             assert!(perform(runtime,&a,&json!({"action":action,"tunnel_id":semantic_id,"text":"Bad reply","reply_to":"none"})).is_err());

@@ -463,8 +463,12 @@ async fn team_execution_lock_protects_live_native_runs_and_released_lock_recover
 }
 
 fn tool_reply(request: Request, call_id: &str, args: Value) {
+    worker_tool_reply(request, call_id, "agent_tunnel", args);
+}
+
+fn worker_tool_reply(request: Request, call_id: &str, name: &str, args: Value) {
     let body = json!({"choices":[{"message":{"role":"assistant","content":"", "tool_calls":[{
-        "id":call_id,"type":"function","function":{"name":"agent_tunnel","arguments":args.to_string()}
+        "id":call_id,"type":"function","function":{"name":name,"arguments":args.to_string()}
     }]},"finish_reason":"tool_calls"}]});
     request
         .reply
@@ -518,7 +522,7 @@ async fn real_tunnel_roundtrip(dependent: bool) {
     tool_reply(
         a,
         "open-peer",
-        json!({"action":"open","to":"b","topic":"Verify the conclusion","text":"Please verify the denominator before I finalize."}),
+        json!({"action":"ask","to":"b","topic":"Verify the conclusion","text":"Please verify the denominator before I finalize.","resume_on_reply":true}),
     );
     let a_after_open = request(&mut rx).await;
     assert!(a_after_open
@@ -631,6 +635,136 @@ async fn native_tunnel_parallel_peer_and_late_reply_resume_original_worker_once(
 #[tokio::test]
 async fn native_tunnel_delivers_to_a_dependency_that_has_not_started() {
     real_tunnel_roundtrip(true).await;
+}
+
+#[tokio::test]
+async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknowledgment() {
+    let (fixture, mut requests, server) = fixture().await;
+    let runtime = fixture.runtime.clone();
+    runtime
+        .tools
+        .register(Arc::new(crate::report_calculate::ReportCalculate));
+    let mut writer = worker("writer", &["finance", "review"]);
+    writer.delivery = Some(crate::synthesis::DeliveryKind::Final);
+    let team = runtime
+        .teams
+        .create(
+            &runtime,
+            TeamSpec {
+                name: "Release review".into(),
+                goal: "Review the budget and publish the decision".into(),
+                agents: vec![
+                    worker("finance", &[]),
+                    worker("review", &["finance"]),
+                    writer,
+                ],
+                files: vec![],
+            },
+        )
+        .unwrap();
+    runtime.teams.start(runtime.clone(), &team.id).unwrap();
+    request(&mut requests)
+        .await
+        .reply
+        .send("Base budget checked.".into())
+        .unwrap();
+    tool_reply(
+        request(&mut requests).await,
+        "invite",
+        json!({
+            "action":"invite","to":"finance","topic":"Cash reserve","text":"Calculate the reserve for six seats at 299 each."
+        }),
+    );
+    request(&mut requests)
+        .await
+        .reply
+        .send("Reviewed the launch conditions. Finance will verify the reserve.".into())
+        .unwrap();
+    let saved = runtime.teams.get(&team.id).unwrap();
+    let tunnel = &saved.tunnels[0];
+    let invite = &tunnel.messages[0].id;
+    let helper = request(&mut requests).await;
+    assert!(helper.body["messages"]
+        .to_string()
+        .contains("Calculate the reserve"));
+    tool_reply(
+        helper,
+        "take-work",
+        json!({"action":"accept_work","tunnel_id":tunnel.id,"reply_to":invite}),
+    );
+    worker_tool_reply(
+        request(&mut requests).await,
+        "calculate",
+        "report_calculate",
+        json!({
+            "checks":[{"label":"Refund reserve","terms":[[6,299]]}]
+        }),
+    );
+    let calculated = request(&mut requests).await;
+    assert!(calculated.body["messages"].to_string().contains("1794"));
+    tool_reply(
+        calculated,
+        "return-work",
+        json!({
+            "action":"complete_work","tunnel_id":tunnel.id,"reply_to":invite,"text":"Six seats require a reserve of 1794."
+        }),
+    );
+    request(&mut requests)
+        .await
+        .reply
+        .send("Base budget checked. Refund reserve verified at 1794.".into())
+        .unwrap();
+    let publication = request(&mut requests).await;
+    assert!(publication.body["messages"]
+        .to_string()
+        .contains("Six seats require a reserve of 1794."));
+    tool_reply(
+        publication,
+        "adopted",
+        json!({
+            "action":"open","to":"finance","topic":"Final amount","text":"已采纳，报告已使用核验金额。"
+        }),
+    );
+    request(&mut requests)
+        .await
+        .reply
+        .send("Approve a refund reserve of 1794.".into())
+        .unwrap();
+
+    let finished = settled(&runtime, &team.id).await;
+    assert_eq!(finished.status, "completed");
+    assert!(finished
+        .agents
+        .iter()
+        .all(|agent| agent.status == "completed"));
+    assert_eq!(finished.tunnel_turns.len(), 1);
+    assert_eq!(finished.tunnel_turns["finance"], 1);
+    let messages = &finished.tunnels[0].messages;
+    assert_eq!(
+        messages
+            .iter()
+            .map(|msg| msg.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["cowork_invite", "cowork_accept", "cowork_result"]
+    );
+    for receipt in &messages[1..] {
+        assert_eq!(receipt.reply_to.as_ref(), Some(invite));
+        assert_eq!(receipt.session_id, team.agents[0].session_id);
+    }
+    let notice_tunnel = &finished.tunnels[1];
+    assert!(
+        notice_tunnel.participants.contains(&"finance".into())
+            && notice_tunnel.participants.contains(&"writer".into())
+    );
+    assert_eq!(notice_tunnel.messages[0].kind, "notice");
+    assert!(notice_tunnel.messages[0].resumed_at.is_none());
+    let delivery = crate::synthesis::deliverable(&runtime, &finished)
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.text, "Approve a refund reserve of 1794.");
+    assert!(!delivery.stale);
+    assert!(requests.try_recv().is_err());
+    server.abort();
 }
 
 #[tokio::test]

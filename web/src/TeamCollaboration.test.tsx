@@ -1,10 +1,13 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { TeamDelivery } from "./TeamDelivery";
 import { TeamTunnelThread } from "./TeamTunnel";
+import { ProcessChat } from "./ProcessChat";
+import { tunnelRequestState } from "./tunnelMessages";
 import { projectWorkspaceTrace } from "./workspaceTrace";
 import { rpc } from "./api";
-import type { Team, TeamAgent, TeamTunnel } from "./teamTypes";
+import type { Team, TeamAgent, TeamTunnel, TunnelMessage } from "./teamTypes";
+import type { SessionResult } from "./types";
 
 vi.mock("./api", () => ({ rpc: vi.fn(), errorText: String }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
@@ -37,6 +40,62 @@ it("keeps both speakers and their agreed wording visible after the temporary lan
   expect(screen.getByLabelText("双方确认的结论").textContent).toContain("主推统一接口。");
   fireEvent.click(page.container.querySelector('[data-tunnel-from="a"] button')!);
   expect(select).toHaveBeenCalledWith("a");
+});
+
+it("shows one copy of a peer exchange in either participant's chat, including co-work results and passive notices", () => {
+  function message(seq: number, kind: TunnelMessage["kind"], text: string, from: string, reply_to?: string): TunnelMessage {
+    return { id: String(seq), seq, from, to: from === "a" ? "b" : "a", at, kind, text, reply_to };
+  }
+  const work: TeamTunnel = { ...channel, decision: null, messages: [
+    message(1, "cowork_invite", "请复算容量表", "a"), message(2, "cowork_accept", "我来核算", "b", "1"),
+    message(3, "cowork_result", "容量上限为 16 席", "b", "1"), message(4, "notice", "已采纳 16 席上限", "a"),
+    message(5, "question", "需要预留客服时间吗？", "a"), message(6, "answer", "每天预留两小时", "b", "5"),
+  ] };
+  const props = { team: { ...team, tunnels: [work] }, sessions: {}, profiles: [], onSelectAgent: vi.fn(), onOpenTunnel: vi.fn() };
+  const page = render(<ProcessChat {...props} agentId="a" />);
+  for (const agentId of ["a", "b", undefined]) {
+    page.rerender(<ProcessChat {...props} agentId={agentId} />);
+    expect(page.container.querySelectorAll("[data-peer-kind]")).toHaveLength(6);
+    for (const record of work.messages) expect(screen.getAllByText(record.text, { selector: "p" })).toHaveLength(1);
+    const notification = within(page.container.querySelector<HTMLElement>('[data-peer-kind="notice"]')!);
+    expect(notification.getByText("通知")).toBeTruthy();
+    expect(notification.queryByText("待答复")).toBeNull();
+    expect(screen.getByText("已交付")).toBeTruthy();
+    expect(screen.getByText("已答复")).toBeTruthy();
+    fireEvent.click(notification.getByRole("button", { name: /打开协作记录/ }));
+    expect(props.onOpenTunnel).toHaveBeenCalledWith(work.id);
+  }
+  page.rerender(<ProcessChat {...props} agentId="writer" />);
+  expect(page.container.querySelector("[data-peer-kind]")).toBeNull();
+  const trace = projectWorkspaceTrace([props.team]).lanes.flatMap((lane) => lane.nodes);
+  expect(trace.filter((node) => node.detail === "已采纳 16 席上限").map((node) => node.label).sort()).toEqual(["通知 → b", "通知 ← a"].sort());
+  expect(trace.filter((node) => node.detail === "容量上限为 16 席").map((node) => node.label).sort()).toEqual(["交付协作成果 → a", "交付协作成果 ← b"].sort());
+
+  const [invite, accept] = work.messages;
+  const open: TeamTunnel = { ...work, status: "open", messages: [invite, accept] };
+  expect(tunnelRequestState(open, invite)).toBe("已接手");
+  const skippedInvite = { ...invite, followup_closed_reason: "follow-up budget exhausted" };
+  const question = work.messages[4];
+  const partial: TeamTunnel = { ...open, messages: [skippedInvite, accept, question] };
+  expect(tunnelRequestState(partial, skippedInvite)).toBe("未交付");
+  expect(tunnelRequestState(partial, question)).toBe("待答复");
+  expect(tunnelRequestState(partial, { ...question, followup_closed_reason: "budget exhausted" })).toBe("未答复");
+  expect(tunnelRequestState({ ...open, status: "interrupted" }, invite)).toBe("未交付");
+  expect(tunnelRequestState({ ...open, messages: [invite, { ...accept, kind: "cowork_decline" }] }, invite)).toBe("已婉拒");
+});
+
+it("uses the shared peer record in place of the matching recipient note, keeping history without a shared record", () => {
+  const note = { id: "tunnel:tunnel-1:q", type: "system_note", text: "原始会话的协作通知", at };
+  const sessions = { a: { session: { id: "a", name: null, events: [note] }, task_id: null, state: null } } satisfies Record<string, SessionResult>;
+  const props = { team, sessions, profiles: [], agentId: "a", onSelectAgent: vi.fn() };
+  const view = render(<ProcessChat {...props} />);
+  expect(screen.queryByText(note.text)).toBeNull();
+  const notes = (current: Team) => projectWorkspaceTrace([current], [], current.id, sessions).lanes.flatMap((lane) => lane.nodes).filter((node) => node.eventId === note.id);
+  expect(notes(team)).toHaveLength(0);
+  const legacy = { ...team, tunnels: [] };
+  view.rerender(<ProcessChat {...props} team={legacy} />);
+  expect(screen.getByText(note.text)).toBeTruthy();
+  expect(notes(legacy)).toHaveLength(1);
 });
 
 it("shows the shipped draft and its supporting research from the final run, with access to the source conversation", async () => {

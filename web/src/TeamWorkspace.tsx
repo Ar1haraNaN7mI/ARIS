@@ -125,11 +125,11 @@ export function TeamWorkspace({ initialData, latestProfile, onChat }: { initialD
         <ProcessRelay teams={state.teams} profiles={config?.profiles || []} selectedTeamId={activeTeam?.id} selectedAgentId={conversation?.id} onSelect={selectTeam} onOpenTunnel={openTunnel} />
         <header className="lp-conversation-head">
           <span className="lp-thread-tag">{activeTeam ? activeTeam.name : "新会话"}</span>
-          <strong>{view === "tunnel" ? "角色协商" : view === "delivery" ? "最终交付" : conversation ? conversation.name : simple ? "ARIS" : activeTeam ? "全部会话" : "ARIS"}</strong>
+          <strong>{view === "tunnel" ? "角色协作" : view === "delivery" ? "最终交付" : conversation ? conversation.name : simple ? "ARIS" : activeTeam ? "全部会话" : "ARIS"}</strong>
           <span className="lp-head-context">{conversation ? profile?.model || conversation.profile_id : simple ? activeTeam?.admin?.model_id : activeTeam ? `${workers.length} 个子任务` : data?.workspace.split(/[\\/]/).filter(Boolean).at(-1)}</span>
           {activeTeam && <div className="lp-view-actions">
             <button aria-pressed={view === "chat"} onClick={() => setView("chat")}>对话</button>
-            {relatedChannels.length > 0 && <button aria-pressed={view === "tunnel"} onClick={() => openTunnel(activeTeam.id, relatedChannels.at(-1)!.id)}>协商</button>}
+            {relatedChannels.length > 0 && <button aria-pressed={view === "tunnel"} onClick={() => openTunnel(activeTeam.id, relatedChannels.at(-1)!.id)}>协作</button>}
             {finalAuthor && <button aria-pressed={view === "delivery"} onClick={() => setView("delivery")}>最终交付</button>}
             <button aria-pressed={view === "timeline"} onClick={() => setView("timeline")}>记录</button>
             {agent && <button aria-pressed={view === "browser"} onClick={() => setView("browser")}>浏览器</button>}
@@ -148,7 +148,7 @@ export function TeamWorkspace({ initialData, latestProfile, onChat }: { initialD
             ? <div className="lp-content-scroll"><TeamTimeline team={activeTeam} sessions={activity.sessions} onSelectAgent={selectAgent} /></div>
             : view === "browser" && agent && data
             ? <div className="lp-content-scroll"><ComputerSettings token={data.token} agentId={agent.session_id || agent.id} /></div>
-            : <ProcessChat team={activeTeam} sessions={activity.sessions} profiles={config?.profiles || []} agentId={conversation?.id} onSelectAgent={selectAgent} />}
+            : <ProcessChat team={activeTeam} sessions={activity.sessions} profiles={config?.profiles || []} agentId={conversation?.id} onSelectAgent={selectAgent} onOpenTunnel={(id) => openTunnel(activeTeam.id, id)} />}
           {activity.approvals.length > 0 && <section className="aw-approvals" aria-label="待确认的操作">
             {activity.approvals.map((approval) => <div key={approval.request_id}>
               <div><strong>{approval.name} 需要确认</strong><p>{approval.summary}</p></div>

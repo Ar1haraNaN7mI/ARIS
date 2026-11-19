@@ -7,14 +7,22 @@ import { AgentGlyph } from "./AgentGlyph";
 import { sessionModelIdentities, type SessionModelIdentity } from "./sessionModelIdentity";
 import { formatTime } from "./TeamConversation";
 import { RunningBorder } from "./RunningBorder";
-import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
+import type { ModelProfile, Team, TeamAgent, TeamTunnel, TunnelMessage } from "./teamTypes";
+import { TunnelMessageCard } from "./TeamTunnel";
+import { mirrorsReceivedTunnelMessage } from "./tunnelMessages";
 import type { SessionEvent, SessionResult } from "./types";
 import { conversationAgents, messageSource } from "./teamConversationModel";
 
-type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; note?: string; noteLabel?: string; partial?: boolean };
+type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; peer?: { tunnel: TeamTunnel; message: TunnelMessage }; note?: string; noteLabel?: string; partial?: boolean };
 export function conversationEntries(team: Team, sessions: Record<string, SessionResult>, agentId?: string, profiles: ModelProfile[] = []): Entry[] {
   const entries: Entry[] = [{ id: "goal", at: team.created_at, user: team.goal }];
   for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, source: messageSource(team, message), recipient: team.agents.find((agent) => agent.id === message.agent_id)?.name, queued: message.queued });
+  for (const tunnel of team.tunnels || []) {
+    if (agentId && !tunnel.participants.includes(agentId)) continue;
+    for (const message of tunnel.messages) {
+      entries.push({ id: `peer:${tunnel.id}:${message.id}`, at: message.at, peer: { tunnel, message } });
+    }
+  }
   for (const agent of conversationAgents(team).filter((item) => !agentId || item.id === agentId)) {
     const snapshot = sessions[agent.id];
     const events = agent.session_id && snapshot?.session.id === agent.session_id ? snapshot.session.events : [];
@@ -37,7 +45,7 @@ export function conversationEntries(team: Team, sessions: Record<string, Session
       }
       if (item.kind === "message" && item.event.type === "assistant_message") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), event: item.event });
       if (item.kind === "tool") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), event: item.event, tool: item });
-      if (item.kind === "note") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), note: item.event.text, event: item.event });
+      if (item.kind === "note" && !mirrorsReceivedTunnelMessage(team, agent.id, item.event.id)) entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), note: item.event.text, event: item.event });
     }
     const latestStart = team.events.filter((event) => event.agent_id === agent.id && event.kind === "agent_started").at(-1)?.at;
     const latestFinish = team.events.filter((event) => event.agent_id === agent.id && event.kind === "agent_finished").at(-1)?.at;
@@ -80,8 +88,9 @@ function recipientsFromReceipt(team: Team, result?: SessionEvent): TeamAgent[] {
     return team.agents.filter((actor) => actor.session_id && actor.session_id !== team.admin?.session_id && recipients.get(actor.id) === actor.session_id);
   } catch { return []; }
 }
-export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }: { team: Team; sessions: Record<string, SessionResult>; profiles: ModelProfile[]; agentId?: string; onSelectAgent: (id: string) => void }) {
+export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent, onOpenTunnel }: { team: Team; sessions: Record<string, SessionResult>; profiles: ModelProfile[]; agentId?: string; onSelectAgent: (id: string) => void; onOpenTunnel?: (id: string) => void }) {
   const entries = useMemo(() => conversationEntries(team, sessions, agentId, profiles), [team, sessions, agentId, profiles]);
+  const actorNames = useMemo(() => new Map(team.agents.map((agent) => [agent.id, agent.name])), [team.agents]);
   const activeAgents = conversationAgents(team).filter((agent) => agent.status === "running" && (!agentId || agent.id === agentId));
   const scroll = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
@@ -92,6 +101,7 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
     const agent = entry.agent;
     const color = entry.identity?.family ? modelColors[entry.identity.family] : "#8ba1ad";
     const attrs = agent ? { "data-anchor-key": `message:${team.id}:${agent.id}:${entry.event?.id || entry.id}`, "data-process-team": team.id, "data-process-agent": agent.id, "data-process-event": entry.event?.id } : {};
+    if (entry.peer) return <TunnelMessageCard key={entry.id} {...entry.peer} names={actorNames} onSelectActor={onSelectAgent} onOpenTunnel={onOpenTunnel} />;
     if (entry.user && entry.source && entry.source !== "user") return <details className="lp-note lp-dispatch-note" key={entry.id}><summary><span>{entry.source === "admin" ? "ARIS · 分工安排" : "任务指令"}{entry.recipient && ` · ${entry.recipient}`}</span><time>{formatTime(entry.at)}</time></summary><pre>{entry.user}</pre></details>;
     if (entry.user) return <article className="lp-user-message" key={entry.id} {...attrs}><div className="lp-message-who"><PersonIcon /><span>你</span><time>{formatTime(entry.at)}</time>{entry.queued && <small>等待下一轮</small>}</div><div className="lp-user-bubble">{entry.user}</div></article>;
     if (entry.tool) {

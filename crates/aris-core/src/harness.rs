@@ -1372,16 +1372,6 @@ impl TeamStore {
                 return Ok(());
             }
             let ready = ready_wave(&team);
-            if let Some(budget) = &team.execution_budget {
-                ensure!(
-                    started.elapsed().as_secs() < budget.max_runtime_secs,
-                    "Admin execution time budget exhausted"
-                );
-                ensure!(
-                    runs + ready.len() <= budget.max_agent_runs,
-                    "Admin agent-run budget exhausted; send a new instruction to continue"
-                );
-            }
             if ready.is_empty() {
                 self.mutate(id, |t| {
                     // A message may arrive after ready_wave was computed. Keep
@@ -1432,6 +1422,16 @@ impl TeamStore {
                     continue;
                 }
                 return Ok(());
+            }
+            if let Some(budget) = &team.execution_budget {
+                ensure!(
+                    started.elapsed().as_secs() < budget.max_runtime_secs,
+                    "Admin execution time budget exhausted"
+                );
+                ensure!(
+                    runs + ready.len() <= budget.max_agent_runs,
+                    "Admin agent-run budget exhausted; send a new instruction to continue"
+                );
             }
             let mut running = tokio::task::JoinSet::new();
             runs += ready.len();
@@ -1793,6 +1793,12 @@ fn apply_queued_messages(team: &mut Team) {
     );
 }
 
+pub(crate) const PEER_COORDINATION_GUIDANCE: &str = r#"Use agent_tunnel with the exact peer ID. Choose the interaction by what the recipient needs to do:
+- To share an observation, credit a contribution or say “已采纳”, use open/send as a notice. Both lanes show it. An acknowledgment needs no reply.
+- Use ask for a specific unanswered question. Answer with send and reply_to. Use propose/accept for a decision requiring both participants' agreement.
+- Use invite for co-work: name a bounded piece of the assignment a peer can actually perform and the result you need. The recipient uses accept_work or decline_work with reply_to pointing to the invite. After accepting, do the work in your own session using your tools and owned files. Preserve your original contribution when you report the added work. Use complete_work against that same invite with the result and any file references. An invitation or acceptance alone is not a delivery.
+If your own deliverable still needs the answer or work result, set resume_on_reply=true on the request. Otherwise the result is available to the final author in the shared record. Continue available work without polling or requesting courtesy acknowledgments."#;
+
 fn agent_prompt(team: &Team, agent: &TeamAgent) -> String {
     let inputs: Vec<_> = team
         .agents
@@ -1838,7 +1844,10 @@ fn agent_prompt(team: &Team, agent: &TeamAgent) -> String {
         .map(|peer| format!("{}: {} ({})", peer.id, peer.name, peer.role))
         .collect::<Vec<_>>()
         .join("; ");
-    messages.push(format!("Internal coordination: your worker id is {}. Available peer ids: {}. Use agent_tunnel for a short, nonblocking question or proposal when another worker's expertise is needed. Reply to a received message with reply_to; use expects_reply=false for a complete answer. Continue your assignment rather than waiting or polling. Only mutual proposal acceptance is a joint decision.",agent.id,peers));
+    messages.push(format!(
+        "Internal coordination: your worker id is {}. Available peer ids: {}.\n{}",
+        agent.id, peers, PEER_COORDINATION_GUIDANCE
+    ));
     format!("You are {} in ARIS, a general-purpose multi-agent harness. Role: {}.\nShared goal: {}\nYour assignment: {}\nYour browser identity is your session; use your own browser tools.\nShared artifact files: {}\nYour owned output files: {}\nRead relevant existing files before editing. Keep edits within your assigned output files; other agents can be working concurrently. Use shared files directly, preserve previous contributions, and report exact delivered paths and unfinished work. If no output files were assigned, return your findings in the response.\nDependency results:\n{}\nExplicit handoffs:\n{}\nConversation instructions with their actual source, oldest to newest (latest takes precedence):\n{}", agent.name,agent.role,team.goal,agent.prompt,team.files.join(", "),agent.files.join(", "),inputs.join("\n\n"),handoffs.join("\n\n"),messages.join("\n\n"))
 }
 
