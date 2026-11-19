@@ -12,7 +12,7 @@ use aris_core::{
 };
 use aris_llm::{
     AssembledResponse, ChatMessage, FinishReason, LlmConfig, LlmEvent, LlmRequestOptions,
-    OpenAiCompatibleClient, ToolFunctionSpec, ToolSpec,
+    OpenAiCompatibleClient, ToolCallDelta, ToolFunctionSpec, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +22,9 @@ use tokio::sync::mpsc;
 const PLAN_TIMEOUT: Duration = Duration::from_secs(60);
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+// A dispatch can carry both durable role instructions and a current assignment for eight workers.
+const MAX_ADMIN_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_PLANNER_REASONING_BYTES: usize = 256 * 1024;
 const MAX_GOAL_BYTES: usize = 32_000;
 
 #[derive(Deserialize)]
@@ -169,6 +172,21 @@ async fn generate(
         .text)
 }
 
+fn control_payload_bytes(call: &ToolCallDelta) -> Result<usize> {
+    // Chat gateways may repeat this identifier on every argument fragment.
+    ensure!(
+        call.id.as_ref().is_none_or(|id| id.len() <= 256),
+        "Admin tool call ID exceeded 256 bytes"
+    );
+    Ok(call.function.as_ref().map_or(0, |function| {
+        function
+            .name
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(function.arguments.as_ref().map_or(0, String::len))
+    }))
+}
+
 async fn generate_response(
     mut config: LlmConfig,
     messages: &[ChatMessage],
@@ -186,22 +204,29 @@ async fn generate_response(
         let future =
             client.stream_chat_cancellable_with_options(messages, tools, tx, None, options);
         tokio::pin!(future);
-        let mut bytes = 0usize;
+        let output_limit = if tools.is_empty() {
+            MAX_OUTPUT_BYTES
+        } else {
+            MAX_ADMIN_OUTPUT_BYTES
+        };
+        let mut output_bytes = 0usize;
+        let mut reasoning_bytes = 0usize;
         let mut events_open = true;
         loop {
             tokio::select! {
                 event = rx.recv(), if events_open => match event {
-                    Some(LlmEvent::TextDelta(text) | LlmEvent::ReasoningDelta(text)) => {
-                        bytes = bytes.saturating_add(text.len());
-                        ensure!(bytes <= MAX_OUTPUT_BYTES, "Team planner response exceeded 64 KiB; retry with a narrower goal");
+                    Some(LlmEvent::TextDelta(text)) => {
+                        output_bytes = output_bytes.saturating_add(text.len());
+                        ensure!(output_bytes <= output_limit, "Team planner response exceeded {} KiB", output_limit / 1024);
+                    },
+                    Some(LlmEvent::ReasoningDelta(text)) => {
+                        reasoning_bytes = reasoning_bytes.saturating_add(text.len());
+                        ensure!(reasoning_bytes <= MAX_PLANNER_REASONING_BYTES, "Team planner reasoning exceeded {} KiB", MAX_PLANNER_REASONING_BYTES / 1024);
                     },
                     Some(LlmEvent::ToolCallDelta(call)) => {
                         ensure!(!tools.is_empty(), "Team planner returned a tool call; no tools were executed");
-                        let size = call.id.as_ref().map_or(0, String::len).saturating_add(call.function.as_ref().map_or(0, |f| {
-                            f.name.as_ref().map_or(0, String::len) + f.arguments.as_ref().map_or(0, String::len)
-                        }));
-                        bytes = bytes.saturating_add(size);
-                        ensure!(bytes <= MAX_OUTPUT_BYTES, "Admin control call exceeded 64 KiB; no roles were created");
+                        output_bytes = output_bytes.saturating_add(control_payload_bytes(&call)?);
+                        ensure!(output_bytes <= output_limit, "Admin control call exceeded {} KiB; no roles were created", output_limit / 1024);
                     },
                     Some(_) => {},
                     None => events_open = false,
@@ -210,10 +235,13 @@ async fn generate_response(
                     let response = response.context("KEI team planning request failed")?;
                     ensure!(!tools.is_empty() || response.tool_calls.is_empty(), "Team planner returned a tool call; no tools were executed");
                     ensure!(!matches!(response.finish_reason, FinishReason::Length), "Team planner response was truncated; retry with a narrower goal");
-                    let size = response.text.len()
-                        .saturating_add(response.reasoning.as_ref().map_or(0, String::len))
-                        .saturating_add(if response.tool_calls.is_empty() {0} else {serde_json::to_vec(&response.tool_calls)?.len()});
-                    ensure!(size <= MAX_OUTPUT_BYTES, "Team planner response exceeded 64 KiB; retry with a narrower goal");
+                    ensure!(response.tool_calls.is_empty() || response.finish_reason == FinishReason::ToolCalls, "Admin tool call did not finish successfully; no roles were created");
+                    ensure!(response.reasoning.as_ref().is_none_or(|text| text.len() <= MAX_PLANNER_REASONING_BYTES), "Team planner reasoning exceeded {} KiB", MAX_PLANNER_REASONING_BYTES / 1024);
+                    let mut size = response.text.len();
+                    for call in &response.tool_calls {
+                        size = size.saturating_add(control_payload_bytes(call)?);
+                    }
+                    ensure!(size <= output_limit, "Team planner response exceeded {} KiB", output_limit / 1024);
                     return Ok(response);
                 }
             }
@@ -924,7 +952,7 @@ Use one worker for a single operational task such as editing one file. For a bro
 For a direct answer, return ONLY {"mode":"answer","response":"full answer"} and do not call a tool.
 To add missing roles, call create_sub_agents once with response (brief plan, not a result), new_agents and assignments. To reuse existing roles without additions, call dispatch_sub_agents once with response and assignments. Never call both or make multiple calls. A call creates/persists/schedules the work; it does not mean the workers have completed it. No confirmation model request follows.
 Use the user's language except tool/schema values. Exact catalog profile IDs only; existing roles, models, instructions, dependencies and sessions are immutable.
-Match the work to existing roles first. When allow_new_roles=true, create the missing owners in this request, within new_worker_slots. Role count follows the work. The controller occupies no worker slot. Use the tool response to explain the split and any handoff briefly. Assign each new role once and only the existing roles needed for this request. Never create/assign an admin or ask workers to spawn, schedule, recursively delegate, or call the admin API.
+Match the work to existing roles first. When allow_new_roles=true, create the missing owners in this request, within new_worker_slots. Role count follows the work. The controller occupies no worker slot. Explain the split and handoffs briefly. Put each role's durable remit in its prompt and this turn's action in its assignment. All workers already receive the shared goal. Refer to input files by name and leave the analysis to their owners. Assign each new role once and only the existing roles needed for this request. Never create/assign an admin or ask workers to spawn, schedule, recursively delegate, or call the admin API.
 Dependencies form a DAG of known IDs; assign unfinished dependencies too. Independent workers have empty depends_on; never force a dependency just to make a chain.
 Set delivery explicitly on each new role. Use "independent" for separate results needing no final publication, "supporting" for research/evidence/intermediate drafts, and exactly one "final" owner when the user requests an integrated publishable result. A final owner must be a terminal role depending on the relevant source roles or intermediate chain; it writes the actual final UTF-8 documents, not a planning outline, review notes, or "I wrote the file" as the deliverable. If the user asks for research plus promotion, retain the research report as a supporting artifact and assign a final owner to write the publication. Reuse an existing final owner on revisions; never create a second final owner or rerun source roles unnecessarily. Dependencies supply original completed deliveries and complete two-sided collaboration records; only explicitly accepted proposals are joint decisions.
 Limits: IDs 1–64 ASCII letters/digits/_/-; names 200 UTF-8 bytes; roles 4000; prompts/instructions 12000; response 24000. Outputs: <=16 new files, forward-slash workspace-relative paths; no traversal, credentials, .env/.git/.aris/target/node_modules. Parallel writers use distinct files; chat-only work uses []. Input files belong in instructions, not files arrays.
@@ -968,8 +996,9 @@ fn parse_admin(
     workspace: &Path,
 ) -> Result<(String, Vec<TeamAgent>, Vec<AdminAssignment>)> {
     ensure!(
-        text.len() <= MAX_OUTPUT_BYTES,
-        "Admin response exceeded 64 KiB"
+        text.len() <= MAX_ADMIN_OUTPUT_BYTES,
+        "Admin response exceeded {} KiB",
+        MAX_ADMIN_OUTPUT_BYTES / 1024
     );
     let draft: AdminDraft = serde_json::from_str(text)
         .context("Admin returned invalid decision JSON; no workers were started")?;
@@ -1607,6 +1636,34 @@ mod tests {
         ],"assignments":[{"agent_id":"reader","instruction":"Read fixture.txt once and give the answer."}]})
     }
 
+    fn admin_context(root: &TestRoot) -> Team {
+        let runtime = test_runtime(root, "http://127.0.0.1:1/v1".into());
+        let mut team = runtime
+            .teams
+            .create(
+                &runtime,
+                serde_json::from_value(json!({
+                    "name":"fixture", "goal":"fixture",
+                    "agents":[{"id":"admin","name":"ARIS","role":"admin","profile_id":"writer"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        team.admin = Some(TeamAdmin {
+            request_id: "request".into(),
+            session_id: team.agents[0].session_id.clone(),
+            profile_id: "writer".into(),
+            model_id: "exact-writer-model".into(),
+            family: "gpt".into(),
+            phase: "planning".into(),
+            response: String::new(),
+            error: None,
+            requested_effort: None,
+            applied_effort: None,
+        });
+        team
+    }
+
     fn register_files(runtime: &Runtime) {
         let guard = aris_fs::PathGuard::new(aris_fs::PathGuardConfig {
             workspace_root: runtime.workspace_root.clone(),
@@ -1681,6 +1738,123 @@ mod tests {
             "new_agents": agents,
             "assignments": assignments
         })
+    }
+
+    #[tokio::test]
+    async fn admin_control_budget_excludes_repeated_ids_and_independent_reasoning() {
+        let root = TestRoot::new();
+        let team = admin_context(&root);
+        let tools = admin_tools(&team, &catalog(), true);
+        let mut decision = one_worker();
+        decision["new_agents"][0]["prompt"] = json!("p".repeat(2000));
+        decision.as_object_mut().unwrap().remove("mode");
+        let arguments = decision.to_string();
+        let call_id = format!("call_{}", "x".repeat(245));
+        assert!(arguments.len() < MAX_OUTPUT_BYTES);
+        assert!(arguments.chars().count() * call_id.len() > MAX_ADMIN_OUTPUT_BYTES);
+
+        let mut repeated_ids = String::new();
+        for (index, character) in arguments.chars().enumerate() {
+            let mut function = json!({"arguments":character.to_string()});
+            if index == 0 {
+                function["name"] = json!("create_sub_agents");
+            }
+            repeated_ids.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":call_id,"function":function
+                }]}}]})
+            ));
+        }
+        repeated_ids.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+        let reasoning = "r".repeat(MAX_PLANNER_REASONING_BYTES - 512);
+        assert!(reasoning.len() + arguments.len() > MAX_ADMIN_OUTPUT_BYTES);
+        let long_reasoning = format!(
+            "data: {}\n\n{}",
+            json!({"choices":[{"delta":{"reasoning_content":reasoning}}]}),
+            admin_tool_body("create_sub_agents", decision)
+        );
+
+        for (body, expected_id, reasoning_len) in [
+            (repeated_ids, call_id.as_str(), 0),
+            (long_reasoning, "admin-call-1", reasoning.len()),
+        ] {
+            let (url, server) = mock_server(body, "text/event-stream").await;
+            let response = generate_response(
+                test_config(url, LlmProtocol::ChatCompletions),
+                &[ChatMessage::user("Create one reader")],
+                &tools,
+                ADMIN_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let calls = admin_invocations(&response).unwrap();
+            assert_eq!(calls[0].call_id, expected_id);
+            assert_eq!(
+                response.reasoning.as_ref().map_or(0, String::len),
+                reasoning_len
+            );
+            let (_, additions, _) =
+                parse_admin_output(&response, &calls, &tools, &team, &catalog(), true, &root.0)
+                    .unwrap();
+            assert_eq!(additions[0].prompt, "p".repeat(2000));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_control_arguments_over_their_own_limit_are_rejected() {
+        let root = TestRoot::new();
+        let team = admin_context(&root);
+        let tools = admin_tools(&team, &catalog(), true);
+        let mut decision = one_worker();
+        decision["response"] = json!("x".repeat(MAX_ADMIN_OUTPUT_BYTES + 1));
+        decision.as_object_mut().unwrap().remove("mode");
+        let responses_body = json!({"id":"oversized","status":"completed","output":[{
+            "type":"function_call","id":"item-1","call_id":"call-1",
+            "name":"create_sub_agents","arguments":decision.to_string()
+        }]})
+        .to_string();
+        for (protocol, content_type, body) in [
+            (
+                LlmProtocol::ChatCompletions,
+                "text/event-stream",
+                admin_tool_body("create_sub_agents", decision),
+            ),
+            (LlmProtocol::Responses, "application/json", responses_body),
+        ] {
+            let (url, server) = mock_server(body, content_type).await;
+            let error = generate_response(
+                test_config(url, protocol),
+                &[ChatMessage::user("Create one reader")],
+                &tools,
+                ADMIN_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("256 KiB"), "{error}");
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn admin_accepts_complete_eight_worker_decision_above_64_kib() {
+        let root = TestRoot::new();
+        let team = admin_context(&root);
+        let mut decision = eight_worker_decision();
+        for agent in decision["new_agents"].as_array_mut().unwrap() {
+            agent["prompt"] = json!("p".repeat(9000));
+        }
+        let text = decision.to_string();
+        assert!(text.len() > MAX_OUTPUT_BYTES && text.len() < MAX_ADMIN_OUTPUT_BYTES);
+        let (_, additions, assignments) =
+            parse_admin(&text, &team, &catalog(), true, &root.0).unwrap();
+        assert_eq!(additions.len(), 8);
+        assert_eq!(assignments.len(), 8);
+        assert!(additions
+            .iter()
+            .all(|agent| agent.prompt == "p".repeat(9000)));
+        assert_eq!(additions[7].depends_on, ["worker_6"]);
     }
 
     async fn read_fixture_request(socket: &mut tokio::net::TcpStream) -> Value {
@@ -2466,20 +2640,7 @@ mod tests {
     #[tokio::test]
     async fn admin_responses_protocol_exposes_and_decodes_native_creation() {
         let root = TestRoot::new();
-        let runtime = test_runtime(&root, "http://127.0.0.1:1/v1".into());
-        let mut team = runtime.teams.create(&runtime, serde_json::from_value(json!({"name":"fixture","goal":"fixture","agents":[{"id":"admin","name":"ARIS","role":"admin","profile_id":"writer"}]})).unwrap()).unwrap();
-        team.admin = Some(TeamAdmin {
-            request_id: "request".into(),
-            session_id: team.agents[0].session_id.clone(),
-            profile_id: "writer".into(),
-            model_id: "exact-writer-model".into(),
-            family: "gpt".into(),
-            phase: "planning".into(),
-            response: String::new(),
-            error: None,
-            requested_effort: None,
-            applied_effort: None,
-        });
+        let team = admin_context(&root);
         let mut arguments = one_worker();
         arguments.as_object_mut().unwrap().remove("mode");
         let body = json!({"id":"response-1","status":"completed","output":[{"type":"function_call","id":"item-1","call_id":"response-call-1","name":"create_sub_agents","arguments":arguments.to_string()}]}).to_string();
@@ -2795,20 +2956,7 @@ mod tests {
     #[test]
     fn admin_rejects_recursive_unknown_unassigned_and_unapproved_expansion() {
         let root = TestRoot::new();
-        let runtime = test_runtime(&root, "http://127.0.0.1:1/v1".into());
-        let mut team=runtime.teams.create(&runtime,serde_json::from_value(json!({"name":"test","goal":"test","agents":[{"id":"admin","name":"ARIS","role":"admin","profile_id":"writer"}]})).unwrap()).unwrap();
-        team.admin = Some(TeamAdmin {
-            request_id: "request".into(),
-            session_id: team.agents[0].session_id.clone(),
-            profile_id: "writer".into(),
-            model_id: "exact-writer-model".into(),
-            family: "gpt".into(),
-            phase: "planning".into(),
-            response: String::new(),
-            error: None,
-            requested_effort: None,
-            applied_effort: None,
-        });
+        let team = admin_context(&root);
         let mut value = one_worker();
         value["assignments"][0]["agent_id"] = json!("admin");
         assert!(

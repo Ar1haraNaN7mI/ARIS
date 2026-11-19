@@ -459,7 +459,9 @@ impl DeepSeekClient {
             })
             .collect();
 
-        if !tool_calls.is_empty() {
+        // Tool bytes can be a valid JSON prefix even when generation was truncated.
+        // Preserve the provider's failure reason so callers cannot dispatch it.
+        if !tool_calls.is_empty() && finish == FinishReason::Stop {
             finish = FinishReason::ToolCalls;
         }
 
@@ -657,11 +659,10 @@ async fn assemble_non_stream_response(
     for call in &tool_calls {
         let _ = tx.send(LlmEvent::ToolCallDelta(call.clone())).await;
     }
-    let finish_reason = if !tool_calls.is_empty() {
-        FinishReason::ToolCalls
-    } else {
-        finish_reason(choice.finish_reason.as_deref())
-    };
+    let mut finish_reason = finish_reason(choice.finish_reason.as_deref());
+    if !tool_calls.is_empty() && finish_reason == FinishReason::Stop {
+        finish_reason = FinishReason::ToolCalls;
+    }
     let _ = tx.send(LlmEvent::Finished(finish_reason.clone())).await;
     Ok(AssembledResponse {
         provider_items: None,
@@ -962,5 +963,112 @@ mod tests {
             rx.recv().await,
             Some(LlmEvent::Finished(FinishReason::Stop))
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_slices_are_not_reemitted_and_preserve_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let fragments = [
+            r#"{"prompt":""#.to_owned(),
+            "中".repeat(20_000),
+            r#""}"#.to_owned(),
+        ];
+        let arguments = fragments.concat();
+        assert!(arguments.len() < 64 * 1024);
+        for (reason, expected) in [
+            ("length", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+        ] {
+            let mut body = String::new();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let chunk = json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"call_fixture","type":"function",
+                    "function":{"name":(index == 0).then_some("create_sub_agents"),
+                                "arguments":fragment}
+                }]}}]});
+                body.push_str(&format!("data: {chunk}\n\n"));
+            }
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+            body.push_str(&format!("data: {terminal}\n\ndata: [DONE]\n\n"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let client = super::DeepSeekClient::new(LlmConfig {
+                base_url: format!("http://{address}/v1"),
+                backend: LlmBackend::OpenAiCompatible,
+                ..LlmConfig::default()
+            })
+            .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.stream_chat(&[ChatMessage::user("fixture")], &[], tx),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.tool_calls.len(), 1);
+            let parsed = result.parsed_tool_calls().unwrap();
+            assert_eq!(parsed[0].0, "call_fixture");
+            assert_eq!(parsed[0].1, "create_sub_agents");
+            assert_eq!(
+                parsed[0].2,
+                serde_json::from_str::<serde_json::Value>(&arguments).unwrap()
+            );
+            for fragment in &fragments {
+                let Some(LlmEvent::ToolCallDelta(call)) = rx.recv().await else {
+                    panic!("expected one event per provider slice");
+                };
+                assert_eq!(call.id.as_deref(), Some("call_fixture"));
+                assert_eq!(call.function.unwrap().arguments.as_ref(), Some(fragment));
+            }
+            assert_eq!(result.finish_reason, expected);
+            assert!(
+                matches!(rx.recv().await, Some(LlmEvent::Finished(reason)) if reason == expected)
+            );
+            assert!(rx.recv().await.is_none(), "no duplicate final tool call");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn non_stream_tools_preserve_provider_failure_reason() {
+        for (reason, expected) in [
+            ("length", FinishReason::Length),
+            (
+                "content_filter",
+                FinishReason::Other("content_filter".into()),
+            ),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("stop", FinishReason::ToolCalls),
+        ] {
+            // A valid JSON prefix is not evidence that a truncated call is complete.
+            let payload = json!({"choices":[{"message":{"tool_calls":[{
+                "id":"call_fixture","type":"function",
+                "function":{"name":"create_sub_agents","arguments":"{\"agents\":[]}"}
+            }]},"finish_reason":reason}]})
+            .to_string();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let response = super::assemble_non_stream_response(&payload, tx)
+                .await
+                .unwrap();
+            assert_eq!(response.parsed_tool_calls().unwrap().len(), 1);
+            assert_eq!(response.finish_reason, expected);
+            assert!(matches!(rx.recv().await, Some(LlmEvent::ToolCallDelta(_))));
+            assert!(
+                matches!(rx.recv().await, Some(LlmEvent::Finished(reason)) if reason == expected)
+            );
+            assert!(rx.recv().await.is_none());
+        }
     }
 }
