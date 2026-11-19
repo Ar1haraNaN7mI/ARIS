@@ -1103,12 +1103,17 @@ impl TeamStore {
                 });
             }
             let delegated = !selected.is_empty();
+            let compiling_delivery = selected.len() > 1
+                && team.agents.iter().any(|a| {
+                    selected.contains(&a.id)
+                        && a.delivery == Some(crate::synthesis::DeliveryKind::Final)
+                });
             team.dispatch_agent_ids = None;
             team.execution_budget = delegated.then(|| TeamExecutionBudget {
                 agent_ids: selected.into_iter().collect(),
                 max_agent_runs: 6 + crate::tunnel::MAX_FOLLOWUPS,
-                max_steps_per_agent: 12,
-                max_tool_calls_per_agent: 32,
+                max_steps_per_agent: if compiling_delivery { 18 } else { 12 },
+                max_tool_calls_per_agent: if compiling_delivery { 40 } else { 32 },
                 max_context_chars: 64_000,
                 max_tokens_per_step: 4096,
                 max_parallel: 3,

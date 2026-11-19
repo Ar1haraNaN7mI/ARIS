@@ -780,6 +780,13 @@ async fn run_turn_inner(
         if let Some(brief) = &worker_brief {
             if _step > 0 {
                 let mut reminder = format!("Continue your current ARIS assignment using the observations above. Complete the assigned work and answer in the user's language. Your recipient already supplied the brief. Use the tools to write your assigned files and to send any requested questions, proposals or replies to the named peers. Return concrete findings and sources.\n{brief}");
+                if let Some((_, _, limit)) = execution_limits {
+                    let steps_left = max_steps - _step;
+                    let calls_left = limit.saturating_sub(tool_calls_used);
+                    if steps_left <= 4 || calls_left <= 6 {
+                        reminder.push_str(&format!("\nRemaining budget including this step: {steps_left} model responses and {calls_left} tool calls. Deliver from the evidence already collected. Reserve time for the outstanding peer reply, writing the declared files, and a final answer. Disclose any genuine evidence gap in the report."));
+                    }
+                }
                 if !missing_files.is_empty() {
                     reminder.push_str(&format!("\nThese assigned documents still need a verified write. Use write_file to finish them now: {}",missing_files.join(", ")));
                     missing_files.clear();
