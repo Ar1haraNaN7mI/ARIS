@@ -503,7 +503,7 @@ fn source_with_proof(
     })
 }
 
-fn ancestors<'a>(team: &'a Team, agent: &TeamAgent) -> Result<Vec<&'a TeamAgent>> {
+pub(crate) fn ancestors<'a>(team: &'a Team, agent: &TeamAgent) -> Result<Vec<&'a TeamAgent>> {
     fn visit<'a>(
         team: &'a Team,
         id: &str,
@@ -1091,7 +1091,7 @@ pub fn prepare(
             .filter(|handoff| handoff.to == agent.id)
             .collect();
         let final_guidance = if agent.delivery == Some(DeliveryKind::Final) {
-            "Write the single requested publication-ready result, addressing its actual audience. Deliver the final documents themselves, not a progress report, draft outline, list of what you did, or instructions for somebody else to write them. If files are assigned, write those UTF-8 documents and keep separate requested documents separate. Use the full source deliveries and references below; retain exact factual support and qualification. Do not turn unaccepted proposals into joint decisions. Include unresolved disagreement honestly when it affects the result. Use completed source work directly. Ask an owner for help only if a specific missing answer or contribution affects the publication."
+            "Write the single requested publication-ready result, addressing its actual audience. Start from the source deliveries supplied in this request. Verify any discrepancy that changes the decision, then save a usable first version with the decision, figures and supporting evidence. For a long report, add complete sections to that document as you finish them. Use the remaining time to refine and read back the saved report. Deliver the final documents themselves, not a progress report, draft outline, list of what you did, or instructions for somebody else to write them. If files are assigned, write those UTF-8 documents and keep separate requested documents separate. Use the full source deliveries and references below; retain exact factual support and qualification. Do not turn unaccepted proposals into joint decisions. Include unresolved disagreement honestly when it affects the result. Use completed source work directly. Ask an owner for help only if a specific missing answer or contribution affects the publication."
         } else {
             "Deliver your assigned work with complete evidence and checkable sources. Use dependency originals below for this step; do not rerun previous roles. Independent deliverables need no additional synthesis."
         };

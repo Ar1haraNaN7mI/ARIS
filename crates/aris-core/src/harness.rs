@@ -12,12 +12,14 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
     sync::{Arc, Weak},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Automatic administration is bounded independently of manually created teams.
 pub const ADMIN_WORKER_LIMIT: usize = 8;
+const FINALIZATION_WINDOW_SECS: u64 = 480;
 
 fn now() -> String {
     Utc::now().to_rfc3339()
@@ -129,6 +131,38 @@ pub struct TeamExecutionBudget {
     pub max_tokens_per_step: u32,
     pub max_parallel: usize,
     pub max_runtime_secs: u64,
+    /// Minimum time from the first eligible publication turn. Older budgets
+    /// keep their original shared deadline.
+    #[serde(default)]
+    pub finalization_window_secs: u64,
+}
+
+impl TeamExecutionBudget {
+    fn role_deadline(
+        &self,
+        started: Instant,
+        wave_started: Instant,
+        role: &TeamAgent,
+        publication_deadline: &mut Option<Instant>,
+    ) -> Instant {
+        let base = started + Duration::from_secs(self.max_runtime_secs);
+        if role.delivery != Some(crate::synthesis::DeliveryKind::Final)
+            || self.finalization_window_secs == 0
+        {
+            return base;
+        }
+        if let Some(deadline) = *publication_deadline {
+            return deadline;
+        }
+        if wave_started >= base {
+            return base;
+        }
+        let window =
+            Duration::from_secs(self.finalization_window_secs.min(FINALIZATION_WINDOW_SECS));
+        let deadline = base.max(wave_started + window);
+        *publication_deadline = Some(deadline);
+        deadline
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1128,11 +1162,23 @@ impl TeamStore {
                 });
             }
             let delegated = !selected.is_empty();
-            let compiling_delivery = selected.len() > 1
-                && team.agents.iter().any(|a| {
-                    selected.contains(&a.id)
-                        && a.delivery == Some(crate::synthesis::DeliveryKind::Final)
-                });
+            let final_owner = team.agents.iter().find(|a| {
+                selected.contains(&a.id)
+                    && a.delivery == Some(crate::synthesis::DeliveryKind::Final)
+            });
+            let compiling_delivery = selected.len() > 1 && final_owner.is_some();
+            let finalization_window_secs = match final_owner {
+                Some(writer)
+                    if crate::synthesis::ancestors(team, writer)?
+                        .iter()
+                        .filter(|source| source.session_id != admin_session)
+                        .count()
+                        >= 2 =>
+                {
+                    FINALIZATION_WINDOW_SECS
+                }
+                _ => 0,
+            };
             let max_agent_runs = selected.len() + crate::tunnel::MAX_FOLLOWUPS;
             team.dispatch_agent_ids = None;
             team.execution_budget = delegated.then(|| TeamExecutionBudget {
@@ -1144,6 +1190,7 @@ impl TeamStore {
                 max_tokens_per_step: 4096,
                 max_parallel: 3,
                 max_runtime_secs: 900,
+                finalization_window_secs,
             });
             let admin = team.admin.as_mut().unwrap();
             admin.phase = if delegated { "delegated" } else { "answered" }.into();
@@ -1341,7 +1388,8 @@ impl TeamStore {
         Ok(team)
     }
     async fn drive(self: &Arc<Self>, runtime: Arc<Runtime>, id: &str) -> Result<()> {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        let mut publication_deadline = None;
         let mut runs = 0usize;
         loop {
             let team = self.mutate(id, |t| {
@@ -1423,23 +1471,48 @@ impl TeamStore {
                 }
                 return Ok(());
             }
+            let wave_started = Instant::now();
+            let mut dispatch = Vec::new();
+            let mut expired = Vec::new();
+            for agent in ready {
+                let deadline = team.execution_budget.as_ref().map(|budget| {
+                    budget.role_deadline(started, wave_started, &agent, &mut publication_deadline)
+                });
+                if deadline.is_some_and(|limit| wave_started >= limit) {
+                    expired.push(agent.id);
+                } else {
+                    dispatch.push((agent, deadline));
+                }
+            }
+            if !expired.is_empty() {
+                self.mutate(id, |t| {
+                    for agent_id in &expired {
+                        if let Some(agent) = t.agents.iter_mut().find(|a| &a.id == agent_id) {
+                            agent.status = "cancelled".into();
+                            agent.error = Some("Admin execution time budget exhausted".into());
+                        }
+                        Self::event(
+                            t,
+                            Some(agent_id),
+                            "agent_error",
+                            "Admin execution time budget exhausted",
+                        );
+                    }
+                    Ok(())
+                })?;
+            }
+            if dispatch.is_empty() {
+                continue;
+            }
             if let Some(budget) = &team.execution_budget {
                 ensure!(
-                    started.elapsed().as_secs() < budget.max_runtime_secs,
-                    "Admin execution time budget exhausted"
-                );
-                ensure!(
-                    runs + ready.len() <= budget.max_agent_runs,
+                    runs + dispatch.len() <= budget.max_agent_runs,
                     "Admin agent-run budget exhausted; send a new instruction to continue"
                 );
             }
             let mut running = tokio::task::JoinSet::new();
-            runs += ready.len();
-            let deadline = team
-                .execution_budget
-                .as_ref()
-                .map(|b| started + std::time::Duration::from_secs(b.max_runtime_secs));
-            for agent in ready {
+            runs += dispatch.len();
+            for (agent, deadline) in dispatch {
                 let store = self.clone();
                 let runtime = runtime.clone();
                 let id = id.to_owned();
@@ -1992,6 +2065,107 @@ mod tests {
             applied_effort: None,
         }
     }
+    #[test]
+    fn publication_clock_is_bounded_and_isolated_from_other_workers() {
+        let legacy = serde_json::json!({
+            "agent_ids":["first","second","writer"], "max_agent_runs":11, "max_steps_per_agent":18,
+            "max_tool_calls_per_agent":40, "max_context_chars":64000, "max_tokens_per_step":4096,
+            "max_parallel":3, "max_runtime_secs":900
+        });
+        let mut budget: TeamExecutionBudget = serde_json::from_value(legacy).unwrap();
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+        let mut publication = None;
+        let other = agent("second", &[], &[]);
+        let mut writer = agent("writer", &["first", "second"], &[]);
+        writer.delivery = Some(crate::synthesis::DeliveryKind::Final);
+        assert_eq!(
+            budget.role_deadline(started, at(899), &writer, &mut publication),
+            at(900)
+        );
+        assert!(
+            publication.is_none(),
+            "an old budget keeps its shared deadline"
+        );
+        budget.finalization_window_secs = 480;
+        assert_eq!(
+            budget.role_deadline(started, at(900), &writer, &mut publication),
+            at(900)
+        );
+        assert!(
+            publication.is_none(),
+            "eligibility cannot be granted after the research cutoff"
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(899), &writer, &mut publication),
+            at(1379)
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(899), &other, &mut publication),
+            at(900)
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(1200), &writer, &mut publication),
+            at(1379)
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(1380), &writer, &mut publication),
+            at(1379)
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(1200), &other, &mut publication),
+            at(900)
+        );
+        assert_eq!(
+            budget.role_deadline(started, at(100), &writer, &mut None),
+            at(900)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_allocates_finalization_only_for_distinct_source_workers() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), false);
+        let runtime = &fixture.runtime;
+        for (upstream, delivery, expected) in [
+            (vec![], Some(crate::synthesis::DeliveryKind::Final), 0),
+            (
+                vec!["source"],
+                Some(crate::synthesis::DeliveryKind::Final),
+                480,
+            ),
+            (vec!["source"], None, 0),
+        ] {
+            let mut source = agent("source", &[], &[]);
+            source.status = "completed".into();
+            let mut analysis = agent("analysis", &upstream, &[]);
+            analysis.status = "completed".into();
+            let mut writer = agent("writer", &["analysis"], &[]);
+            writer.delivery = delivery;
+            let mut original = team(vec![source, analysis, writer]);
+            original.status = "planning".into();
+            original.admin = Some(admin("controller-session"));
+            runtime.teams.save(&original).unwrap();
+            let result = runtime
+                .teams
+                .finish_admin(
+                    runtime,
+                    &original.id,
+                    "capacity-request",
+                    "Publish the existing research",
+                    vec![],
+                    vec![AdminAssignment {
+                        agent_id: "writer".into(),
+                        instruction: "Write the report".into(),
+                    }],
+                )
+                .unwrap();
+            assert_eq!(
+                result.execution_budget.unwrap().finalization_window_secs,
+                expected
+            );
+        }
+    }
+
     #[test]
     fn admin_worker_capacity_counts_real_controller_and_saturates() {
         for count in [0, 1, 2, 7, 8, 9, 32] {

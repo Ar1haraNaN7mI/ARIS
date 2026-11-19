@@ -28,7 +28,7 @@ export type Team = {
   id: string; name: string; goal: string;
   status: "idle" | "planning" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
   admin?: { session_id: string; profile_id: string; model_id: string; family: ModelFamily; phase: "planning" | "answered" | "delegated" | "failed" | "cancelled"; response: string; error?: string; request_id?: string; requested_effort?: string; applied_effort?: string };
-  execution_budget?: { agent_ids: string[]; max_agent_runs: number; max_steps_per_agent: number; max_tokens_per_step: number; max_parallel: number; max_runtime_secs: number };
+  execution_budget?: { agent_ids: string[]; max_agent_runs: number; max_steps_per_agent: number; max_tokens_per_step: number; max_parallel: number; max_runtime_secs: number; finalization_window_secs?: number };
   agents: TeamAgent[]; files: string[]; tunnels?: TeamTunnel[];
   handoffs: { id: string; from: string; to: string; instruction: string; summary: string; at: string }[];
   checkpoints: { id: string; label: string; at: string; files: { path: string; exists: boolean; size: number }[] }[];
