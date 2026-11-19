@@ -2094,6 +2094,14 @@ mod tests {
             .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()));
         let calls = server.await.unwrap();
         assert_eq!(calls.len(), 5); // controller + two steps per worker
+        for i in [2, 4] {
+            assert!(
+                calls[i]["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("All assigned documents have verified content")
+            );
+        }
         assert!(calls[3]["messages"].to_string().contains(research));
         assert!(!calls[3]["messages"]
             .to_string()

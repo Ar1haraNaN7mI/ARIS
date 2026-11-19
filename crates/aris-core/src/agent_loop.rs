@@ -697,6 +697,8 @@ async fn run_turn_inner(
     let output_check = crate::synthesis::delivery_check(&runtime, &task_id)?;
     let mut requested_correction = false;
     let mut missing_files = Vec::<String>::new();
+    let mut check_written_files = false;
+    let mut documents_ready = false;
     let context_chars = if execution_limits.is_some() {
         Some(model_policy.context_chars.unwrap_or(64_000).min(64_000))
     } else {
@@ -749,6 +751,12 @@ async fn run_turn_inner(
 
         runtime.computer_status();
         let peer_context = crate::tunnel::context(&runtime, &task_id)?;
+        if check_written_files {
+            if let Some(check) = &output_check {
+                documents_ready = check.missing(&session.read())?.is_empty();
+            }
+            check_written_files = false;
+        }
         let conversation_limit = message_limit.map(|limit| {
             limit
                 .saturating_sub(
@@ -779,7 +787,12 @@ async fn run_turn_inner(
         }
         if let Some(brief) = &worker_brief {
             if _step > 0 {
-                let mut reminder = format!("Continue your current ARIS assignment using the observations above. Complete the assigned work and answer in the user's language. Your recipient already supplied the brief. Use the tools to write your assigned files and to send any requested questions, proposals or replies to the named peers. Return concrete findings and sources.\n{brief}");
+                let next_action = if documents_ready {
+                    "All assigned documents have verified content for this run. Address any outstanding peer request, then return your final handoff with the file paths and findings. Reopen sources or revise files only to correct a specific outstanding issue."
+                } else {
+                    "Use the tools to complete your assigned files and to send any requested questions, proposals or replies to the named peers."
+                };
+                let mut reminder = format!("Continue your current ARIS assignment using the observations above. Answer in the user's language. Your recipient already supplied the brief. {next_action} Return concrete findings and sources.\n{brief}");
                 if let Some((_, _, limit)) = execution_limits {
                     let steps_left = max_steps - _step;
                     let calls_left = limit.saturating_sub(tool_calls_used);
@@ -853,7 +866,14 @@ async fn run_turn_inner(
 
         let (llm_tx, mut llm_rx) = mpsc::channel(256);
         let llm = turn_llm.clone();
-        let tools_for_llm = tool_specs.clone();
+        // An additional tool call on the final permitted step would have no
+        // model response to consume its result. Close with the real documents
+        // once their writes have been verified, including any open questions.
+        let tools_for_llm = if documents_ready && _step + 1 == max_steps {
+            Arc::from([])
+        } else {
+            tool_specs.clone()
+        };
         let mut cancel_for_llm = cancel_rx.clone();
         let request_options = if model_policy.max_tokens.is_some()
             || model_policy.temperature.is_some()
@@ -1196,6 +1216,15 @@ async fn run_turn_inner(
                 content: content.clone(),
                 at: Utc::now(),
             });
+            if output_check.is_some()
+                && tool_result.ok
+                && matches!(
+                    name.as_str(),
+                    "write_file" | "edit_file" | "create_file" | "apply_patch" | "shell"
+                )
+            {
+                check_written_files = true;
+            }
             record_event(
                 &runtime,
                 EventEnvelope::new(
