@@ -90,6 +90,73 @@ pub struct PreparedDelivery {
     prior_artifacts: Vec<DeliveryArtifact>,
 }
 
+/// Initialized once before the worker's first model call. This captures the
+/// pre-turn file state without reloading team metadata at each stop candidate.
+pub struct DeliveryCheck {
+    workspace: PathBuf,
+    agent: TeamAgent,
+    proof: PreparedDelivery,
+}
+
+impl DeliveryCheck {
+    pub fn missing(&self, session: &Session) -> Result<Vec<String>> {
+        ensure!(
+            session.id == self.agent.session_id,
+            "Delivery check belongs to another session"
+        );
+        let source = source_with_proof(
+            &self.workspace,
+            &self.agent,
+            session,
+            None,
+            None,
+            Some(&self.proof),
+            false,
+            false,
+        )?;
+        Ok(self
+            .agent
+            .files
+            .iter()
+            .filter(|path| {
+                is_text_output(path)
+                    && !source
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.path == **path)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+pub fn delivery_check(runtime: &Runtime, task_id: &str) -> Result<Option<DeliveryCheck>> {
+    let Some(task) = runtime.tasks.task(task_id) else {
+        return Ok(None);
+    };
+    let Some(owner) = task.owner else {
+        return Ok(None);
+    };
+    let team = runtime.teams.get(&owner.team_id)?;
+    let agent = team
+        .agents
+        .iter()
+        .find(|agent| agent.id == owner.agent_id)
+        .context("Delivery worker is missing")?;
+    if agent.delivery.is_none() || !agent.files.iter().any(|path| is_text_output(path)) {
+        return Ok(None);
+    }
+    ensure!(
+        task.session_id.as_deref() == Some(agent.session_id.as_str()),
+        "Delivery task does not own this session"
+    );
+    Ok(Some(DeliveryCheck {
+        workspace: runtime.workspace_root.clone(),
+        agent: agent.clone(),
+        proof: prepare_files(runtime, &team, agent)?,
+    }))
+}
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -262,6 +329,22 @@ fn completed_source_with_proof(
     run_id: Option<String>,
     proof: Option<&PreparedDelivery>,
 ) -> Result<DeliverySource> {
+    source_with_proof(
+        workspace, agent, session, task_id, run_id, proof, true, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_with_proof(
+    workspace: &Path,
+    agent: &TeamAgent,
+    session: &Session,
+    task_id: Option<String>,
+    run_id: Option<String>,
+    proof: Option<&PreparedDelivery>,
+    require_end: bool,
+    require_complete: bool,
+) -> Result<DeliverySource> {
     let start = session
         .events
         .iter()
@@ -271,9 +354,10 @@ fn completed_source_with_proof(
         unreachable!()
     };
     ensure!(
-        session.events[start..]
-            .iter()
-            .any(|event| matches!(event, SessionEvent::TurnEnd{id,..} if id == turn_id)),
+        !require_end
+            || session.events[start..]
+                .iter()
+                .any(|event| matches!(event, SessionEvent::TurnEnd{id,..} if id == turn_id)),
         "An unfinished turn cannot be published"
     );
     let mut pending = HashMap::new();
@@ -393,14 +477,14 @@ fn completed_source_with_proof(
             reused: false,
         });
     }
-    if agent.delivery == Some(DeliveryKind::Final) {
+    if require_complete && agent.delivery.is_some() {
         for declared in agent.files.iter().filter(|path| is_text_output(path)) {
-            ensure!(artifacts.iter().any(|artifact|artifact.path==*declared),"Final publication is incomplete: {declared} has no verified UTF-8 output for this turn");
+            ensure!(artifacts.iter().any(|artifact|artifact.path==*declared),"Assigned delivery is incomplete: {declared} has no verified UTF-8 output for this turn");
         }
     }
     let (event_id, text) = answer.unwrap_or_default();
     ensure!(
-        !text.trim().is_empty() || !artifacts.is_empty(),
+        !require_complete || !text.trim().is_empty() || !artifacts.is_empty(),
         "Completed role has no final response or verified UTF-8 artifact"
     );
     Ok(DeliverySource {
@@ -603,23 +687,7 @@ fn observed_tunnels(
     captured
 }
 
-pub fn prepare(
-    runtime: &Runtime,
-    team: &Team,
-    agent: &TeamAgent,
-    fallback_prompt: String,
-) -> Result<PreparedDelivery> {
-    if agent.delivery.is_none() {
-        return Ok(PreparedDelivery {
-            prompt: fallback_prompt,
-            sources: vec![],
-            tunnels: vec![],
-            before_files: HashMap::new(),
-            exclusive_files: HashSet::new(),
-            prior_artifacts: vec![],
-        });
-    }
-    let mut sources = vec![];
+fn prepare_files(runtime: &Runtime, team: &Team, agent: &TeamAgent) -> Result<PreparedDelivery> {
     let prior_artifacts = load(runtime, team, agent)?
         .map(|snapshot| snapshot.owner.artifacts)
         .unwrap_or_default();
@@ -651,6 +719,39 @@ pub fn prepare(
         })
         .cloned()
         .collect();
+    Ok(PreparedDelivery {
+        prompt: String::new(),
+        sources: vec![],
+        tunnels: vec![],
+        before_files,
+        exclusive_files,
+        prior_artifacts,
+    })
+}
+
+pub fn prepare(
+    runtime: &Runtime,
+    team: &Team,
+    agent: &TeamAgent,
+    fallback_prompt: String,
+) -> Result<PreparedDelivery> {
+    if agent.delivery.is_none() {
+        return Ok(PreparedDelivery {
+            prompt: fallback_prompt,
+            sources: vec![],
+            tunnels: vec![],
+            before_files: HashMap::new(),
+            exclusive_files: HashSet::new(),
+            prior_artifacts: vec![],
+        });
+    }
+    let mut sources = vec![];
+    let PreparedDelivery {
+        before_files,
+        exclusive_files,
+        prior_artifacts,
+        ..
+    } = prepare_files(runtime, team, agent)?;
     for dependency in ancestors(team, agent)? {
         ensure!(
             dependency.status == "completed",
@@ -1087,6 +1188,85 @@ mod tests {
         )
         .unwrap();
         assert!(direct.artifacts.is_empty()); // existing filenames alone prove nothing
+    }
+
+    #[test]
+    fn supporting_and_independent_roles_require_their_declared_text_files() {
+        let root = TestRoot::new();
+        for kind in [DeliveryKind::Supporting, DeliveryKind::Independent] {
+            let role = agent("researcher", kind, &[], &["research.md"]);
+            let session = transcript(&role, "Would you like me to prepare a report?");
+            let error = completed_source(&root.0, &role, &session, None, None)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("research.md"));
+            // A leftover file without ownership proof cannot satisfy the contract.
+            fs::write(root.0.join("research.md"), "unverified previous content").unwrap();
+            assert!(completed_source(&root.0, &role, &session, None, None).is_err());
+            let mut actual = session.clone();
+            successful_write(&mut actual, "research.md", "report");
+            let delivered = completed_source(&root.0, &role, &actual, None, None).unwrap();
+            assert_eq!(delivered.artifacts.len(), 1);
+            let mut legacy = role.clone();
+            legacy.delivery = None;
+            assert!(completed_source(&root.0, &legacy, &session, None, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn delivery_check_finds_missing_files_and_accepts_same_turn_correction_before_end() {
+        let root = TestRoot::new();
+        let runtime = root.runtime();
+        let role = agent(
+            "researcher",
+            DeliveryKind::Supporting,
+            &[],
+            &["research.md"],
+        );
+        let team = team(vec![role.clone()]);
+        let team_dir = runtime.workspace_outer.join("teams").join(&team.id);
+        fs::create_dir_all(&team_dir).unwrap();
+        fs::write(
+            team_dir.join("team.json"),
+            serde_json::to_vec(&team).unwrap(),
+        )
+        .unwrap();
+        let mut task =
+            aris_protocol::TaskRecord::new(aris_protocol::GoalSpec::new("完成调研报告")).unwrap();
+        task.session_id = Some(role.session_id.clone());
+        task.owner = Some(aris_protocol::TeamTaskOwner {
+            subagent_id: "native-researcher".into(),
+            team_id: team.id.clone(),
+            agent_id: role.id.clone(),
+            parent_session_id: None,
+            workspace: root.0.to_string_lossy().into(),
+        });
+        let task = runtime.tasks.create_task(task).unwrap();
+        let check = delivery_check(&runtime, &task.id).unwrap().unwrap();
+        assert!(delivery_check(&runtime, "unknown-task").unwrap().is_none());
+        let mut session = transcript(&role, "Would you like me to prepare a report?");
+        session.events.pop(); // Stop candidate, not a completed turn.
+        assert_eq!(check.missing(&session).unwrap(), vec!["research.md"]);
+        fs::write(root.0.join("research.md"), "外部文件不算本轮完成").unwrap();
+        assert_eq!(check.missing(&session).unwrap(), vec!["research.md"]);
+        session.append(SessionEvent::TurnEnd {
+            id: "turn-1".into(),
+            at: chrono::Utc::now(),
+        });
+        successful_write(&mut session, "research.md", "correction");
+        session.events.pop();
+        fs::write(root.0.join("research.md"), "同一轮真实工具补写的完整报告").unwrap();
+        assert!(check.missing(&session).unwrap().is_empty());
+        // Publication still requires the actual lifecycle to finish.
+        assert!(completed_source(&root.0, &role, &session, None, None).is_err());
+        session.append(SessionEvent::TurnEnd {
+            id: "turn-1".into(),
+            at: chrono::Utc::now(),
+        });
+        let delivered = completed_source(&root.0, &role, &session, None, None).unwrap();
+        assert_eq!(delivered.artifacts[0].text, "同一轮真实工具补写的完整报告");
+        let another = transcript(&agent("other", DeliveryKind::Supporting, &[], &[]), "other");
+        assert!(check.missing(&another).is_err());
     }
 
     #[test]

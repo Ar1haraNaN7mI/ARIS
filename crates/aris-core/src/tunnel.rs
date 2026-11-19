@@ -74,10 +74,15 @@ fn id() -> String {
     Uuid::new_v4().to_string()
 }
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    optional_text(args, key).with_context(|| format!("{key} is required"))
+}
+
+/// Providers may populate every optional tool property with null or an empty
+/// string. Both mean omitted; meaningful strings retain their exact contents.
+fn optional_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .with_context(|| format!("{key} is required"))
 }
 
 struct Actor {
@@ -206,19 +211,17 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
     let action = text(args, "action")?;
     if action == "read" {
         let team = runtime.teams.get(&actor.team_id)?;
+        let requested_id = optional_text(args, "tunnel_id");
         let tunnels: Vec<_> = team
             .tunnels
             .iter()
             .filter(|tunnel| {
                 tunnel.participants.contains(&actor.agent_id)
-                    && args
-                        .get("tunnel_id")
-                        .and_then(Value::as_str)
-                        .is_none_or(|id| tunnel.id == id)
+                    && requested_id.is_none_or(|id| tunnel.id == id)
             })
             .collect();
         ensure!(
-            !tunnels.is_empty() || args.get("tunnel_id").is_none(),
+            !tunnels.is_empty() || requested_id.is_none(),
             "Tunnel not found for this worker"
         );
         return Ok(json!({"tunnels":tunnels,"blocking":false}));
@@ -302,13 +305,17 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             tunnel.status == "open",
             "Tunnel is closed; its transcript remains readable"
         );
-        let reply_to = args
-            .get("reply_to")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        // Opening addresses a peer and topic, never an existing message. Some
+        // providers fill unused references with strings such as "none"; those
+        // fields have no meaning for open. Reply actions remain strict.
+        let reply_to = if action == "open" {
+            None
+        } else {
+            optional_text(args, "reply_to").map(str::to_owned)
+        };
         match action {
             "open" | "send" | "propose" => {
-                if action != "open" || args.get("text").is_some() {
+                if action != "open" || optional_text(args, "text").is_some() {
                     let body = text(args, "text")?.to_owned();
                     let expects_reply = action == "propose"
                         || args
@@ -346,8 +353,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                     tunnel,
                     actor,
                     "accept",
-                    args.get("text")
-                        .and_then(Value::as_str)
+                    optional_text(args, "text")
                         .unwrap_or("I accept this proposal.")
                         .into(),
                     Some(proposal.id.clone()),
@@ -364,9 +370,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                 tunnel.close_reason = Some("Both participants accepted the proposal".into());
             }
             "close" => {
-                let reason = args
-                    .get("text")
-                    .and_then(Value::as_str)
+                let reason = optional_text(args, "text")
                     .unwrap_or("Closed by a participant without a joint decision");
                 ensure!(
                     reason.chars().count() <= MAX_MESSAGE_CHARS,
@@ -412,8 +416,13 @@ impl ToolHandler for TunnelTool {
             "Consult another real worker in this team through a temporary, asynchronous two-way tunnel. open uses to+topic and optional text; send/propose use tunnel_id+text. Reply with reply_to and expects_reply=false unless you need another answer. accept uses the other worker's proposal_id and records joint agreement; close records unresolved closure. read returns the full two-way transcript. Never wait or poll: peers receive messages at their next model step; late replies may resume the same conversation within a strict budget.",
             json!({"type":"object","properties":{
                 "action":{"type":"string","enum":["open","send","read","propose","accept","close"]},
-                "to":{"type":"string"},"topic":{"type":"string"},"tunnel_id":{"type":"string"},
-                "text":{"type":"string"},"reply_to":{"type":"string"},"proposal_id":{"type":"string"},"expects_reply":{"type":"boolean"}
+                "to":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "topic":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "tunnel_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "text":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "reply_to":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "proposal_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "expects_reply":{"anyOf":[{"type":"boolean"},{"type":"null"},{"enum":[""]}]}
             },"required":["action"],"additionalProperties":false})).with_metadata(metadata)
     }
     async fn call(&self, args: Value, ctx: &ToolContext) -> std::result::Result<String, ToolError> {
@@ -881,5 +890,134 @@ mod tests {
         current.agents[1].status = "completed".into();
         schedule(&mut current);
         assert!(current.tunnel_turns.is_empty());
+    }
+
+    #[test]
+    fn optional_empty_properties_are_omitted_but_required_references_remain_strict() {
+        let (fixture, team, _lease) = setup();
+        let runtime = &fixture.runtime;
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        for (index, empty) in [json!(""), Value::Null, json!(" \t ")]
+            .into_iter()
+            .enumerate()
+        {
+            let args = json!({"action":"open","to":"b","topic":format!("optional-{index}"),
+                "text":"A real question","reply_to":empty,"tunnel_id":null,"proposal_id":null,"expects_reply":null});
+            runtime
+                .tools
+                .preflight(&aris_tools::ToolCall {
+                    id: "fixture".into(),
+                    name: "agent_tunnel".into(),
+                    arguments: args.clone(),
+                })
+                .unwrap();
+            let opened = perform(runtime, &a, &args).unwrap();
+            let id = opened["tunnel"]["id"].as_str().unwrap();
+            assert!(opened["tunnel"]["messages"][0].get("reply_to").is_none());
+            assert_eq!(opened["tunnel"]["messages"][0]["expects_reply"], true);
+            let read = perform(runtime, &a, &json!({"action":"read","tunnel_id":empty})).unwrap();
+            assert!(!read["tunnels"].as_array().unwrap().is_empty());
+            assert!(perform(
+                runtime,
+                &a,
+                &json!({"action":"send","tunnel_id":empty,"text":"required id"})
+            )
+            .is_err());
+            assert!(perform(
+                runtime,
+                &a,
+                &json!({"action":"send","tunnel_id":id,"text":empty})
+            )
+            .is_err());
+            assert!(perform(
+                runtime,
+                &a,
+                &json!({"action":"propose","tunnel_id":id,"text":empty})
+            )
+            .is_err());
+            assert!(perform(
+                runtime,
+                &b,
+                &json!({"action":"accept","tunnel_id":id,"proposal_id":empty})
+            )
+            .is_err());
+            assert!(perform(
+                runtime,
+                &a,
+                &json!({"action":"open","to":empty,"topic":"invalid"})
+            )
+            .is_err());
+            let closed = perform(
+                runtime,
+                &a,
+                &json!({"action":"close","tunnel_id":id,"text":empty}),
+            )
+            .unwrap();
+            assert!(!closed["tunnel"]["close_reason"]
+                .as_str()
+                .unwrap()
+                .is_empty());
+        }
+        let opened = perform(
+            runtime,
+            &a,
+            &json!({"action":"open","to":"b","topic":"no first message","text":null,"reply_to":""}),
+        )
+        .unwrap();
+        let id = opened["tunnel"]["id"].as_str().unwrap();
+        assert!(opened["tunnel"]["messages"].as_array().unwrap().is_empty());
+        let still_empty = perform(
+            runtime,
+            &a,
+            &json!({"action":"open","to":"b","topic":"no first message","text":"","reply_to":null}),
+        )
+        .unwrap();
+        assert!(still_empty["tunnel"]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let proposal=perform(runtime,&a,&json!({"action":"propose","tunnel_id":id,"text":"Use the verified source","reply_to":""})).unwrap();
+        let proposal_id = proposal["tunnel"]["messages"][0]["id"].as_str().unwrap();
+        let accepted = perform(
+            runtime,
+            &b,
+            &json!({"action":"accept","tunnel_id":id,"proposal_id":proposal_id,"text":null}),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted["tunnel"]["messages"][1]["text"],
+            "I accept this proposal."
+        );
+        let read_empty = perform(
+            runtime,
+            &participant(&team, "final"),
+            &json!({"action":"read","tunnel_id":null}),
+        )
+        .unwrap();
+        assert!(read_empty["tunnels"].as_array().unwrap().is_empty());
+        for invalid in [json!(42), json!({}), json!(true)] {
+            assert!(runtime
+                .tools
+                .preflight(&aris_tools::ToolCall {
+                    id: "fixture".into(),
+                    name: "agent_tunnel".into(),
+                    arguments: json!({"action":"read","tunnel_id":invalid})
+                })
+                .is_err());
+        }
+        let semantic_open=perform(runtime,&a,&json!({"action":"open","to":"b","topic":"ignore unused references",
+            "text":"Verify the official condition","reply_to":"none","proposal_id":"none","tunnel_id":"none"})).unwrap();
+        let semantic_id = semantic_open["tunnel"]["id"].as_str().unwrap();
+        assert!(semantic_open["tunnel"]["messages"][0]
+            .get("reply_to")
+            .is_none());
+        assert_eq!(
+            semantic_open["tunnel"]["messages"][0]["expects_reply"],
+            true
+        );
+        for action in ["send", "propose"] {
+            assert!(perform(runtime,&a,&json!({"action":action,"tunnel_id":semantic_id,"text":"Bad reply","reply_to":"none"})).is_err());
+        }
     }
 }

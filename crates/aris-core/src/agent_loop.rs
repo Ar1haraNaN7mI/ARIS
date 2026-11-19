@@ -670,10 +670,33 @@ async fn run_turn_inner(
     // Cache tool schemas across steps until registry generation changes.
     let mut tool_gen = u64::MAX;
     let mut tool_specs: Arc<[ToolSpec]> = Arc::from([]);
-    let team_worker = runtime
-        .tasks
-        .task(&task_id)
-        .is_some_and(|task| task.owner.is_some());
+    let owner = runtime.tasks.task(&task_id).and_then(|task| task.owner);
+    let team_worker = owner.is_some();
+    let worker_brief = if let Some(owner) = owner {
+        let team = runtime.teams.get(&owner.team_id)?;
+        let worker = team
+            .agents
+            .iter()
+            .find(|agent| agent.id == owner.agent_id)
+            .context("Worker assignment missing")?;
+        let instruction = team
+            .messages
+            .iter()
+            .rev()
+            .find(|msg| !msg.queued && msg.agent_id.as_deref() == Some(worker.id.as_str()));
+        let peers: Vec<_> = team
+            .agents
+            .iter()
+            .filter(|a| a.id != worker.id && a.subagent_id.is_some())
+            .map(|a| a.id.as_str())
+            .collect();
+        Some(json!({"role":worker.id,"assignment":worker.prompt,"latest_instruction":instruction.map(|msg| &msg.text),"write_to":worker.files,"peer_ids":peers}).to_string())
+    } else {
+        None
+    };
+    let output_check = crate::synthesis::delivery_check(&runtime, &task_id)?;
+    let mut requested_correction = false;
+    let mut missing_files = Vec::<String>::new();
     let context_chars = if execution_limits.is_some() {
         Some(model_policy.context_chars.unwrap_or(64_000).min(64_000))
     } else {
@@ -741,8 +764,28 @@ async fn run_turn_inner(
             conversation_limit,
             model_policy.thinking.unwrap_or(base_llm_config.thinking),
         );
+        // Crawled pages and long tool batches can evict the current user turn
+        // from the bounded history. Keep the actual commission (including its
+        // source deliveries) in front of the surviving tool conversation.
+        if team_worker
+            && !messages
+                .iter()
+                .any(|message| message.role == aris_llm::Role::User && message.text() == user_text)
+        {
+            messages.insert(1, aris_llm::ChatMessage::user(user_text.clone()));
+        }
         if let Some(context) = peer_context {
             messages.push(aris_llm::ChatMessage::user(context));
+        }
+        if let Some(brief) = &worker_brief {
+            if _step > 0 {
+                let mut reminder = format!("Continue your current ARIS assignment using the observations above. Complete the assigned work and answer in the user's language. Your recipient already supplied the brief. Use the tools to write your assigned files and to send any requested questions, proposals or replies to the named peers. Return concrete findings and sources.\n{brief}");
+                if !missing_files.is_empty() {
+                    reminder.push_str(&format!("\nThese assigned documents still need a verified write. Use write_file to finish them now: {}",missing_files.join(", ")));
+                    missing_files.clear();
+                }
+                messages.push(aris_llm::ChatMessage::user(reminder));
+            }
         }
         if vision {
             session
@@ -758,22 +801,23 @@ async fn run_turn_inner(
                 .into_iter()
                 .filter(|definition| team_worker || definition.name != "agent_tunnel")
                 .collect();
-            let tunnel = team_worker
-                .then(|| {
-                    definitions
-                        .iter()
-                        .find(|definition| definition.name == "agent_tunnel")
-                        .cloned()
+            let worker_tools: Vec<_> = definitions
+                .iter()
+                .filter(|definition| {
+                    team_worker
+                        && (definition.name == "agent_tunnel"
+                            || (output_check.is_some() && definition.name == "write_file"))
                 })
-                .flatten();
+                .cloned()
+                .collect();
             let mut definitions =
                 select_tools_for_query(&definitions, &user_text, model_policy.tool_budget);
-            if let Some(tunnel) = tunnel {
+            for required in worker_tools {
                 if !definitions
                     .iter()
-                    .any(|definition| definition.name == "agent_tunnel")
+                    .any(|definition| definition.name == required.name)
                 {
-                    definitions.push(tunnel);
+                    definitions.push(required);
                 }
             }
             tool_specs = definitions
@@ -925,7 +969,21 @@ async fn run_turn_inner(
         if !needs_tools {
             let peer_arrived =
                 _step + 1 < max_steps && crate::tunnel::has_unread(&runtime, &task_id)?;
-            completed_response = !peer_arrived;
+            missing_files = match &output_check {
+                Some(check) => check.missing(&session.read())?,
+                None => vec![],
+            };
+            let repair =
+                !missing_files.is_empty() && !requested_correction && _step + 1 < max_steps;
+            if repair {
+                requested_correction = true;
+                session.write().append(SessionEvent::SystemNote {
+                    id: Uuid::new_v4().to_string(),
+                    text: format!("待补齐交付文件：{}", missing_files.join("、")),
+                    at: Utc::now(),
+                });
+            }
+            completed_response = !peer_arrived && !repair;
             session.write().append(SessionEvent::StepEnd {
                 id: step_id.clone(),
                 turn_id: turn_id.clone(),
@@ -941,8 +999,17 @@ async fn run_turn_inner(
                 Some(&run_id),
             );
             save_step_checkpoint(&runtime, &session, &task_id, &run_id, _step);
-            if peer_arrived {
+            if peer_arrived || repair {
                 continue;
+            }
+            if !missing_files.is_empty() {
+                let reason = format!(
+                    "Assigned delivery is incomplete: {}",
+                    missing_files.join(", ")
+                );
+                record_task_feedback(&runtime, &task_id, &run_id, false, &reason);
+                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                anyhow::bail!(reason);
             }
             break;
         }

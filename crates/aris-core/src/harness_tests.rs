@@ -632,3 +632,54 @@ async fn native_tunnel_parallel_peer_and_late_reply_resume_original_worker_once(
 async fn native_tunnel_delivers_to_a_dependency_that_has_not_started() {
     real_tunnel_roundtrip(true).await;
 }
+
+#[tokio::test]
+async fn worker_missing_an_assigned_document_gets_one_same_session_correction() {
+    let (fixture, mut rx, server) = fixture().await;
+    let runtime = fixture.runtime.clone();
+    let mut researcher = worker("researcher", &[]);
+    researcher.delivery = Some(crate::synthesis::DeliveryKind::Supporting);
+    researcher.files = vec!["research.md".into()];
+    let team = runtime
+        .teams
+        .create(
+            &runtime,
+            TeamSpec {
+                name: "missing assigned report".into(),
+                goal: "Write a sourced research report".into(),
+                agents: vec![researcher],
+                files: vec!["research.md".into()],
+            },
+        )
+        .unwrap();
+    runtime.teams.start(runtime.clone(), &team.id).unwrap();
+    request(&mut rx)
+        .await
+        .reply
+        .send("Which report would you like?".into())
+        .unwrap();
+    let correction = request(&mut rx).await;
+    let last = correction.body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert!(last["content"].as_str().unwrap().contains("research.md"));
+    assert!(last["content"].as_str().unwrap().contains("verified write"));
+    correction
+        .reply
+        .send("No document delivered".into())
+        .unwrap();
+    let end = settled(&runtime, &team.id).await;
+    assert_eq!(end.status, "failed");
+    assert!(end.agents[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("research.md"));
+    assert!(
+        rx.try_recv().is_err(),
+        "Do not repeat an unsuccessful recovery"
+    );
+    server.abort();
+}
