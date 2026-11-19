@@ -13,7 +13,7 @@ use std::sync::{Arc, Weak};
 use uuid::Uuid;
 
 const MAX_TUNNELS: usize = 8;
-const MAX_OPEN_PER_AGENT: usize = 2;
+const MAX_ACTIVE_PER_AGENT: usize = 2;
 const MAX_MESSAGES: usize = 16;
 const MAX_MESSAGE_CHARS: usize = 2048;
 const MAX_TRANSCRIPT_CHARS: usize = 16_384;
@@ -297,7 +297,8 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             "Team is stopping; coordination is closed"
         );
         let address_peer = action == "open"
-            || (matches!(action, "ask" | "invite") && optional_text(args, "tunnel_id").is_none());
+            || (matches!(action, "send" | "ask" | "invite")
+                && optional_text(args, "tunnel_id").is_none());
         let index = if address_peer {
             let to = text(args, "to")?;
             let topic = text(args, "topic")?;
@@ -331,17 +332,6 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                     team.tunnels.len() < MAX_TUNNELS,
                     "This workflow has reached its 8-tunnel limit"
                 );
-                for agent in [&actor.agent_id, &to.to_owned()] {
-                    ensure!(
-                        team.tunnels
-                            .iter()
-                            .filter(|tunnel| tunnel.status == "open"
-                                && tunnel.participants.contains(agent))
-                            .count()
-                            < MAX_OPEN_PER_AGENT,
-                        "A worker can have at most two open tunnels"
-                    );
-                }
                 let at = now();
                 team.tunnels.push(AgentTunnel {
                     id: id(),
@@ -374,7 +364,8 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         // Opening addresses a peer and topic, never an existing message. Some
         // providers fill unused references with strings such as "none"; those
         // fields have no meaning for open. Reply actions remain strict.
-        let reply_to = if address_peer {
+        let was_active = has_pending_work(tunnel);
+        let reply_to = if address_peer && action != "send" {
             None
         } else {
             optional_text(args, "reply_to").map(str::to_owned)
@@ -447,11 +438,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                 });
                 // A decision can share its transcript with unfinished co-work or
                 // an expressly requested return to the proposer.
-                if !tunnel
-                    .messages
-                    .iter()
-                    .any(|message| needs_attention(tunnel, message))
-                {
+                if !has_pending_work(tunnel) {
                     tunnel.status = "closed".into();
                     tunnel.close_reason = Some("Both participants accepted the proposal".into());
                 }
@@ -476,6 +463,22 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             _ => "tunnel_message",
         };
         let summary = format!("{}: {}", tunnel.id, tunnel.topic);
+        if !was_active && has_pending_work(tunnel) {
+            let participants = tunnel.participants.clone();
+            for participant in &participants {
+                let active = team
+                    .tunnels
+                    .iter()
+                    .filter(|other| {
+                        other.participants.contains(participant) && has_pending_work(other)
+                    })
+                    .count();
+                ensure!(
+                    active <= MAX_ACTIVE_PER_AGENT,
+                    "{participant} already has two tunnels requiring a response or co-work"
+                );
+            }
+        }
         TeamStore::event(team, Some(&actor.agent_id), event_kind, &summary);
         Ok(())
     })?;
@@ -500,12 +503,12 @@ impl ToolHandler for TunnelTool {
         // or an external account. It remains available to read-only workers.
         metadata.idempotent = false;
         ToolDefinition::builtin("agent_tunnel",
-            "Coordinate asynchronously with an existing teammate. open(to,topic,text) or send(tunnel_id,text) posts a visible notice without waking a worker. ask requests a necessary answer; invite requests a specific piece of work with a checkable result. For ask/invite supply to+topic or an existing tunnel_id, plus text. If your own deliverable depends on the return, set resume_on_reply=true on the request. Answer via send+reply_to. The invitee uses accept_work, performs the work with its own tools/permissions, then complete_work with the result or artifact reference; decline_work gives a reason. All three use tunnel_id and reply_to=invitation message id. propose/accept record an explicit decision via proposal_id. read returns the full transcript; close ends a discussion. Continue useful work without polling.",
+            "Coordinate asynchronously with an existing teammate. open or send posts a visible notice without waking a worker. ask requests a necessary answer; invite requests a specific piece of work with a checkable result. For send/ask/invite supply to+topic or an existing tunnel_id, plus text. Up to two tunnels per participant can have outstanding work; notices do not use these slots. If your own deliverable depends on the return, set resume_on_reply=true on the request. Answer via send+reply_to with the received message id. The invitee uses accept_work, performs the work with its own tools/permissions, then complete_work with the result or artifact reference; decline_work gives a reason. All three use tunnel_id and reply_to=invitation message id. propose/accept record an explicit decision via proposal_id. read returns the full transcript; close ends a discussion. Continue useful work without polling.",
             json!({"type":"object","properties":{
                 "action":{"type":"string","enum":["open","send","ask","invite","accept_work","decline_work","complete_work","read","propose","accept","close"]},
-                "to":{"anyOf":[{"type":"string"},{"type":"null"}]},
-                "topic":{"anyOf":[{"type":"string"},{"type":"null"}]},
-                "tunnel_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "to":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Exact peer worker id. Pair with topic to open a tunnel or send directly."},
+                "topic":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Topic for the peer route. Reusing the same open topic reuses its transcript."},
+                "tunnel_id":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"For send/ask/invite use an existing tunnel id or address via to and topic."},
                 "text":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "reply_to":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "proposal_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
@@ -569,6 +572,13 @@ fn needs_attention(tunnel: &AgentTunnel, message: &TunnelMessage) -> bool {
             }))
 }
 
+fn has_pending_work(tunnel: &AgentTunnel) -> bool {
+    tunnel
+        .messages
+        .iter()
+        .any(|message| needs_attention(tunnel, message))
+}
+
 /// Ending an unattended request must leave the opposite participant's ongoing work usable.
 fn end_followups(tunnel: &mut AgentTunnel, messages: &[String], reason: &str) {
     if messages.is_empty() || tunnel.status != "open" {
@@ -583,11 +593,7 @@ fn end_followups(tunnel: &mut AgentTunnel, messages: &[String], reason: &str) {
     }
     if changed {
         tunnel.updated_at = now();
-        if !tunnel
-            .messages
-            .iter()
-            .any(|message| needs_attention(tunnel, message))
-        {
+        if !has_pending_work(tunnel) {
             tunnel.status = "closed".into();
             tunnel.close_reason = Some(reason.into());
         }
@@ -844,7 +850,7 @@ mod tests {
 
     fn setup() -> (crate::tests::RuntimeFixture, Team, std::fs::File) {
         let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), false);
-        let agents = ["a","b","final"].iter().map(|id|serde_json::from_value(json!({
+        let agents = ["a","b","final","c"].iter().map(|id|serde_json::from_value(json!({
             "id":id,"name":id,"role":"analyst","profile_id":"gpt","delivery":if *id == "final" { Some("final") } else { None }
         })).unwrap()).collect();
         let team = fixture
@@ -998,6 +1004,93 @@ mod tests {
             .for_each(|a| a.status = "completed".into());
         schedule(&mut current);
         assert!(current.tunnel_turns.is_empty());
+    }
+
+    #[test]
+    fn notices_reuse_peer_routes_without_taking_active_request_slots() {
+        let (fixture, team, _lease) = setup();
+        let runtime = &fixture.runtime;
+        let final_owner = participant(&team, "final");
+        let post = |from: &str, action: &str, topic: &str| {
+            perform(
+                runtime,
+                &participant(&team, from),
+                &json!({
+                    "action":action, "to":"final", "topic":topic, "text":"Verify the source totals"
+                }),
+            )
+        };
+        let question = post("a", "ask", "a").unwrap();
+        post("b", "invite", "b").unwrap();
+        // Three distinct upstream roles can notify a writer already handling two requests.
+        for source in ["a", "b", "c"] {
+            let posted = post(source, "send", source).unwrap();
+            let last = posted["tunnel"]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap();
+            assert_eq!(last["kind"], "notice");
+            assert_eq!(last["from"], source);
+            assert_eq!(last["to"], "final");
+        }
+        let before = runtime.teams.get(&team.id).unwrap();
+        assert_eq!(before.tunnels.len(), 3);
+        assert!(post("c", "ask", "new topic").is_err());
+        let passive = before.tunnels.iter().find(|t| t.topic == "c").unwrap();
+        let c = participant(&team, "c");
+        for action in ["ask", "invite", "propose", "open", "send"] {
+            let attempt = json!({
+                "action":action, "to":"final", "topic":"c", "tunnel_id":passive.id,
+                "text":"Need a decision", "expects_reply":true
+            });
+            assert!(perform(runtime, &c, &attempt)
+                .unwrap_err()
+                .to_string()
+                .contains("two tunnels"));
+        }
+        let after = runtime.teams.get(&team.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.tunnels).unwrap(),
+            serde_json::to_value(&before.tunnels).unwrap()
+        );
+        let reply = |id: &Value| {
+            perform(
+                runtime,
+                &final_owner,
+                &json!({
+                    "action":"send","to":"a","topic":"a","reply_to":id,"text":"Verified 12 transactions."
+                }),
+            )
+        };
+        assert!(
+            reply(&json!(passive.messages[0].id)).is_err(),
+            "a direct reply must reference a message in its actual route"
+        );
+        let answer = reply(&question["tunnel"]["messages"][0]["id"]).unwrap();
+        assert_eq!(answer["tunnel"]["messages"][2]["kind"], "answer");
+        assert_eq!(
+            answer["tunnel"]["messages"][2]["reply_to"],
+            question["tunnel"]["messages"][0]["id"]
+        );
+        post("c", "ask", "c").unwrap();
+        let current = runtime.teams.get(&team.id).unwrap();
+        assert_eq!(current.tunnels.len(), 3);
+        assert_eq!(
+            current
+                .tunnels
+                .iter()
+                .filter(|t| has_pending_work(t))
+                .count(),
+            2
+        );
+        for index in current.tunnels.len()..MAX_TUNNELS {
+            post("a", "send", &format!("notice {index}")).unwrap();
+        }
+        assert!(post("a", "send", "extra notice")
+            .unwrap_err()
+            .to_string()
+            .contains("8-tunnel limit"));
     }
 
     #[test]
