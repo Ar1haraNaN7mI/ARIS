@@ -11,14 +11,30 @@ import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
 import type { SessionEvent, SessionResult } from "./types";
 import { conversationAgents, messageSource } from "./teamConversationModel";
 
-type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; note?: string; partial?: boolean };
+type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; note?: string; noteLabel?: string; partial?: boolean };
 export function conversationEntries(team: Team, sessions: Record<string, SessionResult>, agentId?: string, profiles: ModelProfile[] = []): Entry[] {
   const entries: Entry[] = [{ id: "goal", at: team.created_at, user: team.goal }];
   for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, source: messageSource(team, message), recipient: team.agents.find((agent) => agent.id === message.agent_id)?.name, queued: message.queued });
   for (const agent of conversationAgents(team).filter((item) => !agentId || item.id === agentId)) {
-    const events = sessions[agent.id]?.session.events || [];
+    const snapshot = sessions[agent.id];
+    const events = agent.session_id && snapshot?.session.id === agent.session_id ? snapshot.session.events : [];
     const identities = sessionModelIdentities(events, profiles);
+    const isAdmin = !!team.admin && agent.session_id === team.admin.session_id;
+    let firstAdminUser = true;
+    const mirroredMessages = new Set<string>();
     for (const item of sessionTimeline(events)) {
+      if (item.kind === "message" && item.event.type === "user_message" && item.event.text) {
+        if (isAdmin) {
+          const originalGoal = firstAdminUser && item.event.text.trim() === team.goal.trim() && Math.abs(Date.parse(item.event.at) - Date.parse(team.created_at)) < 5000;
+          firstAdminUser = false;
+          const mirrored = (team.messages || []).find((message) => !mirroredMessages.has(message.id) && messageSource(team, message) === "user" &&
+            (!message.agent_id || message.agent_id === agent.id) && message.text === item.event.text && Math.abs(Date.parse(message.at) - Date.parse(item.event.at)) < 1000);
+          if (mirrored) mirroredMessages.add(mirrored.id);
+          if (!originalGoal && !mirrored) entries.push({ id: `${agent.id}:user:${item.event.id}`, at: item.event.at, user: item.event.text, source: "user", agent, event: item.event });
+        } else if (agentId) {
+          entries.push({ id: `${agent.id}:context:${item.event.id}`, at: item.event.at, agent, event: item.event, note: item.event.text, noteLabel: "执行上下文" });
+        }
+      }
       if (item.kind === "message" && item.event.type === "assistant_message") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), event: item.event });
       if (item.kind === "tool") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), event: item.event, tool: item });
       if (item.kind === "note") entries.push({ id: `${agent.id}:${item.event.id}`, at: item.event.at, agent, identity: identities.get(item.event.id), note: item.event.text, event: item.event });
@@ -64,7 +80,7 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
     const color = entry.identity?.family ? modelColors[entry.identity.family] : "#8ba1ad";
     const attrs = agent ? { "data-anchor-key": `message:${team.id}:${agent.id}:${entry.event?.id || entry.id}`, "data-process-team": team.id, "data-process-agent": agent.id, "data-process-event": entry.event?.id } : {};
     if (entry.user && entry.source && entry.source !== "user") return <details className="lp-note lp-dispatch-note" key={entry.id}><summary><span>{entry.source === "admin" ? "ARIS · 分工安排" : "任务指令"}{entry.recipient && ` · ${entry.recipient}`}</span><time>{formatTime(entry.at)}</time></summary><pre>{entry.user}</pre></details>;
-    if (entry.user) return <article className="lp-user-message" key={entry.id}><div className="lp-message-who"><PersonIcon /><span>你</span><time>{formatTime(entry.at)}</time>{entry.queued && <small>等待下一轮</small>}</div><div className="lp-user-bubble">{entry.user}</div></article>;
+    if (entry.user) return <article className="lp-user-message" key={entry.id} {...attrs}><div className="lp-message-who"><PersonIcon /><span>你</span><time>{formatTime(entry.at)}</time>{entry.queued && <small>等待下一轮</small>}</div><div className="lp-user-bubble">{entry.user}</div></article>;
     if (entry.tool) {
       const { event, result } = entry.tool;
       const live = !result && !entry.tool.turnEnded && agent?.status === "running";
@@ -72,7 +88,7 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent }
       const file = result?.ok === true ? writtenFile(event) : undefined;
       return <div key={entry.id} {...attrs} className="lp-process-row" style={{ "--model-color": color, "--light-color": color } as CSSProperties}><details className={`lp-tool-step ${live ? "running" : ""} ${result?.ok === false ? "failed" : ""}`}><summary>{live && <RunningBorder />}<span className={`lp-step-marker ${result?.ok === false ? "failed" : ""}`} /><strong>{event.name || result?.name || "工具调用"}</strong><span className="lp-tool-owner">{agent?.name}</span><small>{live ? "执行中" : result ? result.ok === false ? "失败" : "已完成" : "未返回"}{Number.isFinite(duration) && duration >= 0 && ` · ${duration < 1000 ? `${duration} ms` : `${(duration / 1000).toFixed(1)} s`}`}</small></summary><div className="lp-tool-body">{event.type === "tool_call" && <details open><summary>输入参数</summary><pre>{pretty(event.arguments)}</pre></details>}{result && <details open><summary>工具返回</summary><pre>{pretty(result.content)}</pre></details>}</div></details>{file && <div className="lp-delivery"><FileTextIcon /><span>产物 · <code>{file}</code></span></div>}</div>;
     }
-    if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{agent?.name} · {agent?.error === entry.note ? "执行失败" : "运行记录"}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
+    if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{agent?.name} · {entry.noteLabel || (agent?.error === entry.note ? "执行失败" : "运行记录")}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
     return <article className={`lp-assistant-message ${entry.partial ? "running" : ""}`} key={entry.id} {...attrs} style={{ "--model-color": color, "--light-color": color } as CSSProperties}>{entry.partial && <RunningBorder />}<div className="lp-message-who"><AgentGlyph family={entry.identity?.family || "unknown"} /><button title={entry.identity?.modelId || "历史模型未记录"} onClick={() => agent && onSelectAgent(agent.id)}>{agent?.name}</button>{entry.identity?.modelId && <small className="lp-message-model">{entry.identity.modelId}</small>}<time>{formatTime(entry.at)}</time>{entry.partial && <span className="lp-writing">正在回复</span>}</div>{entry.event?.reasoning && <details className="lp-reasoning"><summary>思考过程</summary><pre>{entry.event.reasoning}</pre></details>}{entry.event?.text && <Body text={entry.event.text} />}</article>;
   })}{activeAgents.length > 0 && <div className="lp-active-line"><span />{activeAgents.map((agent) => agent.name).join("、")} {team.status === "planning" ? "正在处理" : "正在执行"}</div>}</div></div>;
 }
