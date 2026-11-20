@@ -19,10 +19,11 @@ type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" 
 export function conversationEntries(team: Team, sessions: Record<string, SessionResult>, agentId?: string, profiles: ModelProfile[] = []): Entry[] {
   const entries: Entry[] = [{ id: "goal", at: team.created_at, user: team.goal }];
   for (const event of team.events) {
-    if (event.kind !== "cowork_turn_started" && event.kind !== "cowork_turn_finished") continue;
+    if (event.kind !== "cowork_turn_started" && event.kind !== "cowork_turn_finished" && event.kind !== "final_review") continue;
     if (agentId && agentId !== event.agent_id) continue;
     const agent = team.agents.find((member) => member.id === event.agent_id);
-    if (agent) entries.push({ id: `cowork:${agent.id}:${event.kind}:${event.at}`, at: event.at, agent, action: event.kind, noteLabel: actionLabels[event.kind], note: event.message });
+    const note = event.kind === "final_review" ? "交付依据已更新，主笔开始核对最新完成的材料。" : event.message;
+    if (agent) entries.push({ id: `team:${agent.id}:${event.kind}:${event.at}`, at: event.at, agent, action: event.kind, noteLabel: actionLabels[event.kind], note });
   }
   for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, source: messageSource(team, message), recipient: team.agents.find((agent) => agent.id === message.agent_id)?.name, queued: message.queued });
   for (const tunnel of team.tunnels || []) {

@@ -805,6 +805,126 @@ async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknow
 }
 
 #[tokio::test]
+async fn publication_rechecks_a_source_revised_during_the_writers_own_cowork() {
+    let (fixture, mut rx, server) = fixture().await;
+    let runtime = fixture.runtime.clone();
+    let mut writer = worker("writer", &["research"]);
+    writer.delivery = Some(crate::synthesis::DeliveryKind::Final);
+    let team = runtime
+        .teams
+        .create(
+            &runtime,
+            TeamSpec {
+                name: "Publication freshness".into(),
+                goal: "Verify the headline and publish".into(),
+                agents: vec![worker("research", &[]), writer],
+                files: vec![],
+            },
+        )
+        .unwrap();
+    runtime.teams.start(runtime.clone(), &team.id).unwrap();
+    request(&mut rx)
+        .await
+        .reply
+        .send("Original source conclusion".into())
+        .unwrap();
+    tool_reply(
+        request(&mut rx).await,
+        "verify-claim",
+        json!({
+            "action":"invite","to":"research","topic":"Headline verification","text":"Verify the source for the latest headline."
+        }),
+    );
+    let a = request(&mut rx).await;
+    let b = request(&mut rx).await;
+    let (research, held_writer) = if a.body["messages"]
+        .to_string()
+        .contains("Your assignment: Answer as research")
+    {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let t = runtime.teams.get(&team.id).unwrap();
+    let tunnel = &t.tunnels[0];
+    let invitation = &tunnel.messages[0].id;
+    tool_reply(
+        research,
+        "accept",
+        json!({"action":"accept_work","tunnel_id":tunnel.id,"reply_to":invitation}),
+    );
+    tool_reply(
+        request(&mut rx).await,
+        "return",
+        json!({
+            "action":"complete_work","tunnel_id":tunnel.id,"reply_to":invitation,"text":"Headline verified against the original."
+        }),
+    );
+    request(&mut rx)
+        .await
+        .reply
+        .send("New source conclusion from independent verification.".into())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.teams.get(&team.id).unwrap().agents[0].status != "completed" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    held_writer
+        .reply
+        .send("Written during peer verification.".into())
+        .unwrap();
+    loop {
+        let writer = request(&mut rx).await;
+        let messages = writer.body["messages"].to_string();
+        if messages.contains("Final publication review:") {
+            assert!(messages.contains("New source conclusion from independent verification."));
+            writer
+                .reply
+                .send("Published with the latest verified source.".into())
+                .unwrap();
+            break;
+        }
+        writer.reply.send("The claim is verified.".into()).unwrap();
+    }
+    let finished = settled(&runtime, &team.id).await;
+    assert_eq!(finished.status, "completed");
+    assert_eq!(
+        finished
+            .events
+            .iter()
+            .filter(|e| e.kind == "final_review")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finished
+            .events
+            .iter()
+            .filter(|e| e.kind == "agent_started" && e.agent_id.as_deref() == Some("research"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        finished
+            .events
+            .iter()
+            .filter(|e| e.kind == "agent_started" && e.agent_id.as_deref() == Some("writer"))
+            .count(),
+        2
+    );
+    let delivery = crate::synthesis::deliverable(&runtime, &finished)
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.text, "Published with the latest verified source.");
+    assert!(!delivery.stale);
+    assert!(rx.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
 async fn first_free_slot_serves_cowork_before_primary_dependencies_finish() {
     let (fixture, mut rx, server) = fixture().await;
     let runtime = fixture.runtime.clone();

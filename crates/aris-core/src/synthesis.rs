@@ -525,25 +525,12 @@ pub(crate) fn ancestors<'a>(team: &'a Team, agent: &TeamAgent) -> Result<Vec<&'a
 }
 
 fn relevant_tunnels(team: &Team, ids: &HashSet<String>) -> Result<Vec<Value>> {
-    let value = serde_json::to_value(team)?;
-    Ok(value
-        .get("tunnels")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|tunnel| {
-            tunnel
-                .get("participants")
-                .and_then(Value::as_array)
-                .is_some_and(|participants| {
-                    participants
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|id| ids.contains(id))
-                })
-        })
-        .cloned()
-        .collect())
+    Ok(team
+        .tunnels
+        .iter()
+        .filter(|tunnel| tunnel.participants.iter().any(|id| ids.contains(id)))
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<_>>()?)
 }
 
 fn tunnel_semantics(tunnels: &[Value]) -> Vec<Value> {

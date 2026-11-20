@@ -1392,6 +1392,8 @@ impl TeamStore {
         let mut publication_deadline = None;
         let mut runs = 0usize;
         let mut in_flight = HashSet::new();
+        let mut publication_ran = false;
+        let mut final_review = false;
         loop {
             let team = self.mutate(id, |t| {
                 if t.status != "cancelling" {
@@ -1439,11 +1441,42 @@ impl TeamStore {
                     if t.status == "cancelling" || t.messages.iter().any(|message| message.queued) {
                         return Ok(());
                     }
-                    let complete = t
+                    let mut complete = t
                         .agents
                         .iter()
                         .filter(|a| selected_for_run(t, a))
                         .all(|a| a.status == "completed");
+                    if complete && publication_ran {
+                        if let Some(delivery) = crate::synthesis::deliverable(&runtime, t)?
+                            .filter(|delivery| delivery.stale)
+                        {
+                            // A contributor can complete a co-work revision after
+                            // the writer has taken its immutable source snapshot.
+                            // One final read of the now-settled sources is charged
+                            // against the normal run and time budgets.
+                            let sources_settled = delivery.sources.iter().all(|source| {
+                                t.agents.iter().any(|a| {
+                                    a.id == source.agent_id && a.status == "completed"
+                                })
+                            });
+                            let owner = t.agents.iter_mut().find(|a| a.id == delivery.agent_id)
+                                .context("Final delivery owner disappeared")?;
+                            if sources_settled && !final_review {
+                                owner.status = pending();
+                                final_review = true;
+                                Self::event(t, Some(&delivery.agent_id), "final_review",
+                                    "Source evidence changed during publication; reviewing the latest completed snapshots");
+                                return Ok(());
+                            }
+                            owner.status = "failed".into();
+                            owner.error = Some(if sources_settled {
+                                "Sources changed again during the final review. The last delivery is retained for inspection."
+                            } else {
+                                "A source still has unfinished work. Complete it before requesting another final review."
+                            }.into());
+                            complete = false;
+                        }
+                    }
                     t.status = if complete { "completed" } else { "failed" }.into();
                     crate::tunnel::close_all(
                         t,
@@ -1534,6 +1567,10 @@ impl TeamStore {
             runs += dispatch.len();
             for (turn, deadline) in dispatch {
                 let worker_id = turn.agent.id.clone();
+                let publishing = !turn.cowork_only
+                    && turn.agent.delivery == Some(crate::synthesis::DeliveryKind::Final);
+                publication_ran |= publishing;
+                let review = publishing && final_review;
                 in_flight.insert(worker_id.clone());
                 let store = self.clone();
                 let runtime = runtime.clone();
@@ -1541,7 +1578,7 @@ impl TeamStore {
                 running.spawn(async move {
                     (
                         worker_id,
-                        store.run_agent(runtime, &id, turn, deadline).await,
+                        store.run_agent(runtime, &id, turn, deadline, review).await,
                     )
                 });
             }
@@ -1566,6 +1603,7 @@ impl TeamStore {
         id: &str,
         turn: LaneTurn,
         deadline: Option<std::time::Instant>,
+        final_review: bool,
     ) -> Result<()> {
         let LaneTurn { agent, cowork_only } = turn;
         let mut cowork_starts = Vec::new();
@@ -1617,10 +1655,13 @@ impl TeamStore {
             let prepared = if cowork_only { None } else {
                 Some(crate::synthesis::prepare(&runtime, &team, &agent, agent_prompt(&team, &agent))?)
             };
-            let prompt = match &prepared {
+            let mut prompt = match &prepared {
                 Some(delivery) => delivery.prompt.clone(),
                 None => format!("You are {} (worker ID {}). Your main assignment is waiting for its dependencies. This is a separate, bounded co-work turn in your own lane. Work only on the incoming invitations {} in the attached peer transcript. Accept and carry out the requested check with your tools; complete_work using the invitation ID, or decline_work if appropriate. If information is missing, ask the requester a concrete question with resume_on_reply=true, then yield without polling. Preserve existing files, write only to your owned paths ({}) if the invitation requires it. Your main assignment will run separately after its inputs arrive. Do not publish or complete the primary assignment during this turn.", agent.name, agent.id, invitations.join(", "), agent.files.join(", ")),
             };
+            if final_review {
+                prompt.push_str("\nFinal publication review: a source completed or changed after the preceding draft was prepared. Read the current source deliveries and prior draft, apply any material differences, and confirm the final publication. Preserve accurate existing files. Send no additional peer requests for this closing check.");
+            }
             let task = self.prepare_task(&runtime, &team, &agent, &prompt)?;
             let (tx, mut rx) = mpsc::channel(256);
             let handle = runner

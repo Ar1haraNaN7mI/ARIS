@@ -67,20 +67,22 @@ it("keeps both speakers and their agreed wording visible after the temporary lan
   expect(select).toHaveBeenCalledWith("a");
 });
 
-it("shows independent co-work turns and the return to the assignment in the actual worker's chat and lane", () => {
+it("shows co-work and final review events in the responsible worker's chat and lane", () => {
   const sample = { ...team, events: [
     { at, agent_id: "b", kind: "cowork_turn_started", message: "work on the invitation" },
     { at, agent_id: "b", kind: "cowork_turn_finished", message: "return to pending assignment" },
+    { at, agent_id: "b", kind: "final_review", message: "Source evidence changed during publication" },
   ] };
   const props = { team: sample, sessions: {}, profiles: [], onSelectAgent: vi.fn() };
   const view = render(<ProcessChat {...props} agentId="b" />);
-  for (const kind of ["cowork_turn_started", "cowork_turn_finished"] as const) {
+  for (const kind of ["cowork_turn_started", "cowork_turn_finished", "final_review"] as const) {
     expect(view.container.querySelector(`.lp-note svg[data-action-icon="${kind}"]`)?.parentElement?.textContent).toContain(actionLabels[kind]);
   }
   const trace = projectWorkspaceTrace([sample]).lanes.find((lane) => lane.agent.id === "b")!;
-  expect(trace.nodes.filter((node) => node.source === "team").map((node) => node.action)).toEqual(["cowork_turn_started", "cowork_turn_finished"]);
+  expect(trace.nodes.filter((node) => node.source === "team").map((node) => node.action)).toEqual(["cowork_turn_started", "cowork_turn_finished", "final_review"]);
   view.rerender(<ProcessChat {...props} agentId="a" />);
   expect(view.container.querySelector('.lp-note svg[data-action-icon="cowork_turn_started"]')).toBeNull();
+  expect(view.container.querySelector('.lp-note svg[data-action-icon="final_review"]')).toBeNull();
 });
 
 it("shows one copy of a peer exchange in either participant's chat, including co-work results and passive notices", () => {

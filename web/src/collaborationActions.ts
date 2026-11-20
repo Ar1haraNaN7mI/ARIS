@@ -1,7 +1,7 @@
 import type { TunnelMessage } from "./teamTypes";
 
 export type CollaborationAction = TunnelMessage["kind"] | "open" | "close" | "read" | "resume" |
-  "end_followup" | "handoff" | "dispatch" | "create" | "cowork_turn_started" | "cowork_turn_finished";
+  "end_followup" | "handoff" | "dispatch" | "create" | "cowork_turn_started" | "cowork_turn_finished" | "final_review";
 
 export const actionLabels: Record<CollaborationAction, string> = {
   message: "发言", notice: "通知", question: "请求答复", answer: "答复",
@@ -10,6 +10,7 @@ export const actionLabels: Record<CollaborationAction, string> = {
   open: "开启通道", close: "关闭通道", read: "读取通道", resume: "唤醒泳道",
   end_followup: "结束跟进", handoff: "交接", dispatch: "分工", create: "创建角色",
   cowork_turn_started: "独立协作开工", cowork_turn_finished: "返回主任务",
+  final_review: "终稿复核",
 };
 
 export function messageAction(message: TunnelMessage): TunnelMessage["kind"] {
