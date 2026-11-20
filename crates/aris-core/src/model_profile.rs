@@ -603,6 +603,23 @@ fn intent_bonus(query: &str, tool_name: &str) -> i32 {
     let query = query.to_ascii_lowercase();
     let matches = |terms: &[&str]| terms.iter().any(|term| query.contains(term));
     let tool_matches = |names: &[&str]| names.contains(&tool_name);
+    if tool_name == "project_checks"
+        && matches(&[
+            "回归测试",
+            "单元测试",
+            "构建命令",
+            "测试入口",
+            "unit test",
+            "test suite",
+            "build scripts",
+            "package.json",
+            "cargo test",
+            "pytest",
+            "unittest",
+        ])
+    {
+        return 15;
+    }
     if matches(&[
         "剪辑",
         "剪视频",

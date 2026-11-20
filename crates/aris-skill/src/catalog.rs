@@ -658,6 +658,22 @@ mod observed_tests {
     }
 
     #[test]
+    fn bundled_coding_skill_routes_from_an_unsegmented_chinese_commission() {
+        let fixture = Fixture::new();
+        let catalog = SkillCatalog::new(fixture.0.join("meta"));
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../outer/bundled-skills");
+        catalog.discover_roots_observed(&[(bundled, SkillSource::Bundled)], &mut |_| {});
+        let first = |query| {
+            crate::rank_skills(&catalog, query, &Default::default(), 1)[0]
+                .summary
+                .name
+                .clone()
+        };
+        assert_eq!(first("请修复代码并补上回归测试"), "software-development");
+        assert_eq!(first("请帮我画一张海报"), "visual-design");
+    }
+
+    #[test]
     fn disabled_skills_stay_out_of_routing_and_loading_after_restart() {
         let fixture = Fixture::new();
         let path = fixture.write(

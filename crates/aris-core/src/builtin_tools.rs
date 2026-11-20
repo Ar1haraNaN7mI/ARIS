@@ -13,6 +13,7 @@ use tokio::process::Command;
 pub fn register_builtin_tools(registry: &ToolRegistry, fs: Arc<FsService>) {
     let todos = Arc::new(TodoStore::default());
     registry.register(Arc::new(crate::report_calculate::ReportCalculate));
+    registry.register(Arc::new(crate::project_checks::ProjectChecks(fs.clone())));
     registry.register(Arc::new(ReadFileTool { fs: fs.clone() }));
     registry.register(Arc::new(WriteFileTool { fs: fs.clone() }));
     registry.register(Arc::new(EditFileTool { fs: fs.clone() }));
@@ -186,11 +187,13 @@ impl ToolHandler for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::builtin(
             "apply_patch",
-            "Apply multi-hunk SEARCH/REPLACE patch. Supports *** Update/Add/Delete File headers.",
+            "Apply a multi-file patch. Use *** Begin Patch and *** End Patch around file headers. For Update File, use @@ and prefix context with a space, additions with +, removals with -. Add File takes +lines; Delete File takes just the header. Also accepts closed <<<<<<< SEARCH / ======= / >>>>>>> REPLACE hunks. Supply unique context for existing content.",
             json!({
                 "type": "object",
                 "properties": {
-                    "patch": { "type": "string" }
+                    "patch": { "type": "string", "examples": [
+                        "*** Begin Patch\n*** Update File: src/example.py\n@@\n-return False\n+return True\n*** End Patch"
+                    ] }
                 },
                 "required": ["patch"]
             }),
@@ -328,15 +331,18 @@ impl ToolHandler for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::builtin(
             "grep",
-            "Search file contents with a regex. Optional glob filter (e.g. *.rs).",
+            "Search UTF-8 source files in stable path order. Matches use path:line:text. Context uses path-line-text. Paths are relative to root or the name of a single searched file. Directory scans skip .git, .aris, node_modules and target; set root explicitly to search inside them.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
-                    "root": { "type": "string" },
+                    "root": { "type": "string", "description": "File or directory; defaults to the workspace cwd." },
                     "glob": { "type": "string" },
                     "case_insensitive": { "type": "boolean" },
-                    "max_hits": { "type": "integer" }
+                    "literal": { "type": "boolean", "description": "Match the exact search text instead of interpreting a regex." },
+                    "context_lines": { "type": "integer", "minimum": 0, "description": "Number of surrounding lines on each side of a match." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Number of matching lines to skip. Continue with the next offset shown in the result." },
+                    "max_hits": { "type": "integer", "minimum": 0, "description": "Matching lines per page (default 80). Context lines do not count." }
                 },
                 "required": ["pattern"]
             }),
@@ -344,23 +350,32 @@ impl ToolHandler for GrepTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let pattern = args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::Message("pattern required".into()))?;
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(|p| resolve_path(ctx, p))
-            .unwrap_or_else(|| ctx.cwd.clone());
-        let glob = args.get("glob").and_then(|v| v.as_str());
-        let ci = args
-            .get("case_insensitive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let max = args.get("max_hits").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+        #[derive(serde::Deserialize)]
+        struct Args {
+            pattern: String,
+            root: Option<String>,
+            glob: Option<String>,
+            case_insensitive: Option<bool>,
+            literal: Option<bool>,
+            context_lines: Option<usize>,
+            offset: Option<usize>,
+            max_hits: Option<usize>,
+        }
+        let args: Args =
+            serde_json::from_value(args).map_err(|e| ToolError::Message(e.to_string()))?;
+        let root = resolve_path(ctx, args.root.as_deref().unwrap_or("."));
+        let options = aris_fs::GrepOptions {
+            glob: args.glob.as_deref(),
+            case_insensitive: args.case_insensitive.unwrap_or_default(),
+            literal: args.literal.unwrap_or_default(),
+            context_lines: args.context_lines.unwrap_or_default(),
+            offset: args.offset.unwrap_or_default(),
+            max_hits: args
+                .max_hits
+                .unwrap_or(aris_fs::GrepOptions::default().max_hits),
+        };
         self.fs
-            .grep(&root, pattern, glob, max, ci)
+            .grep_with_options(&root, &args.pattern, options)
             .map_err(|e| ToolError::Message(e.to_string()))
     }
 }
@@ -401,11 +416,16 @@ impl ToolHandler for ShellTool {
 }
 
 async fn run_shell_cancellable(ctx: &ToolContext, command: &str) -> Result<String, ToolError> {
-    use tokio::io::AsyncReadExt;
-
     #[cfg(windows)]
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", command])
+    let child = Command::new("powershell")
+        // powershell.exe otherwise flattens a native program's nonzero code to 1.
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "{command}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+            ),
+        ])
         .current_dir(&ctx.cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -414,7 +434,7 @@ async fn run_shell_cancellable(ctx: &ToolContext, command: &str) -> Result<Strin
         .map_err(|e| ToolError::Message(e.to_string()))?;
 
     #[cfg(not(windows))]
-    let mut child = Command::new("bash")
+    let child = Command::new("bash")
         .args(["-lc", command])
         .current_dir(&ctx.cwd)
         .stdout(Stdio::piped())
@@ -424,40 +444,30 @@ async fn run_shell_cancellable(ctx: &ToolContext, command: &str) -> Result<Strin
         .map_err(|e| ToolError::Message(e.to_string()))?;
 
     let mut cancel = ctx.cancel.clone();
-    loop {
-        if *cancel.borrow() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(ToolError::Message("shell cancelled".into()));
+    let stopped = async {
+        if cancel.wait_for(|value| *value).await.is_err() {
+            std::future::pending::<()>().await;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_end(&mut stdout).await;
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_end(&mut stderr).await;
-                }
-                let mut text = String::from_utf8_lossy(&stdout).to_string();
-                if !stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&String::from_utf8_lossy(&stderr));
-                }
-                text.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
-                return Ok(text);
-            }
-            Ok(None) => {
-                tokio::select! {
-                    _ = cancel.changed() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
-                }
-            }
-            Err(e) => return Err(ToolError::Message(e.to_string())),
+    };
+    // Drain both pipes while the process runs. Verbose compilers and test suites
+    // can fill a pipe before they exit, even when no one is watching the UI.
+    let output = tokio::select! {
+        biased;
+        _ = stopped => return Err(ToolError::Message("shell cancelled".into())),
+        result = child.wait_with_output() => result.map_err(|e| ToolError::Message(e.to_string()))?,
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
         }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    text.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+    if output.status.success() {
+        Ok(text)
+    } else {
+        Err(ToolError::Message(text))
     }
 }
 
@@ -609,5 +619,34 @@ impl ToolHandler for TodoReadTool {
 
     async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
         Ok(serde_json::to_string_pretty(&*self.store.items.read()).unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod shell_receipt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn verbose_failing_process_drains_both_pipes_and_preserves_exit_status() {
+        let ctx = ToolContext {
+            agent_id: "shell-test".into(),
+            cwd: std::env::temp_dir(),
+            outer_home: PathBuf::new(),
+            workspace_outer: PathBuf::new(),
+            cancel: tokio::sync::watch::channel(false).1,
+        };
+        #[cfg(windows)]
+        let command="[Console]::Out.Write(('x' * 200000)); [Console]::Error.Write(('y' * 200000)); cmd.exe /c exit 7";
+        #[cfg(not(windows))]
+        let command = "printf '%0200000d' 0; printf '%0200000d' 0 >&2; exit 7";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_shell_cancellable(&ctx, command),
+        )
+        .await
+        .expect("verbose process should finish");
+        let text = result.unwrap_err().to_string();
+        assert!(text.len() >= 400000);
+        assert!(text.ends_with("[exit 7]"));
     }
 }

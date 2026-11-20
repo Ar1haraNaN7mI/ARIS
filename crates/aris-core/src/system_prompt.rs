@@ -45,8 +45,8 @@ impl SystemPromptBuilder {
             "Tool routing (efficient):\n\
              1) skill_search/skill_recommend → skill_load → follow body\n\
              2) plugin_search → plugin.<id>.<tool>\n\
-             3) Code navigation: grep, glob, read_file(offset/limit), list_dir\n\
-             4) Edits: edit_file or apply_patch (SEARCH/REPLACE hunks)\n\
+             3) Code navigation: project_checks locates test/build commands and their working directories; grep, glob, read_file(offset/limit), list_dir locate implementations and callers\n\
+             4) Edits: edit_file for a unique anchor, apply_patch for Codex or SEARCH/REPLACE hunks\n\
              5) shell (cancellable), web_fetch, todo_write/todo_read\n\
              6) Web research: web_crawl returns sourced Markdown; computer tools operate your own browser pages\n\
              7) Outcomes auto-update learn weights"

@@ -417,6 +417,9 @@ pub struct TaskStore {
     /// deliberately separate from the event store's global cursor because a
     /// different process may append records that have not been replayed here.
     projection_sequence: AtomicU64,
+    // Last complete replay used for lease recovery. A local append can advance
+    // projection_sequence past an unread heartbeat from a different process.
+    lease_replay_sequence: AtomicU64,
 }
 
 /// One durable projection commit for the end of a worker attempt. Keeping
@@ -459,12 +462,17 @@ impl TaskStore {
             snapshot_path,
             event_notify: RwLock::new(None),
             projection_sequence: AtomicU64::new(0),
+            lease_replay_sequence: AtomicU64::new(0),
         };
         let snapshot_sequence = store.load_snapshot()?;
         store
             .projection_sequence
             .store(snapshot_sequence, Ordering::Release);
         store.replay_after(snapshot_sequence)?;
+        store.lease_replay_sequence.store(
+            store.projection_sequence.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         Ok(store)
     }
 
@@ -864,23 +872,40 @@ impl TaskStore {
         stale_after: Duration,
     ) -> Result<Vec<RunRecord>> {
         let stale_after = stale_after.max(Duration::zero());
+        let expired = |run: &RunRecord| {
+            matches!(
+                run.state,
+                RunState::Running
+                    | RunState::WaitingApproval
+                    | RunState::WaitingEvent
+                    | RunState::Paused
+            ) && now.signed_duration_since(run.heartbeat_at.unwrap_or(run.updated_at))
+                >= stale_after
+                && self
+                    .task(&run.task_id)
+                    .is_none_or(|task| task.owner.is_none())
+        };
+        if self
+            .runs
+            .read()
+            .values()
+            .any(|run| expired(run) && run.worker_id.as_deref().is_some_and(native_worker))
+        {
+            // A long-lived scheduler's projection may predate the owner's last
+            // heartbeat or completion. Refresh only when a native lease appears
+            // expired, then re-evaluate against the durable records.
+            let _guard = self.projection_guard.lock();
+            self.replay_after(self.lease_replay_sequence.load(Ordering::Acquire))?;
+            self.lease_replay_sequence.store(
+                self.projection_sequence.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
         let candidates: Vec<String> = self
             .runs
             .read()
             .values()
-            .filter(|run| {
-                self.task(&run.task_id)
-                    .is_none_or(|task| task.owner.is_none())
-                    && matches!(
-                        run.state,
-                        RunState::Running
-                            | RunState::WaitingApproval
-                            | RunState::WaitingEvent
-                            | RunState::Paused
-                    )
-                    && now.signed_duration_since(run.heartbeat_at.unwrap_or(run.updated_at))
-                        >= stale_after
-            })
+            .filter(|run| expired(run))
             .map(|run| run.id.clone())
             .collect();
         let mut recovered = Vec::new();
@@ -890,9 +915,9 @@ impl TaskStore {
         Ok(recovered)
     }
 
-    /// Recover active runs owned by a previous local worker immediately after
-    /// restart. The current worker id is excluded so a live supervisor is not
-    /// mistaken for an orphan while its heartbeat loop is running.
+    /// Preserve legacy orphan handling. Native worker IDs are unique per
+    /// runtime, including simultaneous processes, so their heartbeat lease
+    /// determines when another worker can take over.
     pub fn recover_orphaned_runs(
         &self,
         now: DateTime<Utc>,
@@ -912,10 +937,9 @@ impl TaskStore {
                             | RunState::WaitingEvent
                             | RunState::Paused
                     )
-                    && run
-                        .worker_id
-                        .as_deref()
-                        .is_some_and(|worker_id| worker_id != current_worker_id)
+                    && run.worker_id.as_deref().is_some_and(|worker_id| {
+                        worker_id != current_worker_id && !native_worker(worker_id)
+                    })
             })
             .map(|run| run.id.clone())
             .collect();
@@ -1357,6 +1381,16 @@ impl TaskStore {
     }
 }
 
+fn native_worker(worker: &str) -> bool {
+    let Some((pid, instance)) = worker
+        .strip_prefix("aris-worker-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    pid.parse::<u32>().is_ok() && uuid::Uuid::parse_str(instance).is_ok()
+}
+
 fn validate_snapshot_records(snapshot: &TaskStoreSnapshot) -> Result<()> {
     let mut task_ids = HashSet::with_capacity(snapshot.tasks.len());
     for task in &snapshot.tasks {
@@ -1583,6 +1617,49 @@ mod tests {
             .transition_task(&task.id, TaskState::Completed)
             .expect("completed");
         assert!(store.transition_task(&task.id, TaskState::Running).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_worker_recovery_reads_durable_heartbeats_before_expiry() {
+        let dir = temp_path("native-lease");
+        let events: Arc<dyn EventStore> =
+            Arc::new(JsonlEventStore::open(dir.join("events.jsonl")).unwrap());
+        let owner = TaskStore::open(events.clone()).unwrap();
+        let task = owner
+            .create_task(TaskRecord::new(GoalSpec::new("run")).unwrap())
+            .unwrap();
+        owner.transition_task(&task.id, TaskState::Running).unwrap();
+        let run = owner.create_run(&task.id, 1).unwrap();
+        let worker = format!("aris-worker-1234-{}", uuid::Uuid::new_v4());
+        let start = Utc::now();
+        owner.claim_run(&run.id, &worker, start).unwrap();
+        let observer = TaskStore::open(events).unwrap();
+        let heartbeat = start + Duration::seconds(15);
+        owner.heartbeat_run(&run.id, &worker, heartbeat).unwrap();
+        // An unrelated local append advances this observer's projection cursor
+        // past the heartbeat before it considers the old lease expired.
+        observer
+            .create_task(TaskRecord::new(GoalSpec::new("other")).unwrap())
+            .unwrap();
+        assert!(observer
+            .recover_orphaned_runs(heartbeat, "worker-new")
+            .unwrap()
+            .is_empty());
+        let ttl = Duration::seconds(10);
+        assert!(observer
+            .recover_stale_runs(heartbeat, ttl)
+            .unwrap()
+            .is_empty());
+        assert_eq!(observer.run(&run.id).unwrap().heartbeat_at, Some(heartbeat));
+        assert_eq!(
+            observer
+                .recover_stale_runs(heartbeat + ttl, ttl)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(observer.task(&task.id).unwrap().state, TaskState::Queued);
         let _ = fs::remove_dir_all(dir);
     }
 

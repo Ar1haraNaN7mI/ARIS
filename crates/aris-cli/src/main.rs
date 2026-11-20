@@ -883,7 +883,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_tui(boot.runtime, opts).await?;
         }
         Some(Commands::Headless { prompt, session }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_foreground(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
             run_headless(boot.runtime, prompt, session, false, None, None).await?;
@@ -894,7 +894,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             last_message_file,
         }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_foreground(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
             run_headless(boot.runtime, prompt, session, json, last_message_file, None).await?;
@@ -906,7 +906,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             last_message_file,
         }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_foreground(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             require_api_key(&boot.runtime)?;
             let store = &boot.runtime.sessions;
@@ -1627,7 +1627,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Commands::Task { action }) => {
-            let boot = boot_full(&workspace, config_path.as_ref())?;
+            let boot = boot_foreground(&workspace, config_path.as_ref())?;
             apply_cli_overrides(&boot.runtime, &cli)?;
             match action {
                 TaskCmd::List { all, json } => {
@@ -1703,6 +1703,12 @@ async fn run(cli: Cli) -> Result<()> {
                     let task = resolve_task(&boot.runtime, &id)?;
                     if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
                         anyhow::bail!("task {} is terminal ({:?})", task.id, task.state);
+                    }
+                    if matches!(
+                        task.state,
+                        TaskState::Running | TaskState::WaitingApproval | TaskState::WaitingEvent
+                    ) {
+                        anyhow::bail!("task {} is already active ({:?})", task.id, task.state);
                     }
                     let session_id = task
                         .session_id
@@ -2337,6 +2343,14 @@ fn boot_full(workspace: &Path, config_path: Option<&PathBuf>) -> Result<Boot> {
     boot_from_config(workspace, config, outer_home, workspace_outer)
 }
 
+fn boot_foreground(workspace: &Path, config_path: Option<&PathBuf>) -> Result<Boot> {
+    let (mut config, outer_home, workspace_outer) = load_paths(workspace, config_path)?;
+    // A one-shot command owns its requested turn. Leave queue dispatch to
+    // long-lived hosts so the scheduler cannot race a manual resume here.
+    config.agent.scheduler_enabled = false;
+    boot_from_config(workspace, config, outer_home, workspace_outer)
+}
+
 fn boot_tui(workspace: &Path, config_path: Option<&PathBuf>, cli: &Cli) -> Result<Boot> {
     let (config, outer_home, workspace_outer) = load_paths(workspace, config_path)?;
     let _ = cli;
@@ -2479,43 +2493,49 @@ async fn run_headless(
     let agent = AgentLoop::new(runtime);
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let requested_task_id = task_id.clone();
+    let before_turn = event_runtime.events.latest_sequence();
     let handle = if let Some(task_id) = task_id {
         agent.run_task(task_id, session.clone(), prompt, tx).await?
     } else {
         agent.run_turn(session.clone(), prompt, tx).await?
     };
-    let mut last_message = String::new();
+    let mut stream_error = None;
+    let mut received_done = false;
     let mut protocol_context = AgentEventContext::for_session(session.read().id.clone());
     protocol_context.task_id = requested_task_id.clone();
     while let Some(ev) = rx.recv().await {
         if let AgentEvent::TurnStarted(turn_id) = &ev {
             protocol_context.turn_id = Some(turn_id.clone());
-            if let Some(task) = &requested_task_id {
-                protocol_context.run_id = event_runtime
-                    .tasks
-                    .latest_run_for_task(task)
-                    .map(|run| run.id);
+            // Another process may already have started a different run for the
+            // same session/task. Use the native turn id, not "latest".
+            let launch = event_runtime
+                .events
+                .read_after(before_turn)?
+                .into_iter()
+                .find(|event| {
+                    event.event_type == "turn.started"
+                        && event.turn_id.as_ref() == Some(turn_id)
+                        && event.payload["session_id"].as_str()
+                            == protocol_context.session_id.as_deref()
+                        && requested_task_id
+                            .as_ref()
+                            .is_none_or(|id| event.task_id.as_ref() == Some(id))
+                });
+            if let Some(launch) = launch {
+                protocol_context.task_id = launch.task_id;
+                protocol_context.run_id = launch.run_id;
+            }
+            if let Some(task_id) = protocol_context.task_id.as_deref() {
+                if json {
+                    event_runtime.register_agent_handle(task_id.to_string(), handle.clone());
+                }
             }
         }
+        if let AgentEvent::Error(error) = &ev {
+            stream_error = Some(error.clone());
+        }
+        received_done = matches!(ev, AgentEvent::Done);
         if json {
-            if matches!(ev, AgentEvent::TurnStarted(_)) {
-                // A requested task id is authoritative. Falling back to the
-                // session's latest task is only appropriate for a plain
-                // interactive turn; otherwise a concurrently updated task in
-                // the same session could steal event correlation.
-                if protocol_context.task_id.is_none() {
-                    if let Some(task) = event_runtime.tasks.task_for_session(&session.read().id) {
-                        protocol_context.task_id = Some(task.id.clone());
-                    }
-                }
-                if let Some(task_id) = protocol_context.task_id.as_deref() {
-                    event_runtime.register_agent_handle(task_id.to_string(), handle.clone());
-                    protocol_context.run_id = event_runtime
-                        .tasks
-                        .latest_run_for_task(task_id)
-                        .map(|run| run.id);
-                }
-            }
             let envelope = ev.to_protocol_event(&protocol_context);
             let envelope = match event_runtime.record_event(envelope) {
                 Ok(persisted) => persisted,
@@ -2525,34 +2545,26 @@ async fn run_headless(
                 }
             };
             emit_ndjson(&envelope);
-            if let AgentEvent::TextDelta(t) = &ev {
-                last_message.push_str(t);
-            }
-            if matches!(ev, AgentEvent::Done) {
-                if let Some(task_id) = protocol_context.task_id.as_deref() {
-                    event_runtime.clear_agent_handle(task_id);
-                }
+            if received_done {
                 break;
             }
             continue;
         }
         match ev {
-            AgentEvent::TextDelta(t) => {
-                last_message.push_str(&t);
-                print!("{t}");
-            }
+            AgentEvent::TextDelta(t) => print!("{t}"),
             AgentEvent::ThoughtTick { t, note } => eprintln!("[ctm:{t}] {note}"),
             AgentEvent::ToolStarted { name, .. } => eprintln!("\n[tool] {name}"),
             AgentEvent::ToolFinished {
                 name, ok, preview, ..
             } => eprintln!("[tool:{name}] ok={ok} {preview}"),
-            AgentEvent::Error(e) => eprintln!("error: {e}"),
             AgentEvent::Done => break,
             _ => {}
         }
     }
-    if let Some(task_id) = protocol_context.task_id.as_deref() {
-        event_runtime.clear_agent_handle(task_id);
+    if json {
+        if let Some(task_id) = protocol_context.task_id.as_deref() {
+            event_runtime.clear_agent_handle(task_id);
+        }
     }
     computer.shutdown().await;
     if let (Some(task), Some(run)) = (requested_task_id, protocol_context.run_id.as_deref()) {
@@ -2570,12 +2582,55 @@ async fn run_headless(
                 std::fs::create_dir_all(parent)?;
             }
         }
-        std::fs::write(&path, &last_message)?;
+        let session = session.read();
+        let last_message = headless_final_message(&session, protocol_context.turn_id.as_deref());
+        std::fs::write(&path, last_message.unwrap_or_default())?;
         if !json {
             eprintln!("wrote last message → {}", path.display());
         }
     }
-    Ok(())
+    if !received_done {
+        anyhow::bail!("Agent event stream closed before completion");
+    }
+    if let Some(run) = protocol_context
+        .run_id
+        .as_deref()
+        .and_then(|id| event_runtime.tasks.run(id))
+    {
+        if run.state == aris_protocol::RunState::Completed {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{}",
+            stream_error
+                .unwrap_or_else(|| format!("Run {} ended in state {:?}", run.id, run.state))
+        );
+    }
+    if let Some(reason) = stream_error {
+        anyhow::bail!("{reason}");
+    }
+    anyhow::bail!("No recorded run outcome for this turn")
+}
+
+/// Streamed deltas include work in progress, and may be dropped by a busy UI.
+/// The assembled response in this turn's final step is the file contract.
+fn headless_final_message<'a>(session: &'a Session, turn: Option<&str>) -> Option<&'a str> {
+    use aris_core::SessionEvent;
+    let turn = turn?;
+    let start = session
+        .events
+        .iter()
+        .rposition(|e| matches!(e,SessionEvent::TurnStart{id,..} if id==turn))?;
+    let mut message = None;
+    for event in &session.events[start + 1..] {
+        match event {
+            SessionEvent::TurnStart { .. } | SessionEvent::TurnEnd { .. } => break,
+            SessionEvent::StepStart { .. } | SessionEvent::ToolCall { .. } => message = None,
+            SessionEvent::AssistantMessage { text, .. } => message = Some(text.as_str()),
+            _ => {}
+        }
+    }
+    message
 }
 
 async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()> {

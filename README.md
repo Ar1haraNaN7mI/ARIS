@@ -94,6 +94,10 @@ aris team message <team-id> "复核数据单位" --agent researcher
 
 普通会话、管理员和执行者都使用内置写作指导。报告可调用 `report_calculate` 批量复核加权分数、比率和预算。安装包附带 Anti-Defensive Writing 的中英文原文和 MIT 许可。[技能及来源](outer/bundled-skills/anti-defensive-writing/SKILL.md)
 
+在代码仓库中，可以直接要求「修复重复计数，并运行 `python -m unittest discover -s tests -v`」。内置编程技能指导智能体复现问题、修改源码并运行回归测试。`project_checks` 从目标文件向仓库根目录查找项目说明、包管理器和测试入口，列出每条建议命令的工作目录和依据。对于明确要求执行的受支持测试命令，ARIS 核对本轮最后一次编辑后的 shell 回执。工作流复盘可查看退出码。[内置编程技能](outer/bundled-skills/software-development/SKILL.md)
+
+脚本集成可用 `aris exec --json` 读取过程事件，用 `--last-message-file` 保存最终答复。验收失败会让 CLI 以非零状态退出。显式创建任务时，`GoalSpec.verification` 支持 `command_passed:命令全文`。
+
 ## 协作与持续改进
 
 邀请协作者执行具体工作时，调度器会在文件可用且有空闲执行槽时启动对方原泳道。收件人的主任务尚在等待依赖时，它可先开一个独立协作回合，交回结果后再按原依赖执行本职任务。运行中的收件人从当前会话读取来信。邀请、接单、交付和采纳各有动作图标。双方都能在同一条通道看到「已采纳」，单纯通知只更新记录。

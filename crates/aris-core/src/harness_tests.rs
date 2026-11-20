@@ -1475,3 +1475,141 @@ async fn reviewer_learns_edit_recovery_from_independent_chats_and_guides_a_real_
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn local_coding_acceptance_repairs_from_real_shell_receipts() {
+    let (fixture, mut requests, server) = fixture().await;
+    let runtime = &fixture.runtime;
+    runtime.settings.write().approval = crate::ApprovalPolicy::Never;
+    let guard = aris_fs::PathGuard::new(aris_fs::PathGuardConfig {
+        workspace_root: runtime.workspace_root.clone(),
+        workspace_outer: runtime.workspace_outer.clone(),
+        outer_home: runtime.outer_home.clone(),
+        deny_core_writes: true,
+        deny_patterns: vec![],
+    })
+    .unwrap();
+    crate::register_builtin_tools(&runtime.tools, Arc::new(aris_fs::FsService::new(guard)));
+    let session = runtime.sessions.create();
+    let agent = crate::AgentLoop::new(runtime.clone());
+    #[cfg(windows)]
+    let command = "if (Test-Path -LiteralPath fixed.txt) { exit 0 } else { exit 7 }";
+    #[cfg(not(windows))]
+    let command = "test -f fixed.txt || exit 7";
+    let mut goal = crate::GoalSpec::new("Repair the workspace and verify it");
+    goal.verification = vec![format!("command_passed:{command}")];
+    let mut task = crate::TaskRecord::new(goal).unwrap();
+    task.session_id = Some(session.read().id.clone());
+    let id = task.id.clone();
+    runtime.tasks.create_task(task).unwrap();
+    let (tx, mut events) = mpsc::channel(256);
+    agent
+        .run_task(&id, session.clone(), "Repair the workspace".into(), tx)
+        .await
+        .unwrap();
+    request(&mut requests)
+        .await
+        .reply
+        .send("Tests passed.".into())
+        .unwrap();
+    let repair = request(&mut requests).await;
+    assert!(repair.body["messages"]
+        .to_string()
+        .contains("Local acceptance is still open"));
+    worker_tool_reply(repair, "red", "shell", json!({"command":command}));
+    let failed = request(&mut requests).await;
+    assert!(failed.body["messages"].to_string().contains("[exit 7]"));
+    worker_tool_reply(
+        failed,
+        "edit",
+        "write_file",
+        json!({"path":"fixed.txt","content":"fixed\n"}),
+    );
+    worker_tool_reply(
+        request(&mut requests).await,
+        "green",
+        "shell",
+        json!({"command":command}),
+    );
+    let finished = request(&mut requests).await;
+    assert!(finished.body["messages"].to_string().contains("[exit 0]"));
+    finished
+        .reply
+        .send("The requested check passed after the edit.".into())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, crate::AgentEvent::Done) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.tasks.task(&id).unwrap().state,
+        crate::TaskState::Completed
+    );
+    let session = session.read();
+    assert!(session.events.iter().any(
+        |e| matches!(e,crate::SessionEvent::ToolResult{call_id,ok:false,..} if call_id=="red")
+    ));
+    assert!(session.events.iter().any(
+        |e| matches!(e,crate::SessionEvent::ToolResult{call_id,ok:true,..} if call_id=="green")
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn local_coding_acceptance_rejects_repeated_text_only_success() {
+    let (fixture, mut requests, server) = fixture().await;
+    let runtime = &fixture.runtime;
+    let session = runtime.sessions.create();
+    let mut task = crate::TaskRecord::new(crate::GoalSpec::new("Repair the workspace")).unwrap();
+    task.session_id = Some(session.read().id.clone());
+    let id = task.id.clone();
+    runtime.tasks.create_task(task).unwrap();
+    let (tx, mut events) = mpsc::channel(128);
+    crate::AgentLoop::new(runtime.clone())
+        .run_task(
+            &id,
+            session.clone(),
+            "Fix the parser and run `cargo test`.".into(),
+            tx,
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        request(&mut requests)
+            .await
+            .reply
+            .send("All tests passed.".into())
+            .unwrap();
+    }
+    let error = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut error = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                crate::AgentEvent::Error(reason) => error = Some(reason),
+                crate::AgentEvent::Done => break,
+                _ => {}
+            }
+        }
+        error
+    })
+    .await
+    .unwrap()
+    .expect("missing acceptance error");
+    assert!(error.contains("cargo test"), "{error}");
+    assert!(error.contains("No matching command"), "{error}");
+    assert_eq!(
+        runtime.tasks.task(&id).unwrap().state,
+        crate::TaskState::Failed
+    );
+    assert!(!session
+        .read()
+        .events
+        .iter()
+        .any(|e| matches!(e, crate::SessionEvent::ToolCall { .. })));
+    server.abort();
+}

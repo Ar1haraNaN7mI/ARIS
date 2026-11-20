@@ -706,6 +706,7 @@ async fn run_turn_inner(
     let mut tool_specs: Arc<[ToolSpec]> = Arc::from([]);
     let owner = runtime.tasks.task(&task_id).and_then(|task| task.owner);
     let team_worker = owner.is_some();
+    let mut requested_commands = Vec::new();
     let worker_brief = if let Some(owner) = owner {
         let team = runtime.teams.get(&owner.team_id)?;
         let worker = team
@@ -730,8 +731,14 @@ async fn run_turn_inner(
             &worker.prompt
         };
         let instruction = instruction.filter(|_| !cowork_only);
+        if !cowork_only {
+            let active_instruction =
+                instruction.map_or(assignment.as_str(), |message| message.text.as_str());
+            crate::coding_checks::add_requested(active_instruction, &mut requested_commands);
+        }
         Some(json!({"role":worker.id,"assignment":assignment,"latest_instruction":instruction.map(|msg| &msg.text),"write_to":worker.files,"peer_ids":peers}).to_string())
     } else {
+        crate::coding_checks::add_requested(&user_text, &mut requested_commands);
         None
     };
     let output_check = if cowork_only {
@@ -748,6 +755,22 @@ async fn run_turn_inner(
     } else {
         model_policy.context_messages
     };
+    let mut command_criteria: Vec<_> = task_goal
+        .iter()
+        .flat_map(|goal| &goal.verification)
+        .filter(|criterion| criterion.trim().starts_with(crate::coding_checks::PREFIX))
+        .cloned()
+        .collect();
+    for c in &requested_commands {
+        if !command_criteria.contains(c) {
+            command_criteria.push(c.clone());
+        }
+    }
+    if !command_criteria.is_empty() {
+        turn_prompt.set_section("acceptance_commands",format!("Verify the final workspace edits with the following exact local shell commands. The runtime checks their exit codes from this turn. Diagnose failing tests and rerun after edits. If execution is unavailable, report the actual blocker.\n{}",command_criteria.join("\n")));
+    }
+    let mut command_correction: Option<String> = None;
+    let mut requested_command_correction = false;
     let system = turn_prompt.render();
     let mut indexed_messages = HashMap::new();
     let mut tool_calls_used = 0usize;
@@ -813,6 +836,9 @@ async fn run_turn_inner(
         if let Some(context) = peer_context {
             messages.push(aris_llm::ChatMessage::user(context));
         }
+        if let Some(reminder) = command_correction.take() {
+            messages.push(aris_llm::ChatMessage::user(reminder));
+        }
         if let Some(brief) = &worker_brief {
             if _step > 0 {
                 let next_action = if documents_ready {
@@ -853,6 +879,7 @@ async fn run_turn_inner(
                 .iter()
                 .filter(|definition| {
                     definition.name == "read_file"
+                        || (!command_criteria.is_empty() && definition.name == "shell")
                         || team_worker
                             && (definition.name == "agent_tunnel"
                                 || (output_check.is_some() && definition.name == "write_file"))
@@ -1072,7 +1099,34 @@ async fn run_turn_inner(
                     at: Utc::now(),
                 });
             }
-            completed_response = !peer_arrived && !repair;
+            let mut retry_command_check = false;
+            if !command_criteria.is_empty()
+                && !requested_command_correction
+                && _step + 1 < max_steps
+            {
+                let missing: Vec<_> =
+                    crate::coding_checks::checks(&command_criteria, &session.read())
+                        .into_iter()
+                        .filter(|check| !check.passed)
+                        .collect();
+                if !missing.is_empty() {
+                    let reasons = missing
+                        .into_iter()
+                        .map(|check| format!("{} — {}", check.criterion, check.detail))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let hint=format!("Local acceptance is still open:\n{reasons}\nUse the actual test diagnostics to repair the change and rerun the requested command. Respect any denial. If blocked, report the exact limitation.");
+                    command_correction = Some(hint.clone());
+                    requested_command_correction = true;
+                    session.write().append(SessionEvent::SystemNote {
+                        id: Uuid::new_v4().to_string(),
+                        text: hint,
+                        at: Utc::now(),
+                    });
+                    retry_command_check = true;
+                }
+            }
+            completed_response = !peer_arrived && !repair && !retry_command_check;
             session.write().append(SessionEvent::StepEnd {
                 id: step_id.clone(),
                 turn_id: turn_id.clone(),
@@ -1088,7 +1142,7 @@ async fn run_turn_inner(
                 Some(&run_id),
             );
             save_step_checkpoint(&runtime, &session, &task_id, &run_id, _step);
-            if peer_arrived || repair {
+            if peer_arrived || repair || retry_command_check {
                 continue;
             }
             if !missing_files.is_empty() {
@@ -1385,7 +1439,15 @@ async fn run_turn_inner(
             _ => review.finish(&lease, TaskState::Paused, RunState::Paused),
         }
     } else {
-        let goal = runtime.tasks.task(&task_id).map(|task| task.goal);
+        let goal = runtime.tasks.task(&task_id).map(|task| {
+            let mut goal = task.goal;
+            for criterion in requested_commands {
+                if !goal.verification.contains(&criterion) {
+                    goal.verification.push(criterion)
+                }
+            }
+            goal
+        });
         let report = goal.as_ref().map(|goal| {
             if goal.has_verification() {
                 record_event(

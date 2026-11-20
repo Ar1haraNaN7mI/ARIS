@@ -5,7 +5,8 @@
 //! Supported forms are:
 //! `file_exists:path`, `dir_exists:path`, `contains:path::text`,
 //! `not_contains:path::text`, `session_contains:text`, and
-//! `assistant_contains:text`.
+//! `assistant_contains:text` and `command_passed:exact shell command`. Command
+//! criteria use native shell receipts in the latest turn after workspace edits.
 
 use crate::Session;
 use aris_protocol::GoalSpec;
@@ -51,12 +52,20 @@ pub fn verify_goal(
     }
 
     let transcript = session.transcript_lines().join("\n");
-    let mut checks = Vec::with_capacity(criteria.len());
+    let mut checks = crate::coding_checks::checks(&criteria, session).into_iter();
+    let mut results = Vec::with_capacity(criteria.len());
     for criterion in criteria {
-        checks.push(evaluate_criterion(workspace_root, &transcript, &criterion));
+        if criterion.starts_with(crate::coding_checks::PREFIX) {
+            results.extend(checks.next());
+        } else {
+            results.push(evaluate_criterion(workspace_root, &transcript, &criterion));
+        }
     }
-    let passed = checks.iter().all(|check| check.passed);
-    VerificationReport { passed, checks }
+    let passed = results.iter().all(|check| check.passed);
+    VerificationReport {
+        passed,
+        checks: results,
+    }
 }
 
 fn evaluate_criterion(
@@ -118,7 +127,7 @@ fn evaluate_criterion(
     } else {
         (
             false,
-            "unknown verification syntax; use file_exists:, dir_exists:, contains:, not_contains:, session_contains:, or assistant_contains:".into(),
+            "unknown verification syntax; use file_exists:, dir_exists:, contains:, not_contains:, session_contains:, assistant_contains:, or command_passed:".into(),
         )
     };
 

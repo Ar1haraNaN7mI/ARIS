@@ -1,11 +1,14 @@
 //! Filesystem capability with PathGuard protecting the core kernel.
 
 mod guard;
+mod patch;
+mod replacement;
+mod search;
 
 pub use guard::{PathDecision, PathGuard, PathGuardConfig};
+pub use search::GrepOptions;
 
 use anyhow::{bail, Context, Result};
-use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -102,18 +105,13 @@ impl FsService {
         if old.is_empty() {
             bail!("old_string must not be empty");
         }
-        let count = original.matches(old).count();
-        if count == 0 {
-            bail!("old_string not found in {}", path.display());
-        }
-        if !replace_all && count > 1 {
-            bail!("old_string found {count} times; set replace_all=true or make it unique");
-        }
-        let updated = if replace_all {
-            original.replace(old, new)
-        } else {
-            original.replacen(old, new, 1)
-        };
+        let (updated, count) = replacement::replace_anchor(
+            &path,
+            &original,
+            old,
+            new,
+            replacement::Mode::Edit { replace_all },
+        )?;
         self.write_text(&path, &updated)?;
         Ok(format!(
             "updated {} ({} replacement{})",
@@ -168,15 +166,15 @@ impl FsService {
     }
 
     fn plan_patch(&self, patch: &str) -> Result<PatchPlan> {
-        let hunks = parse_patch(patch)?;
+        let sections = patch::parse(patch)?;
         let mut contents = BTreeMap::<PathBuf, String>::new();
         let mut deletions = BTreeSet::<PathBuf>::new();
-        let mut operations = Vec::with_capacity(hunks.len());
+        let mut operations = Vec::new();
 
-        for hunk in &hunks {
-            let path = self.guard.resolve_path(&hunk.path);
+        for section in sections {
+            let path = self.guard.resolve_path(&section.path);
             self.guard.check_write(&path)?;
-            if hunk.delete {
+            if section.kind == patch::Kind::Delete {
                 if contents.contains_key(&path) {
                     bail!("cannot delete and update {} in one patch", path.display());
                 }
@@ -190,23 +188,30 @@ impl FsService {
             if deletions.contains(&path) {
                 bail!("cannot update deleted file {} in one patch", path.display());
             }
-            let current = if let Some(content) = contents.get(&path) {
-                content.clone()
-            } else if hunk.search.is_empty() {
+            let existing = contents.remove(&path);
+            let current = if let Some(current) = existing {
+                current
+            } else if section.kind == patch::Kind::Add && !path.try_exists()? {
                 String::new()
             } else {
                 self.read_text(&path)?
             };
-            let (updated, report) = apply_hunk(&path, &current, &hunk.search, &hunk.replace)?;
+            if section.kind == patch::Kind::Add && !current.is_empty() {
+                bail!(
+                    "Add File would overwrite nonempty {}; use Update File with a unique anchor.",
+                    path.display()
+                );
+            }
+            let (updated, reports) = section.apply(&path, current)?;
             contents.insert(path, updated);
-            operations.push(report);
+            operations.extend(reports);
         }
 
         Ok(PatchPlan {
             contents,
             deletions,
+            hunk_count: operations.len(),
             operations,
-            hunk_count: hunks.len(),
         })
     }
 
@@ -248,74 +253,6 @@ impl FsService {
         }
         Ok(hits)
     }
-
-    pub fn grep(
-        &self,
-        root: &Path,
-        pattern: &str,
-        glob_pat: Option<&str>,
-        max_hits: usize,
-        case_insensitive: bool,
-    ) -> Result<String> {
-        let re = if case_insensitive {
-            Regex::new(&format!("(?i){pattern}"))?
-        } else {
-            Regex::new(pattern)?
-        };
-        let globber = glob_pat
-            .map(glob::Pattern::new)
-            .transpose()
-            .context("invalid glob")?;
-        let mut out = String::new();
-        let mut hits = 0usize;
-        let skip = ["target", ".git", "node_modules", ".aris/local"];
-        let root = self.guard.resolve_path(root);
-        self.guard.check_read(&root)?;
-        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let rel = path.strip_prefix(&root).unwrap_or(path);
-            let rel_s = rel.to_string_lossy().replace('\\', "/");
-            if skip.iter().any(|s| rel_s.contains(s)) {
-                continue;
-            }
-            if let Some(g) = &globber {
-                if !g.matches(&rel_s) {
-                    continue;
-                }
-            }
-            // Skip obvious binaries by extension
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if matches!(
-                    ext.to_lowercase().as_str(),
-                    "exe" | "dll" | "so" | "png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "wasm"
-                ) {
-                    continue;
-                }
-            }
-            let Ok(file) = fs::File::open(path) else {
-                continue;
-            };
-            let reader = BufReader::new(file);
-            for (idx, line) in reader.lines().enumerate() {
-                let Ok(line) = line else { continue };
-                if re.is_match(&line) {
-                    out.push_str(&format!("{rel_s}:{}:{line}\n", idx + 1));
-                    hits += 1;
-                    if hits >= max_hits {
-                        out.push_str("… hit limit reached\n");
-                        return Ok(out);
-                    }
-                }
-            }
-        }
-        if out.is_empty() {
-            out.push_str("(no matches)\n");
-        }
-        Ok(out)
-    }
 }
 
 fn replace_file(temp: &Path, destination: &Path) -> Result<()> {
@@ -350,145 +287,6 @@ struct PatchPlan {
     deletions: BTreeSet<PathBuf>,
     operations: Vec<String>,
     hunk_count: usize,
-}
-
-struct PatchHunk {
-    path: PathBuf,
-    search: String,
-    replace: String,
-    delete: bool,
-}
-
-enum PatchMode {
-    Idle,
-    Search,
-    Replace,
-}
-
-fn parse_patch(patch: &str) -> Result<Vec<PatchHunk>> {
-    let mut hunks = Vec::new();
-    let mut current_path: Option<PathBuf> = None;
-    let mut mode = PatchMode::Idle;
-    let mut search = String::new();
-    let mut replace = String::new();
-    let mut delete = false;
-
-    // PowerShell's default UTF-8 writer may prepend a BOM. Treat it as an
-    // encoding marker rather than part of the first patch header.
-    let patch = patch.strip_prefix('\u{feff}').unwrap_or(patch);
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("*** Update File:") {
-            push_hunk(&mut hunks, &current_path, &search, &replace, delete)?;
-            search.clear();
-            replace.clear();
-            mode = PatchMode::Idle;
-            delete = false;
-            current_path = Some(PathBuf::from(rest.trim()));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("*** Add File:") {
-            push_hunk(&mut hunks, &current_path, &search, &replace, delete)?;
-            search.clear();
-            replace.clear();
-            mode = PatchMode::Idle;
-            delete = false;
-            current_path = Some(PathBuf::from(rest.trim()));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("*** Delete File:") {
-            push_hunk(&mut hunks, &current_path, &search, &replace, delete)?;
-            search.clear();
-            replace.clear();
-            mode = PatchMode::Idle;
-            delete = true;
-            current_path = Some(PathBuf::from(rest.trim()));
-            continue;
-        }
-        if delete && line.trim() != "" {
-            bail!("delete file hunk must not contain SEARCH/REPLACE content");
-        }
-        if line.trim() == "<<<<<<< SEARCH" {
-            mode = PatchMode::Search;
-            search.clear();
-            continue;
-        }
-        if line.trim() == "=======" {
-            mode = PatchMode::Replace;
-            replace.clear();
-            continue;
-        }
-        if line.trim() == ">>>>>>> REPLACE" {
-            push_hunk(&mut hunks, &current_path, &search, &replace, delete)?;
-            search.clear();
-            replace.clear();
-            mode = PatchMode::Idle;
-            continue;
-        }
-        match mode {
-            PatchMode::Search => {
-                if !search.is_empty() {
-                    search.push('\n');
-                }
-                search.push_str(line);
-            }
-            PatchMode::Replace => {
-                if !replace.is_empty() {
-                    replace.push('\n');
-                }
-                replace.push_str(line);
-            }
-            PatchMode::Idle => {}
-        }
-    }
-    push_hunk(&mut hunks, &current_path, &search, &replace, delete)?;
-    if hunks.is_empty() {
-        bail!(
-            "apply_patch: no hunks found; use *** Update/Add/Delete File: + SEARCH/REPLACE markers"
-        );
-    }
-    Ok(hunks)
-}
-
-fn push_hunk(
-    hunks: &mut Vec<PatchHunk>,
-    path: &Option<PathBuf>,
-    search: &str,
-    replace: &str,
-    delete: bool,
-) -> Result<()> {
-    if !delete && search.is_empty() && replace.is_empty() {
-        return Ok(());
-    }
-    let Some(path) = path.clone() else {
-        bail!("apply_patch hunk without *** Update/Add/Delete File header");
-    };
-    hunks.push(PatchHunk {
-        path,
-        search: search.to_string(),
-        replace: replace.to_string(),
-        delete,
-    });
-    Ok(())
-}
-
-fn apply_hunk(path: &Path, current: &str, search: &str, replace: &str) -> Result<(String, String)> {
-    if search.is_empty() {
-        return Ok((replace.to_string(), format!("wrote {}", path.display())));
-    }
-    let count = current.matches(search).count();
-    if count == 0 {
-        bail!("old_string not found in {}", path.display());
-    }
-    if count > 1 {
-        bail!(
-            "old_string found {count} times; make it unique before applying {}",
-            path.display()
-        );
-    }
-    Ok((
-        current.replacen(search, replace, 1),
-        format!("updated {} (1 replacement)", path.display()),
-    ))
 }
 
 #[cfg(test)]
@@ -533,6 +331,120 @@ mod tests {
         fs.apply_patch(&patch).expect("apply");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncated_or_invalid_patch_leaves_every_file_untouched() {
+        let root = temp_root("patch-incomplete");
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = service(&root);
+        fs.write_text("victim.txt", "keep\n").unwrap();
+        let first = "*** Add File: staged.txt\n<<<<<<< SEARCH\n=======\nstaged\n>>>>>>> REPLACE\n";
+        for (body, expected) in [
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep", "======="),
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep\n=======\nreplaced", ">>>>>>> REPLACE"),
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep\n*** Delete File: victim.txt", "======="),
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep\n=======\nreplace\n*** Delete File: victim.txt", ">>>>>>> REPLACE"),
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep\n>>>>>>> REPLACE", "======="),
+            ("*** Update File: victim.txt\n<<<<<<< SEARCH\nkeep\n<<<<<<< SEARCH", "======="),
+            ("*** Update File: victim.txt\n=======\nreplace\n>>>>>>> REPLACE", "<<<<<<< SEARCH"),
+            ("*** Update File: victim.txt\n", "<<<<<<< SEARCH"),
+            ("*** Add File: \n", "path"),
+        ] {
+            let patch = format!("{first}{body}");
+            let error = fs.preview_patch(&patch).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(fs.apply_patch(&patch).is_err());
+            assert_eq!(fs.read_text("victim.txt").unwrap(), "keep\n");
+            assert!(!root.join("staged.txt").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn add_and_empty_search_preserve_nonempty_targets() {
+        let root = temp_root("patch-existing");
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = service(&root);
+        fs.write_text("existing.txt", "keep").unwrap();
+        for patch in [
+            "*** Add File: existing.txt\n<<<<<<< SEARCH\n=======\nnew\n>>>>>>> REPLACE",
+            "*** Update File: existing.txt\n<<<<<<< SEARCH\n=======\nnew\n>>>>>>> REPLACE",
+            "*** Update File: existing.txt\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE",
+            "*** Begin Patch\n*** Add File: existing.txt\n+new\n*** End Patch",
+        ] {
+            assert!(fs.preview_patch(patch).is_err());
+            assert!(fs.apply_patch(patch).is_err());
+            assert_eq!(fs.read_text("existing.txt").unwrap(), "keep");
+        }
+        for kind in ["Update", "Add"] {
+            fs.write_text("empty.txt", "").unwrap();
+            let patch = format!(
+                "*** {kind} File: empty.txt\n<<<<<<< SEARCH\n=======\nnew\n>>>>>>> REPLACE"
+            );
+            fs.apply_patch(&patch).unwrap();
+            assert_eq!(fs.read_text("empty.txt").unwrap(), "new");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrapped_patch_supports_multiple_operations_and_preserves_source_endings() {
+        let root = temp_root("diff-multiple");
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = service(&root);
+        let before = "one\r\nkeep\nold\r\nmiddle\r\nlast";
+        fs.write_text("source.txt", before).unwrap();
+        fs.write_text("obsolete.txt", "gone").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: source.txt\n@@\n-one\n+first\n@@ keep\n-old\n+new\n+added\n middle\n-last\n+tail\n*** End of File\n*** Add File: nested/new.txt\n+created\n+\n*** Delete File: obsolete.txt\n*** End Patch";
+        let preview = fs.preview_patch(patch).unwrap();
+        assert_eq!(preview.hunks, 4);
+        assert_eq!(preview.files.len(), 3);
+        assert_eq!(fs.read_text("source.txt").unwrap(), before);
+        assert!(root.join("obsolete.txt").exists());
+        assert!(!root.join("nested").exists());
+        fs.apply_patch(patch).unwrap();
+        assert_eq!(
+            fs.read_text("source.txt").unwrap(),
+            "first\r\nkeep\nnew\r\nadded\r\nmiddle\r\ntail"
+        );
+        assert_eq!(fs.read_text("nested/new.txt").unwrap(), "created\n\n");
+        assert!(!root.join("obsolete.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrapped_patch_requires_complete_structure_and_unique_matching_context() {
+        let root = temp_root("diff-incomplete");
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = service(&root);
+        let original = "first\nrepeat\nrepeat\n";
+        fs.write_text("source.txt", original).unwrap();
+        let first =
+            "*** Begin Patch\n*** Delete File: source.txt\n*** Add File: staged.txt\n+new\n";
+        for suffix in [
+            "",
+            "*** End Patc",
+            "*** Add File: broken.txt\nunprefixed\n*** End Patch",
+        ] {
+            let input = format!("{first}{suffix}");
+            assert!(fs.preview_patch(&input).is_err());
+            assert!(fs.apply_patch(&input).is_err());
+            assert_eq!(fs.read_text("source.txt").unwrap(), original);
+            assert!(!root.join("staged.txt").exists());
+        }
+        for hunk in ["-repeat\n+x", "-missing\n+x", "@@", "repeat\n+x"] {
+            let input = format!("*** Begin Patch\n*** Add File: staged.txt\n+new\n*** Update File: source.txt\n@@\n{hunk}\n*** End Patch");
+            assert!(fs.apply_patch(&input).is_err());
+            assert_eq!(fs.read_text("source.txt").unwrap(), original);
+            assert!(!root.join("staged.txt").exists());
+        }
+        fs.apply_patch("*** Begin Patch\n*** Update File: source.txt\n@@\n-repeat\n+final\n*** End of File\n*** End Patch").unwrap();
+        assert_eq!(
+            fs.read_text("source.txt").unwrap(),
+            "first\nrepeat\nfinal\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -611,6 +523,169 @@ mod tests {
             .expect("write");
         assert!(fs.glob(Path::new("."), "*", 0).expect("glob").is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_multiline_anchor_preserves_local_endings_for_edits_and_patches() {
+        let root = temp_root("crlf-patch");
+        fs::create_dir_all(&root).unwrap();
+        let service = service(&root);
+        let original = "第一行\r\n\r\nalpha\r\nbeta\ngamma\r\n末尾";
+        let expected = "第一行\r\n\r\n一\r\n二\n三\n四\r\n末尾";
+        for file in ["edit.txt", "patch.txt"] {
+            service.write_text(file, original).unwrap();
+        }
+        let old = "\nalpha\nbeta\ngamma";
+        let new = "\n一\n二\n三\n四";
+        service.edit_replace("edit.txt", old, new, false).unwrap();
+        assert_eq!(service.read_text("edit.txt").unwrap(), expected);
+        let patch = format!(
+            "*** Update File: patch.txt\n<<<<<<< SEARCH\n{old}\n=======\n{new}\n>>>>>>> REPLACE\n"
+        );
+        assert_eq!(service.preview_patch(&patch).unwrap().hunks, 1);
+        assert_eq!(service.read_text("patch.txt").unwrap(), original);
+        service.apply_patch(&patch).unwrap();
+        assert_eq!(service.read_text("patch.txt").unwrap(), expected);
+        // An added line in the unterminated last line inherits the prior CRLF.
+        service
+            .edit_replace("edit.txt", "末尾", "末尾\ntail", false)
+            .unwrap();
+        assert_eq!(
+            service.read_text("edit.txt").unwrap(),
+            format!("{expected}\r\ntail")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_logical_anchors_remain_ambiguous_and_explicit_crlf_is_exact() {
+        let root = temp_root("mixed-anchors");
+        fs::create_dir_all(&root).unwrap();
+        let service = service(&root);
+        let original = "头\r\na\r\nb\r\n中\na\nb\n尾";
+        service.write_text("source.txt", original).unwrap();
+        let failure = service
+            .edit_replace("source.txt", "a\nb", "一\n二", false)
+            .unwrap_err();
+        assert!(failure.to_string().contains("found 2 times"));
+        let patch =
+            "*** Update File: source.txt\n<<<<<<< SEARCH\na\nb\n=======\n一\n二\n>>>>>>> REPLACE\n";
+        assert!(service
+            .preview_patch(patch)
+            .unwrap_err()
+            .to_string()
+            .contains("found 2 times"));
+        assert!(service.apply_patch(patch).is_err());
+        assert_eq!(service.read_text("source.txt").unwrap(), original);
+        service
+            .edit_replace("source.txt", "a\nb", "一\n二", true)
+            .unwrap();
+        assert_eq!(
+            service.read_text("source.txt").unwrap(),
+            "头\r\n一\r\n二\r\n中\n一\n二\n尾"
+        );
+        // Explicit CRLF in the anchor addresses only that byte spelling,
+        // and an explicitly mixed replacement is written as supplied.
+        service
+            .edit_replace("source.txt", "一\r\n二", "first\nsecond", false)
+            .unwrap();
+        service
+            .edit_replace("source.txt", "一\n二", "A\r\nB\nC", false)
+            .unwrap();
+        assert_eq!(
+            service.read_text("source.txt").unwrap(),
+            "头\r\nfirst\nsecond\r\n中\nA\r\nB\nC\n尾"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_finds_source_names_that_contain_generated_directory_names() {
+        let root = temp_root("source-search");
+        for name in [
+            "target/generated.txt",
+            "web/node_modules/pkg/generated.txt",
+            ".git/config",
+            ".aris/review.json",
+            "src/retarget.rs",
+            "node_modules_notes/readme.md",
+            ".github/workflows/ci.yml",
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "SOURCE_MARK\n").unwrap();
+        }
+        let service = service(&root);
+        let hits = service
+            .grep(Path::new("."), "SOURCE_MARK", None, 80, false)
+            .unwrap();
+        assert_eq!(hits,".github/workflows/ci.yml:1:SOURCE_MARK\nnode_modules_notes/readme.md:1:SOURCE_MARK\nsrc/retarget.rs:1:SOURCE_MARK\n");
+        assert_eq!(
+            service
+                .grep(Path::new("target"), "SOURCE_MARK", None, 80, false)
+                .unwrap(),
+            "generated.txt:1:SOURCE_MARK\n"
+        );
+        assert!(service
+            .grep(Path::new("missing"), ".", None, 80, false)
+            .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_single_file_literal_overlapping_context_and_pagination() {
+        let root = temp_root("grep-page");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("source.rs"),
+            "开头\r\nAPI[a]\r\n中间\r\napi[a]\r\n尾部\r\napia\r\n",
+        )
+        .unwrap();
+        let service = service(&root);
+        let options = GrepOptions {
+            glob: Some("*.rs"),
+            literal: true,
+            case_insensitive: true,
+            context_lines: 1,
+            max_hits: 1,
+            offset: 0,
+        };
+        let first = service
+            .grep_with_options(Path::new("source.rs"), "api[a]", options)
+            .unwrap();
+        assert_eq!(first,"source.rs-1-开头\nsource.rs:2:API[a]\nsource.rs-3-中间\n… hit limit reached; next offset=1\n");
+        let next = service
+            .grep_with_options(
+                Path::new("source.rs"),
+                "api[a]",
+                GrepOptions {
+                    offset: 1,
+                    ..options
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            next,
+            "source.rs-3-中间\nsource.rs:4:api[a]\nsource.rs-5-尾部\n"
+        );
+        let both = service
+            .grep_with_options(
+                Path::new("."),
+                "api[a]",
+                GrepOptions {
+                    max_hits: 2,
+                    ..options
+                },
+            )
+            .unwrap();
+        assert_eq!(both,"source.rs-1-开头\nsource.rs:2:API[a]\nsource.rs-3-中间\nsource.rs:4:api[a]\nsource.rs-5-尾部\n");
+        assert_eq!(
+            service
+                .grep(Path::new("source.rs"), "api[a]", None, 1, true)
+                .unwrap(),
+            "source.rs:6:apia\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

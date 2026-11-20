@@ -53,6 +53,20 @@ pub fn rank_skills(
             reasons.push("name-match".into());
         }
 
+        // Chinese commissions commonly have no spaces around a full skill tag.
+        for tag in &tags_joined {
+            if tag.chars().count() >= 2
+                && tag
+                    .chars()
+                    .all(|c| matches!(c, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+                && q.contains(tag)
+                && !tokens.iter().any(|t| tag.contains(t))
+            {
+                score += 2.8;
+                reasons.push(format!("tag:{tag}"));
+            }
+        }
+
         for t in &tokens {
             let idf = ((n_docs - df.get(t).copied().unwrap_or(0) as f32 + 0.5)
                 / (df.get(t).copied().unwrap_or(0) as f32 + 0.5))

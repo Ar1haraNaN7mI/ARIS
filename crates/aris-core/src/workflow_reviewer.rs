@@ -248,12 +248,31 @@ fn session_facts(
             continue;
         }
         match e {
-            SessionEvent::TurnStart {id, model_id, ..} => turns.push(json!({"id":id,"model":model_id,"at":at})),
-            SessionEvent::ToolCall {..} => calls+=1,
-            SessionEvent::StepStart {..} => steps+=1,
-            SessionEvent::ToolResult {name, ok, content, call_id, ..} => rows.push(json!({"tool":name,"ok":ok,"at":at,"call":call_id,"failure_class":(!*ok).then(|| failure_kind(content))})),
-            SessionEvent::AssistantMessage {text,..} if !text.is_empty() => {outputs+=1;final_reply=Some(text.as_str());}
-            SessionEvent::TurnEnd {..} if turn.is_some() => break,
+            SessionEvent::TurnStart { id, model_id, .. } => {
+                turns.push(json!({"id":id,"model":model_id,"at":at}))
+            }
+            SessionEvent::ToolCall { .. } => calls += 1,
+            SessionEvent::StepStart { .. } => steps += 1,
+            SessionEvent::ToolResult {
+                name,
+                ok,
+                content,
+                call_id,
+                ..
+            } => {
+                let mut receipt = json!({"tool":name,"ok":ok,"at":at,"call":call_id,"failure_class":(!*ok).then(|| failure_kind(content))});
+                if name == "shell" {
+                    if let Some(code) = crate::coding_checks::exit_code(content) {
+                        receipt["process_exit"] = json!(code);
+                    }
+                }
+                rows.push(receipt);
+            }
+            SessionEvent::AssistantMessage { text, .. } if !text.is_empty() => {
+                outputs += 1;
+                final_reply = Some(text.as_str());
+            }
+            SessionEvent::TurnEnd { .. } if turn.is_some() => break,
             _ => {}
         }
     }
@@ -1495,6 +1514,16 @@ mod tests {
                 content: "permission denied for private-target: confidential tool result".into(),
                 at,
             });
+            for code in [7, 0] {
+                s.append(SessionEvent::ToolResult {
+                    id: format!("{turn}-exit-{code}"),
+                    call_id: format!("shell-{code}"),
+                    name: "shell".into(),
+                    ok: code == 0,
+                    content: format!("confidential output\n[exit {code}]"),
+                    at,
+                });
+            }
             s.append(SessionEvent::TurnEnd {
                 id: format!("{turn}-end"),
                 at,
@@ -1503,7 +1532,9 @@ mod tests {
         let id = s.id.clone();
         drop(s);
         let facts = session_facts(rt, &id, Some("wanted"), None);
-        assert_eq!(facts["tool_results"].as_array().unwrap().len(), 1);
+        assert_eq!(facts["tool_results"].as_array().unwrap().len(), 3);
+        assert_eq!(facts["tool_results"][1]["process_exit"], 7);
+        assert_eq!(facts["tool_results"][2]["process_exit"], 0);
         assert_eq!(facts["tool_results"][0]["failure_class"], "permission");
         assert_eq!(facts["tool_results"][0]["call"], "wanted");
         let raw = facts.to_string();

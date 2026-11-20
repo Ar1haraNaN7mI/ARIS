@@ -42,6 +42,7 @@ impl ApprovalPolicy {
         let is_read = matches!(
             n.as_str(),
             "read_file"
+                | "project_checks"
                 | "list_dir"
                 | "glob"
                 | "grep"
