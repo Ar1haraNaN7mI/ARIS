@@ -96,7 +96,50 @@ impl LearnStore {
 
     /// Management access remains available when model recall is disabled.
     pub fn list(&self) -> LearnState {
-        self.state.read().clone()
+        let mut view = self.state.read().clone();
+        view.experiments.extend(self.workflow_history());
+        view.experiments.sort_by_key(|experiment| experiment.at);
+        view
+    }
+
+    fn read_workflow_history(&self) -> Result<Vec<HarnessExperiment>> {
+        let path = self.path.with_file_name("workflow-experiments.json");
+        match fs::File::open(path) {
+            Ok(file) => Ok(serde_json::from_reader(std::io::BufReader::new(file))?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn workflow_history(&self) -> Vec<HarnessExperiment> {
+        self.read_workflow_history().unwrap_or_else(|error| {
+            tracing::warn!(%error, "Could not load workflow review history");
+            vec![]
+        })
+    }
+
+    // CLI, Web and scheduled workers may review different workspaces under the
+    // same home. Merge the current on-disk history while holding its writer lease.
+    fn update_workflow_history(
+        &self,
+        edit: impl FnOnce(&mut Vec<HarnessExperiment>) -> Result<bool>,
+    ) -> Result<bool> {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.path.with_file_name("workflow-experiments.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let mut entries = self.read_workflow_history()?;
+        if !edit(&mut entries)? {
+            return Ok(false);
+        }
+        crate::settings::atomic_write(
+            &self.path.with_file_name("workflow-experiments.json"),
+            &serde_json::to_vec(&entries)?,
+        )?;
+        Ok(true)
     }
 
     pub fn propose_dispatch(&self, model: &str) -> HarnessTrial {
@@ -167,11 +210,35 @@ impl LearnStore {
         }
     }
 
-    pub fn record_experiment(&self, experiment: HarnessExperiment) -> Result<bool> {
-        let mut state = self.state.write();
+    pub fn record_experiment(&self, mut experiment: HarnessExperiment) -> Result<bool> {
         if !self.generation_enabled.load(Ordering::Acquire) {
             return Ok(false);
         }
+        if experiment.id.starts_with("review/") && experiment.problem.starts_with("workflow.") {
+            return self.update_workflow_history(|entries| {
+                if let Some(existing) = entries.iter().find(|e| e.id == experiment.id) {
+                    experiment.at = existing.at;
+                    experiment.previous = existing.previous.clone();
+                    anyhow::ensure!(
+                        existing == &experiment,
+                        "Workflow review ID identifies a different experiment"
+                    );
+                    return Ok(false);
+                }
+                if self.retrieval_enabled.load(Ordering::Acquire) {
+                    experiment.previous = entries
+                        .iter()
+                        .rev()
+                        .find(|e| e.problem == experiment.problem)
+                        .map(|e| e.id.clone());
+                }
+                entries.push(experiment);
+                let excess = entries.len().saturating_sub(sim::HISTORY_LIMIT);
+                entries.drain(..excess);
+                Ok(true)
+            });
+        }
+        let mut state = self.state.write();
         self.record_locked(&mut state, experiment)
     }
 
@@ -219,6 +286,19 @@ impl LearnStore {
     }
 
     pub fn delete_experiment(&self, id: &str) -> Result<bool> {
+        if id.starts_with("review/") {
+            return self.update_workflow_history(|entries| {
+                let length = entries.len();
+                entries.retain(|e| e.id != id);
+                for e in entries
+                    .iter_mut()
+                    .filter(|e| e.previous.as_deref() == Some(id))
+                {
+                    e.previous = None;
+                }
+                Ok(entries.len() != length)
+            });
+        }
         let mut state = self.state.write();
         let mut next = state.clone();
         next.experiments.retain(|e| e.id != id);
@@ -248,6 +328,14 @@ impl LearnStore {
     pub fn recall_experiments(&self, problem: &str) -> Vec<HarnessExperiment> {
         if !self.retrieval_enabled.load(Ordering::Acquire) {
             return Vec::new();
+        }
+        if problem.starts_with("workflow.") {
+            return self
+                .workflow_history()
+                .into_iter()
+                .rev()
+                .filter(|e| e.problem == problem)
+                .collect();
         }
         self.state
             .read()
@@ -294,6 +382,11 @@ impl LearnStore {
 
     /// Remove episodes, task feedback, routing weights, and sync priors together.
     pub fn clear(&self) -> Result<()> {
+        self.update_workflow_history(|entries| {
+            let changed = !entries.is_empty();
+            entries.clear();
+            Ok(changed)
+        })?;
         let mut state = self.state.write();
         let empty = LearnState::default();
         self.persist_state(&empty, &state)?;

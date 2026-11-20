@@ -481,6 +481,7 @@ async fn run_turn_inner(
                 user_text.clone()
             }
         });
+    let chat_turn = task_override.is_none();
     let task_id = if let Some(task_id) = task_override {
         let task = runtime
             .tasks
@@ -547,6 +548,19 @@ async fn run_turn_inner(
         .map(|run| run.attempt.saturating_add(1))
         .unwrap_or(1);
     let run = runtime.tasks.create_run(&task_id, attempt)?;
+    // All exits, including model or verification failures, pass this boundary.
+    // It is declared before the lease so the run has settled when it fires.
+    let tracked = runtime.learn.generation_enabled()
+        && runtime
+            .tasks
+            .task(&task_id)
+            .is_some_and(|t| t.owner.is_none());
+    let review = TerminalTurnReview {
+        runtime: &runtime,
+        session: &session,
+        run_id: &run.id,
+        tracked,
+    };
     runtime.register_agent_handle(task_id.clone(), control_handle);
     let _active_agent_guard = ActiveAgentGuard {
         runtime: runtime.clone(),
@@ -568,6 +582,16 @@ async fn run_turn_inner(
             text: user_text.clone(),
             at: Utc::now(),
         });
+    }
+    if tracked {
+        runtime.sessions.persist_now_result(&session)?;
+        crate::review_intents::stage_turn(
+            &runtime,
+            &task_id,
+            &session_id,
+            &run.id,
+            chat_turn.then_some(turn_id.as_str()),
+        )?;
     }
     record_event(
         &runtime,
@@ -727,6 +751,7 @@ async fn run_turn_inner(
     let system = turn_prompt.render();
     let mut indexed_messages = HashMap::new();
     let mut tool_calls_used = 0usize;
+    let mut recovery_failures = std::collections::BTreeSet::new();
 
     for _step in 0..max_steps {
         if *cancel_rx.borrow() || *pause_rx.borrow() {
@@ -742,7 +767,7 @@ async fn run_turn_inner(
                 Some(&run_id),
             );
             record_task_feedback(&runtime, &task_id, &run_id, false, "goal deadline exceeded");
-            finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+            review.finish(&lease, TaskState::Failed, RunState::Failed);
             return Err(anyhow::anyhow!("goal deadline exceeded"));
         }
 
@@ -878,6 +903,18 @@ async fn run_turn_inner(
         } else {
             tool_specs.clone()
         };
+        let observed_failures = std::mem::take(&mut recovery_failures);
+        if !observed_failures.is_empty()
+            && ["edit_file", "read_file"]
+                .iter()
+                .all(|name| tools_for_llm.iter().any(|spec| spec.function.name == *name))
+        {
+            for failure in observed_failures {
+                if let Err(error) = crate::reviewer_rules::apply(&runtime, failure, &mut messages) {
+                    tracing::warn!(%error, "Could not read workflow recovery rule");
+                }
+            }
+        }
         let mut cancel_for_llm = cancel_rx.clone();
         if tool_specs
             .iter()
@@ -984,7 +1021,7 @@ async fn run_turn_inner(
                     Some(&run_id),
                 );
                 record_task_feedback(&runtime, &task_id, &run_id, false, &e.to_string());
-                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
                 return Err(e.into());
             }
         };
@@ -1012,7 +1049,7 @@ async fn run_turn_inner(
             Ok(tool_calls) => tool_calls,
             Err(err) => {
                 record_task_feedback(&runtime, &task_id, &run_id, false, &err.to_string());
-                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
                 return Err(err);
             }
         };
@@ -1060,7 +1097,7 @@ async fn run_turn_inner(
                     missing_files.join(", ")
                 );
                 record_task_feedback(&runtime, &task_id, &run_id, false, &reason);
-                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
                 anyhow::bail!(reason);
             }
             break;
@@ -1081,7 +1118,7 @@ async fn run_turn_inner(
                     "Admin tool-call budget exhausted; send a new instruction to continue";
                 runtime.sessions.persist_now(&session);
                 record_task_feedback(&runtime, &task_id, &run_id, false, message);
-                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
                 return Err(anyhow::anyhow!(message));
             }
             if *cancel_rx.borrow() || *pause_rx.borrow() {
@@ -1089,7 +1126,7 @@ async fn run_turn_inner(
             }
             if deadline.is_some_and(|at| Utc::now() >= at) {
                 record_task_feedback(&runtime, &task_id, &run_id, false, "goal deadline exceeded");
-                finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
                 return Err(anyhow::anyhow!("goal deadline exceeded"));
             }
             session.write().append(SessionEvent::ToolCall {
@@ -1212,6 +1249,11 @@ async fn run_turn_inner(
             };
 
             let content = tool_result.content.clone();
+            if let Some(class) =
+                crate::reviewer_rules::EditFailure::recognize(&name, tool_result.ok, &content)
+            {
+                recovery_failures.insert(class);
+            }
 
             session.write().append(SessionEvent::ToolResult {
                 id: Uuid::new_v4().to_string(),
@@ -1315,7 +1357,7 @@ async fn run_turn_inner(
             Some(&run_id),
         );
         record_task_feedback(&runtime, &task_id, &run_id, false, message);
-        finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+        review.finish(&lease, TaskState::Failed, RunState::Failed);
         return Err(anyhow::anyhow!(message));
     }
 
@@ -1327,20 +1369,20 @@ async fn run_turn_inner(
     runtime.learn.flush_dirty();
     if *cancel_rx.borrow() {
         record_task_feedback(&runtime, &task_id, &run_id, false, "run cancelled");
-        finish_durable_run(&lease, TaskState::Cancelled, RunState::Cancelled);
+        review.finish(&lease, TaskState::Cancelled, RunState::Cancelled);
     } else if *pause_rx.borrow() {
         record_task_feedback(&runtime, &task_id, &run_id, false, "run paused");
         match runtime.tasks.task(&task_id).map(|task| task.state) {
             Some(TaskState::Queued) => {
-                finish_durable_run(&lease, TaskState::Queued, RunState::Cancelled)
+                review.finish(&lease, TaskState::Queued, RunState::Cancelled)
             }
             Some(TaskState::Cancelled) => {
-                finish_durable_run(&lease, TaskState::Cancelled, RunState::Cancelled)
+                review.finish(&lease, TaskState::Cancelled, RunState::Cancelled)
             }
             Some(TaskState::Completed) => {
-                finish_durable_run(&lease, TaskState::Completed, RunState::Completed)
+                review.finish(&lease, TaskState::Completed, RunState::Completed)
             }
-            _ => finish_durable_run(&lease, TaskState::Paused, RunState::Paused),
+            _ => review.finish(&lease, TaskState::Paused, RunState::Paused),
         }
     } else {
         let goal = runtime.tasks.task(&task_id).map(|task| task.goal);
@@ -1392,7 +1434,7 @@ async fn run_turn_inner(
         }
         if verification_passed {
             record_task_feedback(&runtime, &task_id, &run_id, true, "run completed");
-            finish_durable_run(&lease, TaskState::Completed, RunState::Completed);
+            review.finish(&lease, TaskState::Completed, RunState::Completed);
         } else {
             let detail = report
                 .as_ref()
@@ -1400,7 +1442,7 @@ async fn run_turn_inner(
                 .map(|check| format!("{}: {}", check.criterion, check.detail))
                 .unwrap_or_else(|| "goal verification failed".into());
             record_task_feedback(&runtime, &task_id, &run_id, false, &detail);
-            finish_durable_run(&lease, TaskState::Failed, RunState::Failed);
+            review.finish(&lease, TaskState::Failed, RunState::Failed);
             return Err(anyhow::anyhow!(detail));
         }
     }
@@ -1412,6 +1454,7 @@ async fn run_turn_inner(
         Some(&task_id),
         Some(&run_id),
     );
+    drop(review);
     let _ = event_tx.send(AgentEvent::TurnEnded(turn_id)).await;
     Ok(())
 }
@@ -1603,14 +1646,34 @@ fn save_step_checkpoint(
     }
 }
 
-fn finish_durable_run(lease: &RunLease, task_state: TaskState, run_state: RunState) {
-    if let Err(err) = lease.finish(task_state, run_state) {
-        tracing::warn!(
-            error = %err,
-            task_id = lease.task_id(),
-            run_id = lease.run_id(),
-            "failed to finish durable run"
-        );
+struct TerminalTurnReview<'a> {
+    runtime: &'a Arc<Runtime>,
+    session: &'a Arc<RwLock<Session>>,
+    run_id: &'a str,
+    tracked: bool,
+}
+
+impl TerminalTurnReview<'_> {
+    fn finish(&self, lease: &RunLease, task_state: TaskState, run_state: RunState) {
+        if task_state == TaskState::Failed && self.tracked {
+            self.runtime.sessions.persist_now(self.session);
+        }
+        if let Err(err) = lease.finish(task_state, run_state) {
+            tracing::warn!(
+                error = %err,
+                task_id = lease.task_id(),
+                run_id = lease.run_id(),
+                "failed to finish durable run"
+            );
+        }
+    }
+}
+
+impl Drop for TerminalTurnReview<'_> {
+    fn drop(&mut self) {
+        if self.tracked {
+            crate::review_intents::recover_turn(self.runtime, self.run_id);
+        }
     }
 }
 
@@ -1697,6 +1760,104 @@ async fn execute_tool_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn short_host_waits_for_its_claimed_review_and_skips_unrelated_corruption() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let _worker = runtime.reviewer_drain.lock().await;
+        let session = runtime.sessions.create();
+        let session_id = session.read().id.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        AgentLoop::new(runtime.clone())
+            .run_turn(session, "First turn".into(), tx)
+            .await
+            .unwrap()
+            .cancel();
+        let mut turn = None;
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::TurnStarted(id) => turn = Some(id),
+                AgentEvent::Done => break,
+                _ => {}
+            }
+        }
+        let turn = turn.unwrap();
+        let root = runtime.workspace_outer.join("workflow-reviews");
+        let other = root.join("a".repeat(64));
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("subject.json"), "invalid JSON").unwrap();
+        let report =
+            crate::workflow_reviewer::get(runtime, Some("chat"), Some(&session_id)).unwrap();
+        assert_eq!(report["history"].as_array().unwrap().len(), 1);
+        let job = root.join(report["review"]["id"].as_str().unwrap());
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(job.join("lease"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let wait = crate::workflow_reviewer::wait_for_revision(runtime, "chat", &session_id, &turn);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut wait)
+                .await
+                .is_err()
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let report =
+            crate::workflow_reviewer::get(runtime, Some("chat"), Some(&session_id)).unwrap();
+        assert_eq!(report["review"]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn workflow_reviews_queue_independent_turns_and_replacement_goals_before_done() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let _worker = runtime.reviewer_drain.lock().await;
+        let agent = AgentLoop::new(runtime.clone());
+        let session = runtime.sessions.create();
+        let session_id = session.read().id.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        agent
+            .run_turn(session.clone(), "A standalone turn".into(), tx)
+            .await
+            .unwrap()
+            .cancel();
+        while !matches!(rx.recv().await.unwrap(), AgentEvent::Done) {}
+        let review =
+            crate::workflow_reviewer::get(runtime, Some("session"), Some(&session_id)).unwrap();
+        assert_eq!(review["history"].as_array().unwrap().len(), 1);
+        assert_eq!(review["review"]["subject_kind"], "chat");
+        assert_eq!(review["review"]["outcome"], "cancelled");
+
+        let mut parent = None;
+        // The TUI keeps the previous goal as parent_task_id when the user replaces it.
+        for _ in 0..2 {
+            let mut task = TaskRecord::new(GoalSpec::new("A durable task")).unwrap();
+            task.session_id = Some(session_id.clone());
+            task.parent_task_id = parent.clone();
+            let task = runtime.tasks.create_task(task).unwrap();
+            let (tx, mut rx) = mpsc::channel(64);
+            agent
+                .run_task(&task.id, session.clone(), task.goal.outcome, tx)
+                .await
+                .unwrap()
+                .cancel();
+            while !matches!(rx.recv().await.unwrap(), AgentEvent::Done) {}
+            let review =
+                crate::workflow_reviewer::get(runtime, Some("task"), Some(&task.id)).unwrap();
+            assert_eq!(review["review"]["outcome"], "cancelled");
+            assert_eq!(review["review"]["status"], "queued");
+            parent = Some(task.id);
+        }
+        let review = crate::workflow_reviewer::get(runtime, None, None).unwrap();
+        assert_eq!(review["history"].as_array().unwrap().len(), 3);
+    }
 
     #[tokio::test]
     async fn read_file_returns_indexed_unicode_pages_to_the_model_without_reindexing() {

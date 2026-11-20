@@ -281,7 +281,7 @@ pub struct TeamStore {
     live_outputs: Mutex<HashMap<(String, String), String>>,
     /// Disposable lookup cache; Team.agents remains the only role registry.
     session_ownership: Mutex<HashMap<String, bool>>,
-    tasks: Mutex<Option<Weak<crate::TaskStore>>>,
+    runtime: Mutex<Weak<Runtime>>,
 }
 
 impl TeamStore {
@@ -294,7 +294,7 @@ impl TeamStore {
             active_runs: Mutex::new(HashMap::new()),
             live_outputs: Mutex::new(HashMap::new()),
             session_ownership: Mutex::new(HashMap::new()),
-            tasks: Mutex::new(None),
+            runtime: Mutex::new(Weak::new()),
         })
     }
     fn directory(&self, id: &str) -> Result<PathBuf> {
@@ -366,15 +366,25 @@ impl TeamStore {
         result
     }
     fn run_lock(&self, id: &str) -> Result<File> {
-        let file = OpenOptions::new()
+        let file = self.open_run_lock(id)?;
+        file.try_lock_exclusive()
+            .context("team is already running in another process")?;
+        Ok(file)
+    }
+    fn open_run_lock(&self, id: &str) -> Result<File> {
+        Ok(OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.directory(id)?.join("run.lock"))?;
-        file.try_lock_exclusive()
-            .context("team is already running in another process")?;
-        Ok(file)
+            .open(self.directory(id)?.join("run.lock"))?)
+    }
+    /// A CLI observer may see a terminal state before the owner has finished
+    /// persisting the review job and released the controller lease.
+    pub async fn wait_for_controller(&self, id: &str) -> Result<()> {
+        let file = self.open_run_lock(id)?;
+        tokio::task::spawn_blocking(move || fs2::FileExt::lock_shared(&file)).await??;
+        Ok(())
     }
     pub fn get(&self, id: &str) -> Result<Team> {
         let _guard = self.transaction.lock();
@@ -384,7 +394,9 @@ impl TeamStore {
             && !self.active_runs.lock().contains_key(id)
         {
             if let Ok(_lease) = self.run_lock(id) {
-                if let Some(tasks) = self.tasks.lock().as_ref().and_then(Weak::upgrade) {
+                let runtime = self.runtime.lock().upgrade();
+                if let Some(runtime) = &runtime {
+                    let tasks = &runtime.tasks;
                     for agent in &team.agents {
                         if let Some(task) = agent.task_id.as_deref().and_then(|id| tasks.task(id)) {
                             if task.owner.as_ref().is_some_and(|owner| {
@@ -424,7 +436,20 @@ impl TeamStore {
                     "interrupted",
                     "Previous process stopped. Completed outputs and checkpoints were retained.",
                 );
+                if let Some(runtime) = &runtime {
+                    crate::review_intents::stage_team(
+                        runtime,
+                        &team,
+                        &team.events[team.events.len() - 1..],
+                    )?;
+                }
                 self.save(&team)?;
+                drop(_state);
+                drop(_guard);
+                if let Some(runtime) = runtime {
+                    runtime.review_team_completion(&team);
+                }
+                return Ok(team);
             }
         }
         for agent in &mut team.agents {
@@ -435,6 +460,27 @@ impl TeamStore {
             }
         }
         Ok(team)
+    }
+
+    pub(crate) fn has_terminal_event(
+        &self,
+        id: &str,
+        at: &str,
+        kind: &str,
+    ) -> Result<Option<bool>> {
+        let _guard = self.transaction.lock();
+        let _state = self.state_lock(id)?;
+        let lease = self.open_run_lock(id)?;
+        match lease.try_lock_exclusive() {
+            Ok(()) => Ok(Some(
+                self.read(id)?
+                    .events
+                    .iter()
+                    .any(|e| e.at == at && e.kind == kind),
+            )),
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
     pub fn list(&self) -> Result<Vec<Team>> {
         let mut teams = Vec::new();
@@ -458,7 +504,15 @@ impl TeamStore {
         let _guard = self.transaction.lock();
         let _state = self.state_lock(id)?;
         let mut team = self.read(id)?;
+        let before = team.events.len();
         update(&mut team)?;
+        if let Some(new_events) = team.events.get(before..) {
+            if new_events.iter().any(crate::review_intents::is_team_end) {
+                if let Some(runtime) = self.runtime.lock().upgrade() {
+                    crate::review_intents::stage_team(&runtime, &team, new_events)?;
+                }
+            }
+        }
         self.save(&team)?;
         self.cache_team_sessions(&team);
         Ok(team)
@@ -633,8 +687,8 @@ impl TeamStore {
         }
         Ok(())
     }
-    pub(crate) fn attach_tasks(&self, tasks: &Arc<crate::TaskStore>) {
-        *self.tasks.lock() = Some(Arc::downgrade(tasks));
+    pub(crate) fn attach_runtime(&self, runtime: &Arc<Runtime>) {
+        *self.runtime.lock() = Arc::downgrade(runtime);
     }
     fn prepare_task(
         &self,
@@ -1356,10 +1410,12 @@ impl TeamStore {
         self: &Arc<Self>,
         runtime: Arc<Runtime>,
         id: &str,
-        lease: File,
+        lease: impl Into<Arc<File>>,
     ) -> Result<Team> {
+        let lease = lease.into();
         let team = self.get(id)?;
         let file_leases = self.artifact_leases(&team)?;
+        let scheduling = crate::reviewer_policy::for_execution(&runtime);
         let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
         // Validate all connections before marking any stage running.
         ensure!(
@@ -1409,6 +1465,14 @@ impl TeamStore {
                 "started",
                 "Executing independent agents in dependency order",
             );
+            if scheduling.revision != 0 {
+                Self::event(
+                    team,
+                    None,
+                    "scheduler_policy",
+                    &serde_json::to_string(&scheduling)?,
+                );
+            }
             Ok(())
         })?;
         let active = ActiveTeam::default();
@@ -1418,20 +1482,35 @@ impl TeamStore {
         let id = id.to_owned();
         tokio::spawn(async move {
             let mut running = JoinSet::new();
-            let result = store.drive(runtime, &id, &wakeup, &mut running).await;
-            if let Err(error) = result {
-                // Keep leases until active runners (including ones still opening
-                // their native task) have observed cancellation and stopped.
-                if !running.is_empty() {
-                    let _ = store.cancel(&id);
-                    while running.join_next().await.is_some() {}
+            let result = store
+                .drive(
+                    runtime.clone(),
+                    &id,
+                    &wakeup,
+                    &mut running,
+                    scheduling.policy,
+                )
+                .await;
+            let terminal = match result {
+                Ok(team) => Ok(team),
+                Err(error) => {
+                    // Keep leases until active runners (including ones still opening
+                    // their native task) have observed cancellation and stopped.
+                    if !running.is_empty() {
+                        let _ = store.cancel(&id);
+                        while running.join_next().await.is_some() {}
+                    }
+                    store.mutate(&id, |t| {
+                        t.status = "failed".into();
+                        crate::tunnel::close_all(t, "interrupted", &error.to_string());
+                        Self::event(t, None, "error", &error.to_string());
+                        Ok(())
+                    })
                 }
-                let _ = store.mutate(&id, |t| {
-                    t.status = "failed".into();
-                    crate::tunnel::close_all(t, "interrupted", &error.to_string());
-                    Self::event(t, None, "error", &error.to_string());
-                    Ok(())
-                });
+            };
+            match terminal {
+                Ok(team) => runtime.review_team_completion(&team),
+                Err(error) => tracing::warn!(%error, team_id=%id, "could not finalize team"),
             }
             store.active_runs.lock().remove(&id);
             drop(file_leases);
@@ -1445,7 +1524,8 @@ impl TeamStore {
         id: &str,
         wakeup: &Notify,
         running: &mut JoinSet<(String, Result<()>)>,
-    ) -> Result<()> {
+        scheduling: crate::reviewer_policy::SchedulingPolicy,
+    ) -> Result<Team> {
         let started = Instant::now();
         let mut publication_deadline = None;
         let mut runs = 0usize;
@@ -1466,7 +1546,7 @@ impl TeamStore {
                 while let Some(joined) = running.join_next().await {
                     joined?.1?;
                 }
-                self.mutate(id, |t| {
+                let cancelled = self.mutate(id, |t| {
                     t.status = "cancelled".into();
                     crate::tunnel::close_all(t, "cancelled", "Team execution was cancelled");
                     let selected: HashSet<_> = t
@@ -1483,17 +1563,17 @@ impl TeamStore {
                     Self::event(t, None, "cancelled", "All active agents stopped");
                     self.capture(t, "After cancellation")
                 })?;
-                return Ok(());
+                return Ok(cancelled);
             }
             // User follow-ups can change several roles' assignments. Drain
             // existing work before applying them, as for ordinary reruns.
             let ready = if team.messages.iter().any(|message| message.queued) {
                 vec![]
             } else {
-                ready_wave(&team, &in_flight)
+                ready_wave_with_policy(&team, &in_flight, scheduling)
             };
             if ready.is_empty() && running.is_empty() {
-                self.mutate(id, |t| {
+                let terminal = self.mutate(id, |t| {
                     // A message may arrive after ready_wave was computed. Keep
                     // the run alive and consume it on the next safe boundary.
                     if t.status == "cancelling" || t.messages.iter().any(|message| message.queued) {
@@ -1569,10 +1649,10 @@ impl TeamStore {
                     );
                     self.capture(t, "After run")
                 })?;
-                if matches!(self.read(id)?.status.as_str(), "running" | "cancelling") {
+                if matches!(terminal.status.as_str(), "running" | "cancelling") {
                     continue;
                 }
-                return Ok(());
+                return Ok(terminal);
             }
             let wave_started = Instant::now();
             let mut dispatch = Vec::new();
@@ -2146,7 +2226,16 @@ struct LaneTurn {
     cowork_only: bool,
 }
 
+#[cfg(test)]
 fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<LaneTurn> {
+    ready_wave_with_policy(team, in_flight, Default::default())
+}
+
+fn ready_wave_with_policy(
+    team: &Team,
+    in_flight: &HashSet<String>,
+    scheduling: crate::reviewer_policy::SchedulingPolicy,
+) -> Vec<LaneTurn> {
     let complete: HashSet<_> = team
         .agents
         .iter()
@@ -2171,7 +2260,15 @@ fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<LaneTurn> {
         .map(|a| (a, crate::tunnel::pending_invite(team, &a.id)))
         .collect();
     // A queued collaboration gets the next available slot before unrelated work.
-    candidates.sort_by_key(|(_, invite)| invite.is_none());
+    let ranks = crate::reviewer_policy::lane_ranks(team, scheduling);
+    candidates.sort_by_key(|(agent, invite)| {
+        let rank = if invite.is_none() {
+            ranks.get(agent.id.as_str()).copied().unwrap_or_default()
+        } else {
+            0
+        };
+        (invite.is_none(), std::cmp::Reverse(rank))
+    });
     for (agent, invite) in candidates {
         if in_flight.len() + ready.len()
             >= team
@@ -2552,6 +2649,29 @@ mod tests {
         }
     }
     #[test]
+    fn workflow_policy_changes_live_eligible_lane_order_and_respects_files() {
+        let mut t = team(vec![
+            agent("a", &[], &["one"]),
+            agent("b", &[], &[]),
+            agent("c", &[], &["ONE"]),
+            agent("d", &["c"], &[]),
+        ]);
+        t.execution_budget=Some(serde_json::from_value(serde_json::json!({
+            "agent_ids":["a","b","c","d"],"max_parallel":2,"max_agent_runs":4,
+            "max_steps_per_agent":12,"max_tool_calls_per_agent":32,"max_tokens_per_step":4096,"max_runtime_secs":900})).unwrap());
+        let pick = |p| {
+            ready_wave_with_policy(&t, &HashSet::new(), p)
+                .into_iter()
+                .map(|turn| turn.agent.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pick(Default::default()), ["a", "b"]);
+        assert_eq!(
+            pick(crate::reviewer_policy::SchedulingPolicy::LongestDependencyChain),
+            ["c", "b"]
+        );
+    }
+    #[test]
     fn graph_and_shared_file_scheduling() {
         let agents = vec![
             agent("a", &[], &["report.md"]),
@@ -2665,6 +2785,114 @@ mod tests {
         final_agent.delivery = Some(crate::synthesis::DeliveryKind::Final);
         validate_graph(&[supporting, final_agent]).unwrap();
     }
+    #[test]
+    fn restart_bridges_native_terminal_commits_to_the_review_queue() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let mut old = team(vec![]);
+        old.status = "completed".into();
+        TeamStore::event(
+            &mut old,
+            None,
+            "finished",
+            "Completed before workflow reviews existed",
+        );
+        runtime.teams.save(&old).unwrap();
+        let mut source = team(vec![]);
+        source.status = "running".into();
+        runtime.teams.save(&source).unwrap();
+        // The normal mutation persists an intent before it publishes the native terminal event.
+        runtime
+            .teams
+            .mutate(&source.id, |team| {
+                team.status = "completed".into();
+                TeamStore::event(team, None, "finished", "All agents completed");
+                Ok(())
+            })
+            .unwrap();
+        let session = runtime.sessions.create();
+        let sid = session.read().id.clone();
+        session.write().append(crate::SessionEvent::TurnStart {
+            id: "real-turn".into(),
+            at: chrono::Utc::now(),
+            profile_id: None,
+            model_id: None,
+            family: None,
+        });
+        runtime.sessions.persist_now_result(&session).unwrap();
+        let mut task = TaskRecord::new(GoalSpec::new("chat run")).unwrap();
+        task.session_id = Some(sid.clone());
+        let task = runtime.tasks.create_task(task).unwrap();
+        runtime
+            .tasks
+            .transition_task(&task.id, TaskState::Running)
+            .unwrap();
+        let run = runtime.tasks.create_run(&task.id, 1).unwrap();
+        crate::review_intents::stage_turn(runtime, &task.id, &sid, &run.id, Some("real-turn"))
+            .unwrap();
+        runtime
+            .tasks
+            .claim_run(&run.id, "retired-worker", chrono::Utc::now())
+            .unwrap();
+        runtime
+            .tasks
+            .finish_run(
+                &run.id,
+                "retired-worker",
+                TaskState::Completed,
+                crate::RunState::Completed,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        // Neither top-level finalizer had a chance to run after these commits.
+        assert!(!runtime.workspace_outer.join("workflow-reviews").exists());
+        for _ in 0..2 {
+            let reopened = Runtime::bootstrap(
+                runtime.config.clone(),
+                runtime.workspace_root.clone(),
+                crate::DeepSeekClient::new(runtime.llm.config()).unwrap(),
+                runtime.tools.clone(),
+            )
+            .unwrap();
+            let all = crate::workflow_reviewer::get(&reopened, None, None).unwrap();
+            assert_eq!(all["history"].as_array().unwrap().len(), 2);
+            for (kind, id) in [("team", &source.id), ("chat", &sid)] {
+                let rec = crate::workflow_reviewer::get(&reopened, Some(kind), Some(id)).unwrap();
+                assert_eq!(rec["review"]["outcome"], "completed");
+            }
+            assert!(
+                crate::workflow_reviewer::get(&reopened, Some("team"), Some(&old.id)).unwrap()
+                    ["review"]
+                    .is_null()
+            );
+            assert_eq!(
+                std::fs::read_dir(reopened.workspace_outer.join("review-intents"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn recovering_an_interrupted_coordinator_queues_one_review_for_the_team() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let mut original = team(vec![agent("worker", &[], &[])]);
+        original.status = "running".into();
+        original.agents[0].status = "running".into();
+        runtime.teams.save(&original).unwrap();
+        for _ in 0..2 {
+            let recovered = runtime.teams.get(&original.id).unwrap();
+            assert_eq!(recovered.status, "failed");
+        }
+        let report = crate::workflow_reviewer::get(runtime, None, None).unwrap();
+        assert_eq!(report["history"].as_array().unwrap().len(), 1);
+        assert_eq!(report["review"]["subject_kind"], "team");
+        assert_eq!(report["review"]["subject_id"], original.id);
+        assert_eq!(report["review"]["outcome"], "failed");
+    }
+
     #[test]
     fn chat_instructions_queue_without_interrupting_then_continue_only_target() {
         let root = std::env::temp_dir().join(format!("aris-queue-{}", new_id()));

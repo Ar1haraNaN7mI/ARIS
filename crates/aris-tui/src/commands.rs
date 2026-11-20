@@ -1519,11 +1519,7 @@ fn handle_goal(ctx: &mut SlashCtx<'_>, rest: &str) -> SlashEffect {
                     task.state,
                     TaskState::Queued | TaskState::Paused | TaskState::Failed
                 ) {
-                    let _ = ctx.runtime.cancel_active_task(&task.id);
-                    let _ = ctx
-                        .runtime
-                        .tasks
-                        .transition_task(&task.id, TaskState::Cancelled);
+                    let _ = ctx.runtime.cancel_task(&task.id);
                 }
             }
             {
@@ -1585,12 +1581,7 @@ fn create_goal_task(ctx: &SlashCtx<'_>, goal: &str) -> anyhow::Result<TaskRecord
     let created = ctx.runtime.tasks.create_task(task)?;
     if let Some(previous) = previous {
         if !matches!(previous.state, TaskState::Completed | TaskState::Cancelled) {
-            let _ = ctx.runtime.cancel_active_task(&previous.id);
-            if let Err(error) = ctx
-                .runtime
-                .tasks
-                .transition_task(&previous.id, TaskState::Cancelled)
-            {
+            if let Err(error) = ctx.runtime.cancel_task(&previous.id) {
                 tracing::debug!(
                     error = %error,
                     task_id = %previous.id,

@@ -1881,11 +1881,29 @@ mod tests {
         let mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1", mock.local_addr().unwrap());
         let mock_task = tokio::spawn(async move {
-            for suffix in ["one", "two"] {
+            let mut suffixes = ["one", "two"].into_iter().peekable();
+            let mut reviews = 0;
+            while suffixes.peek().is_some() || reviews < 2 {
                 let (mut socket, _) = mock.accept().await.unwrap();
                 let (mut request, length) = read_headers(&mut socket).await.unwrap();
                 read_body(&mut socket, &mut request, length).await.unwrap();
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|system| {
+                        system.starts_with("You are the ARIS post-task workflow reviewer")
+                    })
+                {
+                    let assessment = json!({"summary":"Reviewed the public reply","findings":[{"evidence":"turn","lesson":"The reply is persisted."}]});
+                    let payload = format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"content":assessment.to_string()},"finish_reason":"stop"}]})
+                    );
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).as_bytes()).await.unwrap();
+                    reviews += 1;
+                    continue;
+                }
+                let suffix = suffixes.next().expect("unexpected primary turn");
                 assert!(body["messages"]
                     .as_array()
                     .unwrap()
@@ -2001,7 +2019,28 @@ mod tests {
             }
             assert_eq!(streamed, format!("reply {suffix}"));
         }
-        mock_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), mock_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = rpc(&server.host, "reviewer/get", json!({"session_id":id})).await;
+                if let Some(history) = result["result"]["history"].as_array() {
+                    if history.len() == 2
+                        && history.iter().all(|r| {
+                            r["status"] == "completed"
+                                && r["summary"] == "Reviewed the public reply"
+                        })
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("two automatic reviews completed without another chat turn");
         let fetched = rpc(&server.host, "sessions/get", json!({"id":id})).await;
         let messages = fetched["result"]["session"]["events"].as_array().unwrap();
         let sync = &fetched["result"]["sync"];

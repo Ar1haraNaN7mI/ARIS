@@ -382,6 +382,9 @@ pub struct TaskRecord {
     pub policy_snapshot: Value,
     #[serde(default)]
     pub retry_policy: RetryPolicy,
+    /// The scheduler rejected this attempt before an agent run could start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_failure: Option<String>,
 }
 
 impl TaskRecord {
@@ -399,6 +402,7 @@ impl TaskRecord {
             owner: None,
             policy_snapshot: Value::Object(serde_json::Map::new()),
             retry_policy: RetryPolicy::default(),
+            start_failure: None,
         })
     }
 

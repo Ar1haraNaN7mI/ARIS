@@ -245,6 +245,7 @@ pub async fn run_tui(runtime: Arc<Runtime>, opts: TuiOptions) -> Result<()> {
     .await;
 
     app.runtime.computer.shutdown().await;
+    app.runtime.wait_for_reviews().await;
     result
 }
 

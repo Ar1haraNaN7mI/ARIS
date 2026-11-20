@@ -123,7 +123,11 @@ pub async fn run_app_server(runtime: Arc<Runtime>, listen: Option<String>) -> Re
         None | Some("") | Some("stdio://") | Some("stdio") => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            serve_stream_with_auth(runtime, BufReader::new(stdin), stdout, auth_token).await
+            let served =
+                serve_stream_with_auth(runtime.clone(), BufReader::new(stdin), stdout, auth_token)
+                    .await;
+            runtime.wait_for_reviews().await;
+            served
         }
         Some(address) => {
             let address = address.strip_prefix("tcp://").unwrap_or(address);
@@ -433,6 +437,29 @@ async fn handle_request(
     if let Some(result) = crate::harness_extensions::dispatch(&runtime, method, &params) {
         return result;
     }
+    if method == "reviewer/get" {
+        let selectors: Vec<_> = [
+            ("team_id", "team"),
+            ("task_id", "task"),
+            ("session_id", "session"),
+        ]
+        .into_iter()
+        .filter_map(|(field, kind)| params.get(field).map(|value| (kind, value)))
+        .collect();
+        let (kind, id) = match selectors.as_slice() {
+            [] => (None, None),
+            [(kind, value)] if value.as_str().is_some_and(|id| !id.is_empty()) => {
+                (Some(*kind), value.as_str())
+            }
+            _ => {
+                return Err(RpcFailure::invalid_params(
+                    "Select one team_id, task_id or session_id",
+                ))
+            }
+        };
+        return aris_core::workflow_reviewer::get(&runtime, kind, id)
+            .map_err(|error| RpcFailure::invalid_params(error.to_string()));
+    }
     if method == "memory/experiments/propose" {
         return crate::sim_optimizer::propose(&runtime, &params)
             .await
@@ -683,10 +710,8 @@ async fn handle_request(
             let updated = if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
                 task
             } else {
-                let _ = runtime.cancel_active_task(&task.id);
                 runtime
-                    .tasks
-                    .transition_task(&task.id, TaskState::Cancelled)
+                    .cancel_task(&task.id)
                     .map_err(|err| RpcFailure::internal(err.to_string()))?
             };
             Ok(json!({"task": updated}))

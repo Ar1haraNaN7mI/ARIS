@@ -144,6 +144,10 @@ impl TaskScheduler {
         }
     }
 
+    pub(crate) fn is_dispatching(&self, task_id: &str) -> bool {
+        self.state.lock().active.contains(task_id)
+    }
+
     fn update_state(&self, update: impl FnOnce(&mut SchedulerState)) {
         update(&mut self.state.lock());
     }
@@ -174,6 +178,9 @@ impl TaskScheduler {
 
         match runtime.workers.recover_stale_runs() {
             Ok(recovered) => {
+                for run in &recovered {
+                    runtime.review_recovered_task(&run.task_id);
+                }
                 self.update_state(|state| {
                     state.recovered_runs =
                         state.recovered_runs.saturating_add(recovered.len() as u64);
@@ -317,6 +324,7 @@ impl TaskScheduler {
             if let Err(err) = runtime.record_event(event) {
                 tracing::debug!(error = %err, task_id = %task.id, "failed to persist stranded task event");
             }
+            runtime.review_recovered_task(&task.id);
         }
     }
 
@@ -357,6 +365,15 @@ impl TaskScheduler {
             if let Err(err) = runtime.record_event(event) {
                 tracing::debug!(error = %err, task_id = %task.id, "failed to persist retry exhaustion event");
             }
+            runtime.review_recovered_task(&task.id);
+        }
+    }
+
+    fn fail_before_start(&self, runtime: &Arc<Runtime>, id: &str, reason: &str) {
+        if let Err(error) =
+            crate::review_intents::finish_before_start(runtime, id, TaskState::Failed, reason)
+        {
+            tracing::warn!(%error,task_id=id, "Could not persist scheduler rejection");
         }
     }
 
@@ -381,15 +398,7 @@ impl TaskScheduler {
         }
 
         let Some(session_id) = task.session_id.clone() else {
-            let _ = self.tasks.transition_task(&task.id, TaskState::Failed);
-            let _ = runtime.record_event(
-                EventEnvelope::new(
-                    "task.failed",
-                    serde_json::json!({"reason": "task has no session"}),
-                )
-                .with_source(EventSource::Scheduler)
-                .with_task(task.id.clone()),
-            );
+            self.fail_before_start(&runtime, &task.id, "task has no session");
             self.update_state(|state| {
                 state.active.remove(&task.id);
             });
@@ -400,15 +409,7 @@ impl TaskScheduler {
             .deadline
             .is_some_and(|deadline| deadline <= Utc::now())
         {
-            let _ = self.tasks.transition_task(&task.id, TaskState::Failed);
-            let _ = runtime.record_event(
-                EventEnvelope::new(
-                    "task.failed",
-                    serde_json::json!({"reason": "goal deadline expired"}),
-                )
-                .with_source(EventSource::Scheduler)
-                .with_task(task.id.clone()),
-            );
+            self.fail_before_start(&runtime, &task.id, "goal deadline expired");
             self.update_state(|state| {
                 state.active.remove(&task.id);
             });
@@ -418,7 +419,7 @@ impl TaskScheduler {
             Ok(session) => session,
             Err(err) => {
                 tracing::warn!(error = %err, task_id = %task.id, "scheduler failed to load task session");
-                let _ = self.tasks.transition_task(&task.id, TaskState::Failed);
+                self.fail_before_start(&runtime, &task.id, "could not open the task session");
                 self.update_state(|state| {
                     state.active.remove(&task.id);
                     state.errors = state.errors.saturating_add(1);
@@ -447,15 +448,7 @@ impl TaskScheduler {
             match start_result {
                 Err(err) => {
                     tracing::warn!(error = %err, task_id = %task_id, "scheduler failed to start task run");
-                    let _ = scheduler.tasks.transition_task(&task_id, TaskState::Failed);
-                    let _ = runtime.record_event(
-                        EventEnvelope::new(
-                            "task.failed",
-                            serde_json::json!({"reason": err.to_string()}),
-                        )
-                        .with_source(EventSource::Scheduler)
-                        .with_task(task_id.clone()),
-                    );
+                    scheduler.fail_before_start(&runtime, &task_id, "agent failed to start");
                 }
                 Ok(handle) => {
                     runtime.register_agent_handle(task_id.clone(), handle);
@@ -490,7 +483,10 @@ fn retry_ready(
     run: &aris_protocol::RunRecord,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    if run.state != RunState::Failed || run.attempt >= task.retry_policy.max_attempts {
+    if task.start_failure.is_some()
+        || run.state != RunState::Failed
+        || run.attempt >= task.retry_policy.max_attempts
+    {
         return false;
     }
     let delay = task.retry_policy.delay_secs(run.attempt);
@@ -520,6 +516,45 @@ impl Drop for TaskScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deadline_expired_before_dispatch_is_reviewed_without_a_model_run() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), true);
+        let runtime = &fixture.runtime;
+        let _worker = runtime.reviewer_drain.lock().await;
+        let mut goal = crate::GoalSpec::new("An expired request");
+        goal.deadline = Some(Utc::now() - ChronoDuration::minutes(2));
+        let mut task = crate::TaskRecord::new(goal).unwrap();
+        task.session_id = Some(runtime.sessions.create().read().id.clone());
+        let task = runtime.tasks.create_task(task).unwrap();
+        runtime
+            .scheduler
+            .schedule_task(runtime.clone(), task.clone())
+            .await;
+        let state = runtime.tasks.task(&task.id).unwrap();
+        assert_eq!(state.state, TaskState::Failed);
+        assert!(runtime.tasks.latest_run_for_task(&task.id).is_none());
+        assert_eq!(
+            state.start_failure.as_deref(),
+            Some("goal deadline expired")
+        );
+        let review = crate::workflow_reviewer::get(runtime, Some("task"), Some(&task.id)).unwrap();
+        assert_eq!(review["history"].as_array().unwrap().len(), 1);
+        assert_eq!(review["review"]["outcome"], "failed");
+        let queued = runtime
+            .tasks
+            .create_task(
+                crate::TaskRecord::new(crate::GoalSpec::new("Withdraw before dispatch")).unwrap(),
+            )
+            .unwrap();
+        runtime.cancel_task(&queued.id).unwrap();
+        assert!(runtime.tasks.latest_run_for_task(&queued.id).is_none());
+        assert_eq!(
+            crate::workflow_reviewer::get(runtime, Some("task"), Some(&queued.id)).unwrap()
+                ["review"]["outcome"],
+            "cancelled"
+        );
+    }
     use aris_protocol::{GoalSpec, RetryPolicy, TaskRecord};
     use std::path::PathBuf;
     use uuid::Uuid;

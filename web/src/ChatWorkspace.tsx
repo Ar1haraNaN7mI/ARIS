@@ -16,6 +16,7 @@ import { SettingsCenter } from "./SettingsCenter";
 import { useUiPreferences, shouldSend } from "./uiPreferences";
 import { unlockNotificationAudio } from "./notifications";
 import { useHarness } from "./useHarness";
+import { WorkflowReview } from "./WorkflowReview";
 import type { Activity, Bootstrap, Profile, SessionEvent } from "./types";
 
 const labelSession = (name: string | null, id: string) =>
@@ -547,6 +548,10 @@ export function ChatWorkspace({
                 {harness.error || live?.error}
               </div>
             )}
+            {data && currentId && snapshot?.session.id === currentId && !live?.running &&
+              (["completed", "failed", "cancelled"].includes(snapshot.state || "") || events.at(-1)?.type === "turn_end") &&
+              <WorkflowReview key={snapshot.task_id || events.at(-1)?.id} token={data.token} subject="session_id" id={currentId}
+                startedAt={events.filter((event) => event.type === "turn_start").at(-1)?.at} />}
           </div>
           <div className="composer-area">
             {data && !data.model.ready && (

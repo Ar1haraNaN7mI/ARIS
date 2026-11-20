@@ -143,6 +143,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
+    /// Inspect the latest post-task workflow review and its history.
+    Reviewer {
+        #[arg(long, group = "subject")]
+        team: Option<String>,
+        #[arg(long, group = "subject")]
+        task: Option<String>,
+        #[arg(long, group = "subject")]
+        session: Option<String>,
+    },
     /// Create, execute and inspect multi-agent workflows (JSON output)
     Team {
         #[command(subcommand)]
@@ -776,6 +785,24 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.config.clone();
 
     match cli.command.clone() {
+        Some(Commands::Reviewer {
+            team,
+            task,
+            session,
+        }) => {
+            let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
+            let subject = team
+                .as_deref()
+                .map(|id| ("team", id))
+                .or_else(|| task.as_deref().map(|id| ("task", id)))
+                .or_else(|| session.as_deref().map(|id| ("session", id)));
+            let result = aris_core::workflow_reviewer::get(
+                &boot.runtime,
+                subject.map(|s| s.0),
+                subject.map(|s| s.1),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Some(Commands::Models) => {
             let boot = boot_tui(&workspace, config_path.as_ref(), &cli)?;
             let result = team_service::dispatch(boot.runtime, "kei/models", &serde_json::json!({}))
@@ -1756,10 +1783,25 @@ async fn run(cli: Cli) -> Result<()> {
                 TaskCmd::Cancel { id } => {
                     let task = resolve_task(&boot.runtime, &id)?;
                     if !matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
-                        let _ = boot.runtime.cancel_active_task(&task.id);
-                        boot.runtime
-                            .tasks
-                            .transition_task(&task.id, TaskState::Cancelled)?;
+                        let cancelled = boot.runtime.cancel_task(&task.id)?;
+                        if let Some(run) = boot.runtime.tasks.latest_run_for_task(&task.id) {
+                            aris_core::workflow_reviewer::wait_for_revision(
+                                &boot.runtime,
+                                "task",
+                                &task.id,
+                                &run.id,
+                            )
+                            .await?;
+                        } else {
+                            let revision = format!("start/{}", cancelled.updated_at.to_rfc3339());
+                            aris_core::workflow_reviewer::wait_for_revision(
+                                &boot.runtime,
+                                "task",
+                                &task.id,
+                                &revision,
+                            )
+                            .await?;
+                        }
                     }
                     println!("cancelled {}", task.id);
                 }
@@ -2444,11 +2486,19 @@ async fn run_headless(
     };
     let mut last_message = String::new();
     let mut protocol_context = AgentEventContext::for_session(session.read().id.clone());
-    protocol_context.task_id = requested_task_id;
+    protocol_context.task_id = requested_task_id.clone();
     while let Some(ev) = rx.recv().await {
+        if let AgentEvent::TurnStarted(turn_id) = &ev {
+            protocol_context.turn_id = Some(turn_id.clone());
+            if let Some(task) = &requested_task_id {
+                protocol_context.run_id = event_runtime
+                    .tasks
+                    .latest_run_for_task(task)
+                    .map(|run| run.id);
+            }
+        }
         if json {
-            if let AgentEvent::TurnStarted(id) = &ev {
-                protocol_context.turn_id = Some(id.clone());
+            if matches!(ev, AgentEvent::TurnStarted(_)) {
                 // A requested task id is authoritative. Falling back to the
                 // session's latest task is only appropriate for a plain
                 // interactive turn; otherwise a concurrently updated task in
@@ -2505,6 +2555,12 @@ async fn run_headless(
         event_runtime.clear_agent_handle(task_id);
     }
     computer.shutdown().await;
+    if let (Some(task), Some(run)) = (requested_task_id, protocol_context.run_id.as_deref()) {
+        aris_core::workflow_reviewer::wait_for_revision(&event_runtime, "task", &task, run).await?;
+    } else if let Some(turn) = &protocol_context.turn_id {
+        let id = session.read().id.clone();
+        aris_core::workflow_reviewer::wait_for_revision(&event_runtime, "chat", &id, turn).await?;
+    }
     if !json {
         println!();
     }
@@ -2599,6 +2655,8 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
         }
         event_cursor = team.events.len();
         if !matches!(team.status.as_str(), "planning" | "running" | "cancelling") {
+            runtime.teams.wait_for_controller(&id).await?;
+            aris_core::workflow_reviewer::wait_for_team(&runtime, &team).await?;
             runtime.computer.shutdown().await;
             println!("{}", serde_json::to_string_pretty(&json!({"team":team}))?);
             anyhow::ensure!(

@@ -776,13 +776,15 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let catalog_public: Vec<_> = catalog.into_iter().map(|(p, _)| p).collect();
     let trial = runtime.learn.propose_dispatch(&config.model);
+    let scheduling = aris_core::reviewer_policy::for_execution(&runtime);
+    let dispatch_advice = format!("{}\n{}", trial.instruction(), scheduling.policy.rule());
     let mut messages = admin_messages(
         &preview,
         &request.message,
         &catalog_public,
         request.allow_new_roles,
         &admin_session.read(),
-        trial.instruction(),
+        &dispatch_advice,
     )?;
     let tools = admin_tools(&preview, &catalog_public, request.allow_new_roles);
     let (reserved, lease) = runtime.teams.reserve_admin(&team.id, state, lease)?;
@@ -804,15 +806,20 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
         });
     }
     if let Err(error) = runtime.sessions.persist_now_result(&admin_session) {
-        let _ = runtime
+        if let Ok(failed) = runtime
             .teams
-            .fail_admin(&team.id, &request_id, &error.to_string());
+            .fail_admin(&team.id, &request_id, &error.to_string())
+        {
+            runtime.review_team_completion(&failed);
+        }
         return Err(error);
     }
     let returned = reserved.clone();
     tokio::spawn(async move {
         let id = reserved.id.clone();
         let mut calls = vec![];
+        // Keep ownership through failure reporting if worker startup rejects a profile or file lease.
+        let lease = Arc::new(lease);
         let operation = async {
             let deadline = tokio::time::Instant::now() + ADMIN_TIMEOUT;
             let mut attempt = 1;
@@ -925,9 +932,9 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
             }
             runtime.sessions.persist_now_result(&admin_session)?;
             if delegated {
-                runtime.teams.start_reserved(runtime.clone(), &id, lease)?;
+                runtime.teams.start_reserved(runtime.clone(), &id, lease.clone())?;
             } else {
-                drop(lease);
+                runtime.review_team_completion(&team);
                 debug_assert_eq!(team.admin.as_ref().unwrap().phase, "answered");
             }
             Ok::<_, anyhow::Error>(())
@@ -970,7 +977,9 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
             }
             drop(s);
             let _ = runtime.sessions.persist_now_result(&admin_session);
-            let _ = runtime.teams.fail_admin(&id, &request_id, &message);
+            if let Ok(failed) = runtime.teams.fail_admin(&id, &request_id, &message) {
+                runtime.review_team_completion(&failed);
+            }
         }
     });
     Ok(returned)
@@ -1625,14 +1634,29 @@ mod tests {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut observed = vec![];
-            for body in responses {
+            let mut scripted = responses.into_iter().peekable();
+            while scripted.peek().is_some() {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(10), listener.accept())
                         .await
                         .unwrap()
                         .unwrap();
-                observed.push(read_fixture_request(&mut socket).await);
-                reply_fixture(&mut socket, body).await;
+                let request = read_fixture_request(&mut socket).await;
+                if request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|system| {
+                        system.starts_with("You are the ARIS post-task workflow reviewer")
+                    })
+                {
+                    reply_fixture(
+                        &mut socket,
+                        chat_body(r#"{"summary":"Checked the terminal workflow"}"#, "stop"),
+                    )
+                    .await;
+                    continue;
+                }
+                observed.push(request);
+                reply_fixture(&mut socket, scripted.next().unwrap()).await;
             }
             observed
         });
@@ -1644,6 +1668,7 @@ mod tests {
             loop {
                 let team = runtime.teams.get(id).unwrap();
                 if !matches!(team.status.as_str(), "planning" | "running" | "cancelling") {
+                    runtime.teams.wait_for_controller(id).await.unwrap();
                     return team;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

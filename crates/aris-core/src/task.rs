@@ -522,6 +522,16 @@ impl TaskStore {
     }
 
     pub fn transition_task(&self, id: &str, next: TaskState) -> Result<TaskRecord> {
+        self.transition_task_at(id, next, Utc::now(), None)
+    }
+
+    pub(crate) fn transition_task_at(
+        &self,
+        id: &str,
+        next: TaskState,
+        at: DateTime<Utc>,
+        start_failure: Option<&str>,
+    ) -> Result<TaskRecord> {
         let _projection_guard = self.projection_guard.lock();
         let mut tasks = self.tasks.write();
         let task = tasks
@@ -532,7 +542,8 @@ impl TaskStore {
         }
         let previous = task.clone();
         task.state = next;
-        task.updated_at = chrono::Utc::now();
+        task.updated_at = at;
+        task.start_failure = start_failure.map(str::to_owned);
         let updated = task.clone();
         if let Err(err) = self.append_record("task.state_changed", Some(id), None, &updated) {
             tasks.insert(id.to_string(), previous);

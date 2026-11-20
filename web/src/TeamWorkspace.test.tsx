@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TeamWorkspace } from "./TeamWorkspace";
+import { rpc } from "./api";
 import type { Team, TeamAgent } from "./teamTypes";
 
 const mocks = vi.hoisted(() => ({ state: {} as Record<string, unknown>, harness: vi.fn(), admin: vi.fn(), message: vi.fn(), run: vi.fn(), create: vi.fn(), select: vi.fn() }));
@@ -13,12 +14,23 @@ vi.mock("./WorkspaceTrajectory", () => ({ WorkspaceTrajectory: () => null }));
 const worker: TeamAgent = { id: "research", name: "Research", profile_id: "astra", role: "research", prompt: "", files: [], depends_on: [], status: "completed", session_id: "worker-session" };
 const base: Team = { id: "t", name: "Question", goal: "Original", created_at: "2026-11-19T00:00:00Z", status: "completed", agents: [worker], files: [], handoffs: [], events: [], checkpoints: [] };
 beforeEach(() => {
+  vi.mocked(rpc).mockResolvedValue({ templates: [] });
   mocks.harness.mockReturnValue({ data: { token: "test", workspace: "/workspace" } });
   mocks.admin.mockResolvedValue(base); mocks.message.mockResolvedValue(base);
   mocks.state = { teams: [base], team: base, config: { configured: true, profiles: [{ id: "astra", name: "Astra", model: "actual-astra", family: "gpt" }] }, select: mocks.select,
     admin: mocks.admin, message: mocks.message, run: mocks.run, create: mocks.create, loading: false, busy: false, error: "" };
 });
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
+it("loads the whole team's review after completion while keeping the role conversation available", async () => {
+  const review = { id: "r", status: "completed", summary: "已复核任务的派工与交付。", findings: [], changes: [] };
+  vi.mocked(rpc).mockImplementation(async (_token, method) => method === "reviewer/get" ? { review } : { templates: [] });
+  const view = render(<TeamWorkspace onChat={vi.fn()} />);
+  fireEvent.click(view.container.querySelector(".lp-session-row")!);
+  fireEvent.click(await screen.findByText("工作流复盘"));
+  expect(screen.getByText(review.summary)).toBeTruthy();
+  expect(screen.getByLabelText("发送给 Research")).toBeTruthy();
+  expect(rpc).toHaveBeenCalledWith("test", "reviewer/get", { team_id: "t" }, expect.any(AbortSignal));
+});
 it("routes a no-role home message through admin exactly once without a second run", async () => {
   render(<TeamWorkspace onChat={vi.fn()} />);
   fireEvent.change(screen.getByLabelText("新消息"), { target: { value: "Explain the result" } });

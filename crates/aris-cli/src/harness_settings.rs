@@ -48,8 +48,8 @@ pub(crate) fn dispatch(runtime: &Arc<Runtime>, method: &str, params: &Value) -> 
             .map_err(|e| RpcFailure::invalid_params(e.to_string())),
         "memory/delete" => delete_memory(runtime, params),
         "memory/clear" => {
-            let before = runtime.learn.list();
-            runtime.learn.clear().map_err(internal).map(|()| {
+            aris_core::workflow_reviewer::clear_memory(runtime)
+                .map_err(internal).map(|before| {
                 clear_memory_prompt(runtime);
                 json!({"deleted_episodes":before.episodes.len(),"deleted_feedback":before.feedback.len(),"deleted_experiments":before.experiments.len()})
             })

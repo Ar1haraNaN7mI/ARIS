@@ -15,6 +15,7 @@ import { ProcessChat } from "./ProcessChat";
 import { TeamTunnelThread } from "./TeamTunnel";
 import { ModelGlyph, ModelReel, ProcessRelay } from "./ProcessRelay";
 import { WorkspaceTrajectory } from "./WorkspaceTrajectory";
+import { WorkflowReview } from "./WorkflowReview";
 import { Emblem } from "./Emblem";
 import { type TeamTemplate, type TeamDraft, type ModelProfile } from "./teamTypes";
 import { ADMIN_VIEW, adminAgent, conversationAgents, isAdminOnly, progressAgents, teamIsActive, workerAgents } from "./teamConversationModel";
@@ -158,6 +159,9 @@ export function TeamWorkspace({ initialData, latestProfile, onChat }: { initialD
           </section>}
           {view === "chat" && !agent && finalAuthor?.status === "completed" && activeTeam.status === "completed" &&
             <button className="lp-open-final" onClick={() => setView("delivery")}><FileTextIcon />{finalAuthor.name} 已完成汇总 · 查看最终交付 →</button>}
+          {data && ["completed", "failed", "cancelled"].includes(activeTeam.status) &&
+            <WorkflowReview key={activeTeam.events.at(-1)?.at || activeTeam.admin?.request_id} token={data.token} subject="team_id" id={activeTeam.id}
+              startedAt={activeTeam.events.filter((event) => event.kind === "started" || event.kind === "admin_started").at(-1)?.at} />}
           {view !== "tunnel" && view !== "delivery" && <div className="lp-composer-wrap">
             <MessageComposer key={activeTeam.id} agent={conversation} agents={simple ? undefined : workers}
               recipientLabel={activeTeam.admin ? "ARIS" : "整个团队"} files={activeTeam.files}

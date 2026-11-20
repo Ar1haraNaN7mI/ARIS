@@ -17,6 +17,16 @@ async fn fixture() -> (
     mpsc::Receiver<Request>,
     tokio::task::JoinHandle<()>,
 ) {
+    fixture_with_learning(false).await
+}
+
+async fn fixture_with_learning(
+    learn: bool,
+) -> (
+    crate::tests::RuntimeFixture,
+    mpsc::Receiver<Request>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (requests, rx) = mpsc::channel(16);
@@ -60,7 +70,7 @@ async fn fixture() -> (
             });
         }
     });
-    let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), false);
+    let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), learn);
     let runtime = &fixture.runtime;
     fs::write(
         runtime.outer_home.join("credentials.env"),
@@ -107,6 +117,120 @@ async fn settled(runtime: &Runtime, id: &str) -> Team {
     })
     .await
     .unwrap_or_else(|error| panic!("{error}: {:?}", runtime.teams.get(id)))
+}
+
+#[tokio::test]
+async fn workflow_review_changes_the_next_native_teams_first_wave() {
+    let (fixture, mut rx, server) = fixture_with_learning(true).await;
+    let runtime = &fixture.runtime;
+    for revision in [0, 1] {
+        let team = runtime
+            .teams
+            .create(
+                runtime,
+                TeamSpec {
+                    name: format!("policy test {revision}"),
+                    goal: "Collect inputs and synthesize".into(),
+                    agents: vec![
+                        worker("a", &[]),
+                        worker("b", &[]),
+                        worker("c", &[]),
+                        worker("d", &["c"]),
+                    ],
+                    files: vec![],
+                },
+            )
+            .unwrap();
+        runtime
+            .teams
+            .mutate(&team.id, |t| {
+                t.execution_budget = Some(TeamExecutionBudget {
+                    agent_ids: t.agents.iter().map(|a| a.id.clone()).collect(),
+                    max_agent_runs: 4,
+                    max_steps_per_agent: 4,
+                    max_tool_calls_per_agent: 4,
+                    max_tokens_per_step: 4096,
+                    max_parallel: 2,
+                    max_runtime_secs: 300,
+                    finalization_window_secs: 0,
+                });
+                Ok(())
+            })
+            .unwrap();
+        runtime.teams.start(runtime.clone(), &team.id).unwrap();
+        let first = request(&mut rx).await;
+        let second = request(&mut rx).await;
+        let starting = runtime.teams.get(&team.id).unwrap();
+        let admitted: Vec<_> = starting
+            .agents
+            .iter()
+            .filter(|a| a.status == "running")
+            .map(|a| a.id.as_str())
+            .collect();
+        let policy_event = starting
+            .events
+            .iter()
+            .find(|e| e.kind == "scheduler_policy");
+        if revision == 0 {
+            assert_eq!(admitted, ["a", "b"]);
+            assert!(policy_event.is_none());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        } else {
+            assert_eq!(admitted, ["a", "c"]);
+            let active: crate::reviewer_policy::ActivePolicy =
+                serde_json::from_str(&policy_event.unwrap().message).unwrap();
+            assert_eq!(active.revision, 1);
+            assert_eq!(
+                active.policy,
+                crate::reviewer_policy::SchedulingPolicy::LongestDependencyChain
+            );
+        }
+        first.reply.send("Independent result".into()).unwrap();
+        second.reply.send("Independent result".into()).unwrap();
+        for index in 0..2 {
+            let call = request(&mut rx).await;
+            if revision == 0 && index == 1 {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+            }
+            call.reply.send("Result".into()).unwrap();
+        }
+        let terminal = settled(runtime, &team.id).await;
+        assert_eq!(terminal.status, "completed");
+        let reviewer = request(&mut rx).await;
+        assert!(reviewer.body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ARIS post-task workflow reviewer"));
+        reviewer
+            .reply
+            .send(
+                json!({
+                    "summary":"Compare dependency-aware dispatch", "findings":[],
+                    "scheduling_candidate":"longest_dependency_chain","proposal":null,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        crate::workflow_reviewer::wait_for_team(runtime, &terminal)
+            .await
+            .unwrap();
+        let records = crate::workflow_reviewer::get(runtime, Some("team"), Some(&team.id)).unwrap();
+        assert_eq!(records["history"].as_array().unwrap().len(), 1);
+        if revision == 0 {
+            assert_eq!(
+                records["review"]["policy_evaluation"]["outcome"], "activated",
+                "{records}"
+            );
+        }
+    }
+    assert_eq!(
+        crate::workflow_reviewer::get(runtime, None, None).unwrap()["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    server.abort();
 }
 
 #[tokio::test]
@@ -1134,5 +1258,220 @@ async fn worker_missing_an_assigned_document_gets_one_same_session_correction() 
         rx.try_recv().is_err(),
         "Do not repeat an unsuccessful recovery"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn clearing_memory_while_reviewer_waits_keeps_report_without_relearning() {
+    let (fixture, mut rx, server) = fixture_with_learning(true).await;
+    let runtime = &fixture.runtime;
+    let mut team = runtime
+        .teams
+        .create(
+            runtime,
+            TeamSpec {
+                name: "clear during review".into(),
+                goal: "rank dependencies".into(),
+                agents: vec![
+                    worker("a", &[]),
+                    worker("b", &[]),
+                    worker("c", &[]),
+                    worker("d", &["c"]),
+                ],
+                files: vec![],
+            },
+        )
+        .unwrap();
+    let origin = Utc::now() - chrono::Duration::minutes(1);
+    let stamp = |ms| (origin + chrono::Duration::milliseconds(ms)).to_rfc3339();
+    let event = |ms, kind: &str, lane: Option<&str>| TeamEvent {
+        at: stamp(ms),
+        kind: kind.into(),
+        agent_id: lane.map(str::to_owned),
+        message: lane.map_or_else(String::new, |id| format!("{id}: completed")),
+    };
+    team.created_at = stamp(0);
+    team.status = "completed".into();
+    team.events = vec![
+        event(1, "started", None),
+        event(2, "agent_started", Some("a")),
+        event(2, "agent_started", Some("b")),
+        event(102, "agent_finished", Some("a")),
+        event(102, "agent_finished", Some("b")),
+        event(103, "agent_started", Some("c")),
+        event(203, "agent_finished", Some("c")),
+        event(204, "agent_started", Some("d")),
+        event(504, "agent_finished", Some("d")),
+        event(505, "finished", None),
+    ];
+    for lane in &mut team.agents {
+        lane.status = "completed".into();
+    }
+    team.execution_budget=Some(serde_json::from_value(json!({"agent_ids":["a","b","c","d"],"max_parallel":2,"max_agent_runs":4,"max_steps_per_agent":6,"max_tool_calls_per_agent":5,"max_tokens_per_step":1000,"max_runtime_secs":100})).unwrap());
+    let seeded = crate::reviewer_policy::assess(runtime, "previous", &team, None).unwrap();
+    assert_eq!(seeded.revision, 1);
+    let uid = crate::workflow_reviewer::enqueue_team(runtime, &team).unwrap();
+    let reviewer = {
+        let rt = runtime.clone();
+        let t = team.clone();
+        tokio::spawn(async move {
+            crate::workflow_reviewer::wait_for_team(&rt, &t)
+                .await
+                .unwrap();
+        })
+    };
+    let pending = request(&mut rx).await;
+    assert!(pending.body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("ARIS post-task workflow reviewer"));
+    let separate = Runtime::bootstrap(
+        runtime.config.clone(),
+        runtime.workspace_root.clone(),
+        crate::DeepSeekClient::new(runtime.llm.config()).unwrap(),
+        runtime.tools.clone(),
+    )
+    .unwrap();
+    crate::workflow_reviewer::clear_memory(&separate).unwrap();
+    pending.reply.send(json!({"summary":"Review of the old workflow","findings":[],"scheduling_candidate":"longest_dependency_chain","proposal":null}).to_string()).unwrap();
+    reviewer.await.unwrap();
+    let report = crate::workflow_reviewer::get(runtime, Some("team"), Some(&team.id)).unwrap()
+        ["review"]
+        .clone();
+    assert_eq!(report["id"], uid);
+    assert_eq!(report["summary"], "Review of the old workflow");
+    assert_eq!(report["status"], "completed");
+    assert!(report["excluded_by_memory_clear"].is_string());
+    assert!(report["policy_evaluation"].is_null());
+    assert_eq!(
+        crate::reviewer_policy::active(&separate).unwrap().revision,
+        0
+    );
+    assert!(separate
+        .learn
+        .recall_experiments("workflow.team")
+        .is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn reviewer_learns_edit_recovery_from_independent_chats_and_guides_a_real_tool_retry() {
+    let (fixture, mut rx, server) = fixture_with_learning(true).await;
+    let runtime = &fixture.runtime;
+    runtime.settings.write().approval = crate::ApprovalPolicy::Never;
+    let guard = aris_fs::PathGuard::new(aris_fs::PathGuardConfig {
+        workspace_root: runtime.workspace_root.clone(),
+        workspace_outer: runtime.workspace_outer.clone(),
+        outer_home: runtime.outer_home.clone(),
+        deny_core_writes: true,
+        deny_patterns: vec![],
+    })
+    .unwrap();
+    crate::register_builtin_tools(&runtime.tools, Arc::new(aris_fs::FsService::new(guard)));
+    let agent = crate::AgentLoop::new(runtime.clone());
+    for (i, read_first, worked, expected) in [
+        (0, true, true, "proposed"),
+        (1, true, true, "proposed"),
+        (2, false, false, "applied"),
+        (3, true, false, "retired"),
+    ] {
+        let file = format!("brief-{i}.md");
+        fs::write(runtime.workspace_root.join(&file), "existing draft").unwrap();
+        let session = runtime.sessions.create();
+        let (tx, _events) = mpsc::channel(256);
+        agent
+            .run_turn(
+                session.clone(),
+                "Edit the draft with edit_file and read_file".into(),
+                tx,
+            )
+            .await
+            .unwrap();
+        let ask = request(&mut rx).await;
+        assert!(ask.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "edit_file"));
+        assert!(!ask.body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("edit_file mismatch just observed"));
+        let edit =
+            |anchor: &str| json!({"path":file,"old_string":anchor,"new_string":"revised draft"});
+        worker_tool_reply(ask, "initial", "edit_file", edit("outdated text"));
+        let next = request(&mut rx).await;
+        assert_eq!(
+            next.body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("edit_file mismatch just observed"),
+            i == 3
+        );
+        assert!(next.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("old_string not found in"))));
+        let retry = if read_first {
+            worker_tool_reply(next, "read", "read_file", json!({"path":file}));
+            request(&mut rx).await
+        } else {
+            next
+        };
+        worker_tool_reply(
+            retry,
+            "retry",
+            "edit_file",
+            edit(if worked {
+                "existing draft"
+            } else {
+                "incorrect new guess"
+            }),
+        );
+        request(&mut rx)
+            .await
+            .reply
+            .send("Finished the edit attempt".into())
+            .unwrap();
+        let review = request(&mut rx).await;
+        assert!(review.body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ARIS post-task workflow reviewer"));
+        review.reply.send(json!({"summary":"Review file edit outcomes","findings":[],"scheduling_candidate":null,"proposal":null}).to_string()).unwrap();
+        let (sid, turn) = {
+            let s = session.read();
+            (
+                s.id.clone(),
+                s.events
+                    .iter()
+                    .find_map(|e| match e {
+                        crate::SessionEvent::TurnStart { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .unwrap(),
+            )
+        };
+        crate::workflow_reviewer::wait_for_revision(runtime, "chat", &sid, &turn)
+            .await
+            .unwrap();
+        let report = crate::workflow_reviewer::get(runtime, Some("chat"), Some(&sid)).unwrap();
+        assert_eq!(
+            report["review"]["rule_evaluations"][0]["status"], expected,
+            "{report}"
+        );
+        assert_eq!(
+            fs::read_to_string(runtime.workspace_root.join(file)).unwrap(),
+            if worked {
+                "revised draft"
+            } else {
+                "existing draft"
+            }
+        );
+    }
     server.abort();
 }

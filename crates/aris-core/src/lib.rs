@@ -22,6 +22,9 @@ pub mod model_profile;
 pub mod permissions;
 pub mod policy;
 mod report_calculate;
+mod review_intents;
+pub mod reviewer_policy;
+pub mod reviewer_rules;
 pub mod scheduler;
 mod session;
 pub mod settings;
@@ -35,6 +38,7 @@ pub mod tunnel;
 pub mod verification;
 pub mod web_crawl;
 pub mod worker;
+pub mod workflow_reviewer;
 
 pub use agent_loop::{AgentEvent, AgentEventContext, AgentHandle, AgentLoop};
 pub use approvals::{ApprovalQueue, ApprovalScope, DeniedAction, PendingApproval};
@@ -108,6 +112,7 @@ pub struct Runtime {
     pub sessions: Arc<SessionStore>,
     pub prompt: Arc<RwLock<SystemPromptBuilder>>,
     pub learn: Arc<LearnStore>,
+    pub(crate) reviewer_drain: tokio::sync::Mutex<()>,
     pub ctm: Arc<ContinuousThought>,
     pub skills: RwLock<Option<Arc<SkillCatalog>>>,
     pub plugins: RwLock<Option<Arc<PluginRegistry>>>,
@@ -214,6 +219,7 @@ impl Runtime {
             sessions,
             prompt,
             learn,
+            reviewer_drain: tokio::sync::Mutex::new(()),
             ctm,
             skills: RwLock::new(None),
             plugins: RwLock::new(None),
@@ -235,12 +241,8 @@ impl Runtime {
             task_reservations: Mutex::new(HashSet::new()),
         });
         runtime.scheduler.attach_runtime(&runtime);
-        runtime.teams.attach_tasks(&runtime.tasks);
-        runtime.teams.reconcile_tasks(&runtime.tasks)?;
+        runtime.teams.attach_runtime(&runtime);
         tunnel::register(&runtime);
-        if let Err(err) = runtime.workers.recover_stale_runs() {
-            tracing::warn!(error = %err, "failed to recover stale worker runs");
-        }
 
         runtime
             .prompt
@@ -280,6 +282,16 @@ impl Runtime {
         runtime.sync_model_optimization();
         runtime.sync_computer_tools(settings.computer_enabled);
         web_crawl::register(&runtime.tools);
+        runtime.teams.reconcile_tasks(&runtime.tasks)?;
+        match runtime.workers.recover_stale_runs() {
+            Ok(recovered) => {
+                for run in recovered {
+                    runtime.review_recovered_task(&run.task_id);
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to recover stale worker runs"),
+        }
+        review_intents::recover(&runtime)?;
 
         // Align permission mode with sandbox setting when sandbox was persisted.
         let _ = settings.sandbox;
@@ -290,6 +302,61 @@ impl Runtime {
     /// Start the local scheduler after tools/plugins have been attached.
     pub fn start_scheduler(self: &Arc<Self>) {
         self.scheduler.start();
+        self.start_pending_reviews();
+    }
+
+    fn start_pending_reviews(self: &Arc<Self>) {
+        let runtime = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                runtime.wait_for_reviews().await;
+            });
+        }
+    }
+
+    /// Flush queued reviews before a short-lived host tears down its Tokio runtime.
+    pub async fn wait_for_reviews(&self) {
+        if let Err(error) = workflow_reviewer::drain(self).await {
+            tracing::warn!(%error, "workflow reviewer queue could not be drained");
+        }
+    }
+
+    pub(crate) fn review_queued(self: &Arc<Self>, review: Result<String>) {
+        match review {
+            Ok(id) if !id.is_empty() => self.start_pending_reviews(),
+            Err(error) => tracing::warn!(%error, "could not enqueue workflow review"),
+            _ => {}
+        }
+    }
+
+    pub fn review_team_completion(self: &Arc<Self>, team: &harness::Team) {
+        let result = workflow_reviewer::enqueue_team(self, team);
+        if result.is_ok() {
+            review_intents::ack_team(self, team);
+        }
+        self.review_queued(result);
+    }
+
+    /// Recovery may requeue an interrupted attempt. Only settled tasks have a
+    /// workflow to review, and team-owned attempts are reviewed by their coordinator.
+    fn review_recovered_task(self: &Arc<Self>, id: &str) {
+        if let Some(task) = self.tasks.task(id) {
+            if matches!(
+                task.state,
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+            ) && task.owner.is_none()
+            {
+                if let Some(session) = &task.session_id {
+                    if let Some(run) = self.tasks.latest_run_for_task(id) {
+                        if review_intents::has_turn(self, &run.id) {
+                            review_intents::recover_turn(self, &run.id);
+                            return;
+                        }
+                    }
+                    self.review_queued(workflow_reviewer::enqueue_task(self, id, session));
+                }
+            }
+        }
     }
 
     pub fn stop_scheduler(&self) {
@@ -329,6 +396,31 @@ impl Runtime {
         };
         handle.cancel();
         true
+    }
+
+    /// An idle, previously executed task has no live AgentLoop to publish its final review.
+    pub fn cancel_task(self: &Arc<Self>, task_id: &str) -> Result<TaskRecord> {
+        let active = self.cancel_active_task(task_id);
+        if !active {
+            if let (Some(task), Some(run)) = (
+                self.tasks.task(task_id),
+                self.tasks.latest_run_for_task(task_id),
+            ) {
+                review_intents::stage_idle_cancel(self, &task, &run)?;
+            } else {
+                return review_intents::finish_before_start(
+                    self,
+                    task_id,
+                    TaskState::Cancelled,
+                    "cancelled before an agent run started",
+                );
+            }
+        }
+        let task = self.tasks.transition_task(task_id, TaskState::Cancelled)?;
+        if !active && self.tasks.latest_run_for_task(task_id).is_some() {
+            self.review_recovered_task(task_id);
+        }
+        Ok(task)
     }
 
     pub fn pause_active_task(&self, task_id: &str) -> bool {
