@@ -354,12 +354,6 @@
   min-height: 120px;
   max-height: 320px;
 }
-.sc-counter {
-  color: var(--sc-muted);
-  font-size: 10px;
-  margin-top: 7px;
-  text-align: right;
-}
 .sc-field {
   display: block;
   color: var(--sc-text);

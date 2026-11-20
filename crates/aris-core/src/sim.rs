@@ -29,8 +29,8 @@ impl HarnessProposal {
         measurement_ms: Option<i64>,
     ) -> anyhow::Result<HarnessExperiment> {
         anyhow::ensure!(
-            !observation.trim().is_empty() && observation.len() <= 4096,
-            "Supply a measured observation of 1–4096 bytes"
+            !observation.trim().is_empty(),
+            "Supply a measured observation"
         );
         anyhow::ensure!(
             measurement_ms.is_none_or(|ms| ms >= 0),
@@ -85,10 +85,7 @@ impl ExternalEvaluation {
             &self.context,
             &self.observation,
         ] {
-            anyhow::ensure!(
-                !text.trim().is_empty() && text.len() <= 4096,
-                "Evaluation fields require 1–4096 bytes"
-            );
+            anyhow::ensure!(!text.trim().is_empty(), "Evaluation fields require text");
         }
         anyhow::ensure!(
             self.measurement_ms.is_none_or(|ms| ms >= 0),

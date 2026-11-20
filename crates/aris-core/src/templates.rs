@@ -151,8 +151,8 @@ pub fn list(home: &Path) -> Result<Vec<TeamTemplate>> {
 }
 pub fn save(home: &Path, mut template: TeamTemplate) -> Result<TeamTemplate> {
     ensure!(
-        !template.name.trim().is_empty() && template.name.len() <= 200,
-        "template name is required (max 200 bytes)"
+        !template.name.trim().is_empty(),
+        "template name is required"
     );
     ensure!(
         template.agents.len() <= 32 && !template.agents.is_empty(),
@@ -196,6 +196,27 @@ impl From<TeamTemplate> for TeamSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saves_and_reloads_full_template_content() {
+        let home = std::env::temp_dir().join(format!("aris-templates-{}", Uuid::new_v4()));
+        let mut template = builtins().remove(0);
+        let text = "调研任务与数据边界\n".repeat(10_000);
+        template.name = "季度调研".repeat(120);
+        template.description = text.clone();
+        template.goal = text.clone();
+        template.agents[0].prompt = text.clone();
+        let saved = save(&home, template).unwrap();
+        let reloaded = list(&home)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == saved.id)
+            .unwrap();
+        assert_eq!(reloaded.name, saved.name);
+        assert_eq!(reloaded.description, text);
+        assert_eq!(reloaded.goal, text);
+        assert_eq!(reloaded.agents[0].prompt, text);
+        fs::remove_dir_all(home).unwrap();
+    }
     #[test]
     fn every_builtin_has_valid_dependencies_and_can_be_copied() {
         let home = std::env::temp_dir().join(format!("aris-templates-{}", Uuid::new_v4()));

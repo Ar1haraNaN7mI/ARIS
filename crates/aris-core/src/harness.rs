@@ -128,7 +128,6 @@ pub struct TeamExecutionBudget {
     pub max_agent_runs: usize,
     pub max_steps_per_agent: usize,
     pub max_tool_calls_per_agent: usize,
-    pub max_context_chars: usize,
     pub max_tokens_per_step: u32,
     pub max_parallel: usize,
     pub max_runtime_secs: u64,
@@ -634,14 +633,8 @@ impl TeamStore {
         Ok(task)
     }
     pub fn create(&self, runtime: &Runtime, mut spec: TeamSpec) -> Result<Team> {
-        ensure!(
-            !spec.name.trim().is_empty() && spec.name.len() <= 200,
-            "team name is required (max 200 bytes)"
-        );
-        ensure!(
-            !spec.goal.trim().is_empty() && spec.goal.len() <= 32000,
-            "goal is required (max 32000 bytes)"
-        );
+        ensure!(!spec.name.trim().is_empty(), "team name is required");
+        ensure!(!spec.goal.trim().is_empty(), "goal is required");
         ensure!(
             !spec.agents.is_empty() && spec.agents.len() <= 32,
             "a team needs 1–32 agents"
@@ -649,14 +642,7 @@ impl TeamStore {
         validate_graph(&spec.agents)?;
         let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
         for agent in &mut spec.agents {
-            ensure!(
-                !agent.name.trim().is_empty() && agent.name.len() <= 200,
-                "agent name is required"
-            );
-            ensure!(
-                agent.prompt.len() <= 32000 && agent.role.len() <= 4000,
-                "agent instructions are too long"
-            );
+            ensure!(!agent.name.trim().is_empty(), "agent name is required");
             kei.profile(&agent.profile_id)?;
             agent.files = self.validate_files(&agent.files)?;
             spec.files.extend(agent.files.clone());
@@ -782,12 +768,10 @@ impl TeamStore {
         Ok(full)
     }
     fn capture(&self, team: &mut Team, label: &str) -> Result<()> {
-        ensure!(label.len() <= 200, "checkpoint label is too long");
         let id = new_id();
         let directory = self.directory(&team.id)?.join("snapshots").join(&id);
         fs::create_dir_all(&directory)?;
         let mut files = vec![];
-        let mut total = 0u64;
         for (index, relative) in team.files.iter().enumerate() {
             let path = self.artifact_path(relative)?;
             let exists = path.try_exists()?;
@@ -796,11 +780,7 @@ impl TeamStore {
             } else {
                 0
             };
-            total += size;
-            ensure!(
-                total <= 64 * 1024 * 1024,
-                "managed artifacts exceed 64 MiB per checkpoint"
-            );
+
             if exists {
                 fs::copy(&path, directory.join(index.to_string()))?;
             }
@@ -912,7 +892,7 @@ impl TeamStore {
                 !matches!(team.status.as_str(), "running" | "cancelling"),
                 "wait for the team to stop before handoff"
             );
-            ensure!(from != to && instruction.len() <= 32000, "invalid handoff");
+            ensure!(from != to, "invalid handoff");
             let source = team
                 .agents
                 .iter()
@@ -1081,8 +1061,7 @@ impl TeamStore {
                     "duplicate admin assignment"
                 );
                 ensure!(
-                    !assignment.instruction.trim().is_empty()
-                        && assignment.instruction.len() <= 12000,
+                    !assignment.instruction.trim().is_empty(),
                     "invalid admin assignment instructions"
                 );
                 let agent = combined
@@ -1115,11 +1094,7 @@ impl TeamStore {
                     "New roles must have an assignment"
                 );
                 ensure!(
-                    !agent.name.trim().is_empty()
-                        && agent.name.len() <= 200
-                        && !agent.role.trim().is_empty()
-                        && agent.role.len() <= 4000
-                        && agent.prompt.len() <= 12000,
+                    !agent.name.trim().is_empty() && !agent.role.trim().is_empty(),
                     "Invalid new role"
                 );
                 kei.profile(&agent.profile_id)?.resolve(
@@ -1200,7 +1175,6 @@ impl TeamStore {
                 max_agent_runs,
                 max_steps_per_agent: if compiling_delivery { 18 } else { 12 },
                 max_tool_calls_per_agent: if compiling_delivery { 40 } else { 32 },
-                max_context_chars: 64_000,
                 max_tokens_per_step: 4096,
                 max_parallel: 3,
                 max_runtime_secs: 900,
@@ -1252,10 +1226,7 @@ impl TeamStore {
         text: &str,
         cascade: bool,
     ) -> Result<Team> {
-        ensure!(
-            !text.trim().is_empty() && text.len() <= 32000,
-            "message needs 1–32000 bytes"
-        );
+        ensure!(!text.trim().is_empty(), "message is required");
         self.mutate(id, |team| {
             ensure!(team.status != "planning" && !(team.status == "cancelling" && team.admin.as_ref().is_some_and(|a| a.phase == "planning")),
                 "Wait for the admin to finish planning, or cancel it first");

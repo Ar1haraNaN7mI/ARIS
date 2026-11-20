@@ -37,7 +37,6 @@ mode = "auto"
 small_max_steps = 12
 small_tool_budget = 14
 small_context_messages = 24
-small_context_chars = 48000
 small_tool_result_max_chars = 8000
 small_max_tokens = 4096
 small_temperature = 0.1

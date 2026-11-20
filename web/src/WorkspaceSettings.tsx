@@ -101,7 +101,7 @@ function WorkspacePanel({ token }: { token: string }) {
     <section className="sc-section">
       <h3>补丁工件</h3>
       <p className="sc-description">导入 ARIS SEARCH / REPLACE 补丁，仅保存在本机。预览会验证摘要、工作区绑定和路径权限；确认应用后才修改项目文件。</p>
-      <label className="sc-field">来源名称<input className="sc-input" value={source} onChange={event => setSource(event.target.value)} maxLength={200} /></label>
+      <label className="sc-field">来源名称<input className="sc-input" value={source} onChange={event => setSource(event.target.value)} /></label>
       <label className="sc-field">补丁内容<textarea className="sc-textarea ws-mono" value={patch} onChange={event => setPatch(event.target.value)} rows={5} placeholder="*** Update File: example.txt" /></label>
       <button className="sc-button" disabled={op.busy || !workspace || !patch.trim() || !source.trim()} onClick={() => void op.run(async () => {
         await rpc(token, "cloud/import", { workspace: workspace!.workspace, source: source.trim(), text: patch });
@@ -178,7 +178,7 @@ function TasksPanel({ token, onChanged }: Omit<Props, "section">) {
   return <>
     <section className="sc-section"><h3>本机任务</h3>
       <p className="sc-description">任务由当前 ARIS 模型与工具实际执行，保留会话、状态与输出。执行权限沿用安全设置。</p>
-      <label className="sc-field">任务说明<textarea className="sc-textarea" value={prompt} onChange={event => setPrompt(event.target.value)} maxLength={16000} rows={4} placeholder="描述希望 ARIS 完成的工作…" /></label>
+      <label className="sc-field">任务说明<textarea className="sc-textarea" value={prompt} onChange={event => setPrompt(event.target.value)} rows={4} placeholder="描述希望 ARIS 完成的工作…" /></label>
       <button className="sc-button sc-primary" disabled={op.busy || !prompt.trim()} onClick={() => void op.run(async () => {
         const accepted = await rpc<Accepted>(token, "agent/turn", { prompt: prompt.trim(), wait: false });
         if (!accepted.accepted) throw new Error("服务未接受任务。");
@@ -242,8 +242,8 @@ function ReviewPanel({ token, onChanged }: Omit<Props, "section">) {
       <label className="sc-field">审查范围<select className="sc-select" value={scope} disabled={op.busy} onChange={event => { invalidate(); setScope(event.target.value); }}>
         <option value="uncommitted">未提交的已跟踪改动</option><option value="base">与指定分支或版本比较</option><option value="commit">单个提交</option>
       </select></label>
-      {scope !== "uncommitted" && <label className="sc-field">Git 引用<input className="sc-input" value={reference} disabled={op.busy} onChange={event => { invalidate(); setReference(event.target.value); }} maxLength={200} placeholder={scope === "commit" ? "提交 SHA 或 HEAD" : "main 或 origin/main"} /></label>}
-      <label className="sc-field">额外审查要求<textarea className="sc-textarea" value={instructions} disabled={op.busy} onChange={event => { invalidate(); setInstructions(event.target.value); }} maxLength={8000} rows={3} placeholder="例如：重点检查状态竞争、错误处理与回归。" /></label>
+      {scope !== "uncommitted" && <label className="sc-field">Git 引用<input className="sc-input" value={reference} disabled={op.busy} onChange={event => { invalidate(); setReference(event.target.value); }} placeholder={scope === "commit" ? "提交 SHA 或 HEAD" : "main 或 origin/main"} /></label>}
+      <label className="sc-field">额外审查要求<textarea className="sc-textarea" value={instructions} disabled={op.busy} onChange={event => { invalidate(); setInstructions(event.target.value); }} rows={3} placeholder="例如：重点检查状态竞争、错误处理与回归。" /></label>
       <button className="sc-button" disabled={op.busy || (scope !== "uncommitted" && !reference.trim())} onClick={() => void op.run(async () => {
         setPrepared(null);
         setPrepared(await rpc<PreparedReview>(token, "review/prepare", { scope, instructions: instructions.trim(), ...(scope !== "uncommitted" ? { reference: reference.trim() } : {}) }));

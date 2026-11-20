@@ -31,9 +31,11 @@ describe("Editable team templates", () => {
     fireEvent.change(screen.getByLabelText(/模板库/), { target: { value: "custom-1" } });
     expect((screen.getByLabelText("负责模型") as HTMLSelectElement).value).toBe("delivery");
     expect((screen.getByLabelText("团队目标") as HTMLTextAreaElement).value).toBe("评估渠道");
+    const goal = "保留原始实验说明和官方出处\n".repeat(3500) + "验收尾注";
+    fireEvent.change(screen.getByLabelText("团队目标"), { target: { value: goal } });
     fireEvent.click(screen.getByText("保存为可重复使用的模板"));
     fireEvent.click(screen.getByRole("button", { name: "保存为新模板" }));
-    await waitFor(() => expect(api.rpc).toHaveBeenCalledWith("token", "templates/save", expect.objectContaining({ template: expect.objectContaining({ agents: expect.arrayContaining([expect.objectContaining({ profile_id: "delivery" })]) }) })));
+    await waitFor(() => expect(api.rpc).toHaveBeenCalledWith("token", "templates/save", expect.objectContaining({ template: expect.objectContaining({ goal, agents: expect.arrayContaining([expect.objectContaining({ profile_id: "delivery" })]) }) })));
   });
   it("does not pretend models are available before gateway configuration", () => {
     render(<TeamComposer busy={false} onCreate={vi.fn()} onConfigure={vi.fn()} />);

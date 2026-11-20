@@ -252,9 +252,9 @@ fn mutate_session(runtime: &Arc<Runtime>, method: &str, params: &Value) -> RpcRe
     let _guard = mutation_guard(runtime, &id)?;
     if method == "sessions/rename" {
         let name = required_string(params, "name")?.trim();
-        if name.chars().count() > 100 || name.chars().any(char::is_control) {
+        if name.chars().any(char::is_control) {
             return Err(RpcFailure::invalid_params(
-                "name must contain 1 to 100 printable characters",
+                "name must contain printable characters",
             ));
         }
         runtime.sessions.rename(&id, name).map_err(internal)?;
@@ -620,15 +620,16 @@ mod tests {
             at,
         });
         runtime.sessions.persist_now_result(&session).unwrap();
+        let name = "中文对话".repeat(100);
         fixture
-            .call("sessions/rename", json!({"id":id,"name":"中文对话"}))
+            .call("sessions/rename", json!({"id":id,"name":name}))
             .unwrap();
         fixture.call("sessions/archive", json!({"id":id})).unwrap();
         let reopened = SessionStore::with_dir(runtime.outer_home.join("sessions"));
         assert!(reopened.get_or_load(&id).unwrap().read().archived);
         assert_eq!(
             reopened.get_or_load(&id).unwrap().read().name.as_deref(),
-            Some("中文对话")
+            Some(name.as_str())
         );
         let stats = fixture.call("settings/get", json!({})).unwrap();
         assert_eq!(stats["storage"]["archived_count"], 1);

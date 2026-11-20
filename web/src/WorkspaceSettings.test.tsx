@@ -32,10 +32,13 @@ describe("ARIS workspace settings", () => {
   it("submits a real task and displays the persisted assistant output", async () => {
     const onChanged = vi.fn();
     render(<WorkspaceSettings token="fixture-token" section="tasks" onChanged={onChanged} />);
-    fireEvent.change(screen.getByLabelText("任务说明"), { target: { value: "  Verify this fixture  " } });
+    const prompt = "按原文核对并保留证据\n".repeat(3000) + "完整终点";
+    const field = screen.getByLabelText("任务说明");
+    expect(field.hasAttribute("maxlength")).toBe(false);
+    fireEvent.change(field, { target: { value: "  " + prompt + "  " } });
     fireEvent.click(screen.getByRole("button", { name: "开始任务" }));
     expect(await screen.findByText("Fixture review completed.")).toBeTruthy();
-    expect(api.rpc).toHaveBeenCalledWith("fixture-token", "agent/turn", { prompt: "Verify this fixture", wait: false });
+    expect(api.rpc).toHaveBeenCalledWith("fixture-token", "agent/turn", { prompt, wait: false });
     expect(onChanged).toHaveBeenCalled();
   });
 
@@ -61,12 +64,16 @@ describe("ARIS workspace settings", () => {
     render(<WorkspaceSettings token="fixture-token" section="review" />);
     fireEvent.change(screen.getByLabelText("审查范围"), { target: { value: "commit" } });
     fireEvent.change(screen.getByLabelText("Git 引用"), { target: { value: "HEAD" } });
+    const instructions = "核查每条证据\n".repeat(3000) + "完整终点";
+    const input = screen.getByLabelText("额外审查要求");
+    expect(input.hasAttribute("maxlength")).toBe(false);
+    fireEvent.change(input, { target: { value: instructions } });
     fireEvent.click(screen.getByRole("button", { name: "读取审查差异" }));
     expect(await screen.findByLabelText("审查差异")).toHaveProperty("textContent", prepared.diff);
     expect(api.rpc).not.toHaveBeenCalledWith("fixture-token", "agent/turn", expect.anything());
     fireEvent.click(screen.getByRole("button", { name: "开始代码审查" }));
     expect(await screen.findByText("Fixture review completed.")).toBeTruthy();
-    expect(api.rpc).toHaveBeenCalledWith("fixture-token", "review/prepare", { scope: "commit", reference: "HEAD", instructions: "" });
+    expect(api.rpc).toHaveBeenCalledWith("fixture-token", "review/prepare", { scope: "commit", reference: "HEAD", instructions });
     expect(api.rpc).toHaveBeenCalledWith("fixture-token", "agent/turn", { prompt: prepared.prompt, wait: false });
   });
 

@@ -94,7 +94,7 @@ export function TeamComposer({ token, config, busy, onCreate, onConfigure, initi
     <div className="template-library"><label className="aris-field">模板库 <small>载入后可以自由修改每位智能体</small><select value={templateId} onChange={(e) => loadTemplate(e.target.value)}><option value="">选择实用模板或已保存的团队…</option>{[...new Set(templates.map((t) => t.category))].map((category) => <optgroup key={category} label={category}>{templates.filter((t) => t.category === category).map((t) => <option key={t.id} value={t.id}>{t.name} · {t.agents.length} 位智能体</option>)}</optgroup>)}</select></label>{templates.find((t) => t.id === templateId)?.description && <p className="subtle">{templates.find((t) => t.id === templateId)?.description}</p>}</div>
     {templateError && <div className="aris-error" role="alert">{templateError}</div>}
     {templateNotice && <p className="aris-success" role="status">{templateNotice}</p>}
-    <label className="aris-field">任务名称<input value={name} onChange={(e) => setName(e.target.value)} maxLength={100} placeholder="例如：新产品发布调研" /></label>
+    <label className="aris-field">任务名称<input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：新产品发布调研" /></label>
     <label className="aris-field">团队目标<textarea required rows={3} value={goal} onChange={(e) => setGoal(e.target.value)} placeholder="描述你要完成的事、已有资料，以及怎样才算完成…" /></label>
     <div className="aris-split-heading"><h2>分工与依赖</h2><span className="subtle">最多 32 位智能体 · 每批最多 8 位并行</span></div>
     {!profiles.length && <div className="aris-info">先配置 KEI API 模型档案，再为团队分配模型。<button type="button" onClick={onConfigure}>配置模型 <ArrowRightIcon /></button></div>}

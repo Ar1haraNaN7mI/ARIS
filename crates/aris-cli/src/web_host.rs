@@ -195,7 +195,7 @@ struct Request {
     body: Vec<u8>,
 }
 
-async fn read_request(socket: &mut TcpStream) -> Result<Request> {
+async fn read_headers(socket: &mut TcpStream) -> Result<(Request, usize)> {
     let mut bytes = Vec::new();
     let boundary = loop {
         let mut chunk = [0u8; 2048];
@@ -237,23 +237,38 @@ async fn read_request(socket: &mut TcpStream) -> Result<Request> {
         .map(|v| v.parse::<usize>())
         .transpose()?
         .unwrap_or(0);
-    if length > 1024 * 1024 {
-        bail!("request body too large");
-    }
-    while bytes.len() < boundary + length {
-        let mut chunk = [0u8; 2048];
-        let n = socket.read(&mut chunk).await?;
+    let mut body = bytes.split_off(boundary);
+    body.truncate(length);
+    Ok((
+        Request {
+            method,
+            path,
+            headers,
+            body,
+        },
+        length,
+    ))
+}
+
+async fn read_body(socket: &mut TcpStream, request: &mut Request, length: usize) -> Result<()> {
+    let mut chunk = [0u8; 16 * 1024];
+    while request.body.len() < length {
+        let remaining = (length - request.body.len()).min(chunk.len());
+        let n = tokio::time::timeout(
+            Duration::from_secs(10),
+            socket.read(&mut chunk[..remaining]),
+        )
+        .await??;
         if n == 0 {
             bail!("incomplete body");
         }
-        bytes.extend_from_slice(&chunk[..n]);
+        request
+            .body
+            .try_reserve(n)
+            .context("request body allocation failed")?;
+        request.body.extend_from_slice(&chunk[..n]);
     }
-    Ok(Request {
-        method,
-        path,
-        headers,
-        body: bytes[boundary..boundary + length].to_vec(),
-    })
+    Ok(())
 }
 
 async fn response(socket: &mut TcpStream, code: u16, kind: &str, body: &[u8]) -> Result<()> {
@@ -513,11 +528,58 @@ fn static_asset(root: &Path, raw: &str) -> Result<Option<(String, Vec<u8>)>> {
 }
 
 async fn handle(mut socket: TcpStream, host: Arc<Host>) -> Result<()> {
-    let request =
-        match tokio::time::timeout(Duration::from_secs(10), read_request(&mut socket)).await {
+    let (mut request, length) =
+        match tokio::time::timeout(Duration::from_secs(10), read_headers(&mut socket)).await {
             Ok(Ok(r)) => r,
             _ => return json_response(&mut socket, 400, json!({"error":"Invalid request"})).await,
         };
+    let rpc = host.runtime.is_some()
+        && request.method == "POST"
+        && request.path.split('?').next() == Some("/api/harness/rpc");
+    if rpc {
+        // Authenticate from headers before accepting a potentially long prompt.
+        // The normal access check below also rechecks the lock after the upload.
+        if !allowed(&request, &host) {
+            return json_response(
+                &mut socket,
+                403,
+                json!({"error":"Local same-origin request required"}),
+            )
+            .await;
+        }
+        let hash =
+            match crate::web_access::load(&host.outer_home) {
+                Ok(hash) => hash,
+                Err(_) => return json_response(
+                    &mut socket,
+                    503,
+                    json!({"error":{"code":"access_unavailable","message":"无法读取本地访问设置"}}),
+                )
+                .await,
+            };
+        if !host
+            .access
+            .lock()
+            .await
+            .unlocked(hash.as_deref(), session_cookie(&request, &host))
+        {
+            return access_locked(&mut socket).await;
+        }
+    } else if length > 1024 * 1024 {
+        return json_response(&mut socket, 400, json!({"error":"Invalid request"})).await;
+    }
+    let body = read_body(&mut socket, &mut request, length);
+    let read_ok = if rpc {
+        body.await.is_ok()
+    } else {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), body).await,
+            Ok(Ok(()))
+        )
+    };
+    if !read_ok {
+        return json_response(&mut socket, 400, json!({"error":"Invalid request body"})).await;
+    }
     // Cross-site top-level navigation is expected only on this PKCE/state-bound
     // callback. All other local APIs retain same-origin and token checks.
     if request.method == "GET"
@@ -1708,6 +1770,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_rpc_receives_full_large_body_and_rejects_bad_origin_before_upload() {
+        let server = harness(None).await;
+        let host = &server.host;
+        let name = format!("{}末尾", "长文".repeat(200_000));
+        let created = rpc(host, "sessions/create", json!({"name":name})).await;
+        assert_eq!(
+            created["result"]["session"]["name"].as_str(),
+            Some(name.as_str())
+        );
+
+        let mut socket = TcpStream::connect(&host.authority).await.unwrap();
+        let headers = format!("POST /api/harness/rpc HTTP/1.1\r\nHost: {}\r\nOrigin: https://elsewhere.invalid\r\nX-Aris-Token: {}\r\nContent-Length: 5000000\r\n\r\n", host.authority, host.token);
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
     async fn harness_http_exposes_real_state_and_rejects_unauthenticated_writes() {
         let server = harness(None).await;
         let host = &server.host;
@@ -1799,7 +1883,8 @@ mod tests {
         let mock_task = tokio::spawn(async move {
             for suffix in ["one", "two"] {
                 let (mut socket, _) = mock.accept().await.unwrap();
-                let request = read_request(&mut socket).await.unwrap();
+                let (mut request, length) = read_headers(&mut socket).await.unwrap();
+                read_body(&mut socket, &mut request, length).await.unwrap();
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 assert!(body["messages"]
                     .as_array()

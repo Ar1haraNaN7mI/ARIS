@@ -71,8 +71,8 @@ pub use scheduler::{SchedulerSnapshot, TaskScheduler};
 pub use session::{Session, SessionEvent, SessionStore, SESSION_SCHEMA_VERSION};
 pub use settings::{
     load_settings, personality_prompt, save_settings, CharacteristicLevel,
-    PersonalityCharacteristics, SessionSettings, SettingsPatch, CUSTOM_INSTRUCTIONS_MAX_CHARS,
-    PERSONALITIES, PETS, STATUSLINE_FIELDS, THEMES, TITLE_FIELDS,
+    PersonalityCharacteristics, SessionSettings, SettingsPatch, PERSONALITIES, PETS,
+    STATUSLINE_FIELDS, THEMES, TITLE_FIELDS,
 };
 pub use startup_profile::{
     load_startup_profile, save_startup_profile, update_startup_profile, StartupProfile, VisualStyle,
@@ -878,7 +878,7 @@ mod tests {
         let before = runtime.prompt.read().render();
         assert!(runtime
             .update_settings(SettingsPatch {
-                custom_instructions: Some("x".repeat(CUSTOM_INSTRUCTIONS_MAX_CHARS + 1)),
+                custom_instructions: Some("invalid\0control".into()),
                 ..Default::default()
             })
             .is_err());

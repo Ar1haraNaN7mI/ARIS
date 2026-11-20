@@ -22,7 +22,6 @@ use uuid::Uuid;
 
 pub use aris_protocol::CloudArtifact;
 pub const ARTIFACT_SCHEMA_VERSION: u16 = CLOUD_ARTIFACT_SCHEMA_VERSION;
-pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutcome {
@@ -121,9 +120,6 @@ impl CloudProvider for RemoteCloudProvider {
     async fn import(&self, workspace: &Path, source_path: &Path) -> Result<CloudArtifact> {
         let text = fs::read_to_string(source_path)
             .with_context(|| format!("read cloud artifact source {}", source_path.display()))?;
-        if text.len() > MAX_ARTIFACT_BYTES {
-            bail!("cloud artifact source exceeds {} bytes", MAX_ARTIFACT_BYTES);
-        }
         self.client
             .lock()
             .await
@@ -182,9 +178,6 @@ pub fn import_artifact(
 ) -> Result<CloudArtifact> {
     let text = fs::read_to_string(source_path)
         .with_context(|| format!("read cloud artifact source {}", source_path.display()))?;
-    if text.len() > MAX_ARTIFACT_BYTES {
-        bail!("cloud artifact source exceeds {} bytes", MAX_ARTIFACT_BYTES);
-    }
     import_artifact_text(
         outer_home,
         workspace,
@@ -201,9 +194,6 @@ pub fn import_artifact_text(
     text: String,
 ) -> Result<CloudArtifact> {
     let source_name = source_name.into();
-    if text.len() > MAX_ARTIFACT_BYTES {
-        bail!("cloud artifact source exceeds {} bytes", MAX_ARTIFACT_BYTES);
-    }
     let (patch, source) = match serde_json::from_str::<CloudArtifact>(&text) {
         Ok(document) if !document.patch.trim().is_empty() => {
             if document.schema_version > ARTIFACT_SCHEMA_VERSION {

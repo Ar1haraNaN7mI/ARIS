@@ -40,18 +40,20 @@ pub(crate) async fn propose(runtime: &Runtime, params: &Value) -> Result<Value> 
         "Invalid problem identifier"
     );
     for s in [&req.context, &req.objective] {
-        ensure!(
-            !s.trim().is_empty() && s.len() <= 4096,
-            "Supply a context and objective of 1–4096 bytes"
-        );
+        ensure!(!s.trim().is_empty(), "Supply a context and objective");
     }
     let history = runtime.learn.recall_experiments(&req.problem);
-    let clip = |s: &str| s.chars().take(320).collect::<String>();
-    let evidence: Vec<_> = history.iter().take(12).map(|e| json!({
-        "id":e.id, "edit":clip(&e.edit), "rationale":clip(&e.rationale),
-        "prediction":clip(&e.prediction), "context":clip(&e.context), "observed":clip(&e.observation),
-        "passed":e.passed, "measurement_ms":e.measurement_ms
-    })).collect();
+    let evidence: Vec<_> = history
+        .iter()
+        .take(12)
+        .map(|e| {
+            json!({
+                "id":e.id, "edit":e.edit, "rationale":e.rationale,
+                "prediction":e.prediction, "context":e.context, "observed":e.observation,
+                "passed":e.passed, "measurement_ms":e.measurement_ms
+            })
+        })
+        .collect();
     let config = crate::team_planner::optimizer_config(runtime)?;
     let model = config.model.clone();
     let messages = [
@@ -73,10 +75,7 @@ pub(crate) async fn propose(runtime: &Runtime, params: &Value) -> Result<Value> 
         &selected.alternative,
         &selected.evaluation,
     ] {
-        ensure!(
-            !s.trim().is_empty() && s.len() <= 4096,
-            "Proposal fields must be 1–4096 bytes"
-        );
+        ensure!(!s.trim().is_empty(), "Proposal fields must contain text");
     }
     let proposal = HarnessProposal {
         id: format!("proposal/{}", uuid::Uuid::new_v4()),

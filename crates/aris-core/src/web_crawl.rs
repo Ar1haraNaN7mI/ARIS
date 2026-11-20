@@ -47,7 +47,7 @@ impl ToolHandler for WebCrawl {
                 "mode":{"type":"string","enum":["static","dynamic"]},
                 "max_pages":{"type":"integer","minimum":1,"maximum":10},
                 "max_depth":{"type":"integer","minimum":0,"maximum":3},
-                "max_chars":{"type":"integer","minimum":1000,"maximum":60000},
+                "max_chars":{"type":"integer","minimum":1,"description":"Optional excerpt length across all pages. Omit to collect full page text."},
                 "timeout_secs":{"type":"integer","minimum":1,"maximum":60},
                 "css_selector":{"type":"string","minLength":1,"maxLength":512}
             },"required":["url"],"additionalProperties":false
@@ -113,8 +113,8 @@ impl ToolHandler for WebCrawl {
             .stderr
             .take()
             .context("Scrapling stderr unavailable")?;
-        let output_task = tokio::spawn(read_bounded(stdout, 1024 * 1024));
-        let error_task = tokio::spawn(read_bounded(stderr, 64 * 1024));
+        let output_task = tokio::spawn(read_output(stdout));
+        let error_task = tokio::spawn(read_output(stderr));
         let mut cancel = ctx.cancel.clone();
         let seconds = args
             .get("timeout_secs")
@@ -158,16 +158,9 @@ impl ToolHandler for WebCrawl {
     }
 }
 
-async fn read_bounded(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
+async fn read_output(mut reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    anyhow::ensure!(
-        bytes.len() <= limit,
-        "Scrapling output exceeds {limit} bytes"
-    );
+    reader.read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -216,6 +209,11 @@ mod tests {
     fn crawler_bounds_and_urls_are_validated() {
         let tool = WebCrawl;
         let definition = tool.definition();
+        assert!(aris_tools::validate_tool_arguments(
+            &definition,
+            &json!({"url":"https://example.com","max_chars":2_000_000})
+        )
+        .is_ok());
         for args in [
             json!({"url":"https://example.com","max_pages":100}),
             json!({"url":"https://example.com","max_depth":9}),

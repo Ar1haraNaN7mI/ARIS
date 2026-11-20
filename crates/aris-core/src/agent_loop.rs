@@ -2,9 +2,7 @@ use crate::session::{Session, SessionEvent};
 use crate::task::EventStore;
 use crate::verification::verify_goal;
 use crate::worker::RunLease;
-use crate::{
-    compact_tool_description, compact_tool_result, compact_tool_schema, select_tools_for_query,
-};
+use crate::{compact_tool_description, compact_tool_schema, select_tools_for_query};
 use crate::{ApprovalScope, Runtime};
 use anyhow::Context;
 use aris_llm::{FinishReason, LlmEvent, LlmRequestOptions, ToolFunctionSpec, ToolSpec};
@@ -721,20 +719,13 @@ async fn run_turn_inner(
     let mut missing_files = Vec::<String>::new();
     let mut check_written_files = false;
     let mut documents_ready = false;
-    let context_chars = if execution_limits.is_some() {
-        Some(model_policy.context_chars.unwrap_or(64_000).min(64_000))
-    } else {
-        model_policy.context_chars
-    };
     let context_messages = if execution_limits.is_some() {
         Some(model_policy.context_messages.unwrap_or(32).min(32))
     } else {
         model_policy.context_messages
     };
-    let system_limit = context_chars.map(|chars| (chars / 3).max(2_048));
-    let message_limit =
-        context_chars.map(|chars| chars.saturating_sub(system_limit.unwrap_or(0)).max(2_048));
-    let system = turn_prompt.render_with_limit(system_limit);
+    let system = turn_prompt.render();
+    let mut indexed_messages = HashMap::new();
     let mut tool_calls_used = 0usize;
 
     for _step in 0..max_steps {
@@ -779,28 +770,18 @@ async fn run_turn_inner(
             }
             check_written_files = false;
         }
-        let conversation_limit = message_limit.map(|limit| {
-            limit
-                .saturating_sub(
-                    peer_context
-                        .as_ref()
-                        .map_or(0, |context| context.chars().count()),
-                )
-                .max(2_048)
-        });
         let mut messages = session.read().derive_messages_with_budget(
             &system,
             context_messages,
-            conversation_limit,
+            None,
             model_policy.thinking.unwrap_or(base_llm_config.thinking),
         );
         // Crawled pages and long tool batches can evict the current user turn
         // from the bounded history. Keep the actual commission (including its
         // source deliveries) in front of the surviving tool conversation.
-        if team_worker
-            && !messages
-                .iter()
-                .any(|message| message.role == aris_llm::Role::User && message.text() == user_text)
+        if !messages
+            .iter()
+            .any(|message| message.role == aris_llm::Role::User && message.text() == user_text)
         {
             messages.insert(1, aris_llm::ChatMessage::user(user_text.clone()));
         }
@@ -843,18 +824,19 @@ async fn run_turn_inner(
                 .into_iter()
                 .filter(|definition| team_worker || definition.name != "agent_tunnel")
                 .collect();
-            let worker_tools: Vec<_> = definitions
+            let required_tools: Vec<_> = definitions
                 .iter()
                 .filter(|definition| {
-                    team_worker
-                        && (definition.name == "agent_tunnel"
-                            || (output_check.is_some() && definition.name == "write_file"))
+                    definition.name == "read_file"
+                        || team_worker
+                            && (definition.name == "agent_tunnel"
+                                || (output_check.is_some() && definition.name == "write_file"))
                 })
                 .cloned()
                 .collect();
             let mut definitions =
                 select_tools_for_query(&definitions, &user_text, model_policy.tool_budget);
-            for required in worker_tools {
+            for required in required_tools {
                 if !definitions
                     .iter()
                     .any(|definition| definition.name == required.name)
@@ -897,6 +879,27 @@ async fn run_turn_inner(
             tool_specs.clone()
         };
         let mut cancel_for_llm = cancel_rx.clone();
+        if tool_specs
+            .iter()
+            .any(|spec| spec.function.name == "read_file")
+        {
+            // This is a packing preference, not an admission limit. The ledger holds
+            // the exact original, and the model can read every referenced page.
+            let input_page = usize::try_from(base_llm_config.max_tokens)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(32);
+            let tool_page = model_policy
+                .tool_result_max_chars
+                .unwrap_or(runtime.config.agent.tool_result_max_chars);
+            index_long_messages(
+                &runtime,
+                &session_id,
+                &mut messages,
+                input_page,
+                tool_page,
+                &mut indexed_messages,
+            )?;
+        }
         let request_options = if model_policy.max_tokens.is_some()
             || model_policy.temperature.is_some()
             || model_policy.thinking.is_some()
@@ -1208,27 +1211,7 @@ async fn run_turn_inner(
                 }
             };
 
-            let mut content = tool_result.content.clone();
-            let max = model_policy
-                .tool_result_max_chars
-                .unwrap_or(runtime.config.agent.tool_result_max_chars);
-            if content.chars().count() > max && name.starts_with("computer_") {
-                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let screenshot = value.get("screenshot").cloned();
-                    let text = value
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    value = json!({"text": truncate_chars(text, max.saturating_sub(1024)), "screenshot": screenshot, "truncated":true});
-                    content = value.to_string();
-                }
-            } else if name != "agent_tunnel" && content.chars().count() > max {
-                content = if model_policy.compact_tool_results {
-                    compact_tool_result(&content, max)
-                } else {
-                    truncate_chars(&content, max)
-                };
-            }
+            let content = tool_result.content.clone();
 
             session.write().append(SessionEvent::ToolResult {
                 id: Uuid::new_v4().to_string(),
@@ -1511,10 +1494,77 @@ fn prepare_turn_cognition(
     snapshot.ticks.into_iter().map(|t| (t.t, t.note)).collect()
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    out.push_str("\n…[truncated]");
-    out
+fn index_long_messages(
+    runtime: &Runtime,
+    session_id: &str,
+    messages: &mut [aris_llm::ChatMessage],
+    input_page: usize,
+    tool_page: usize,
+    cache: &mut HashMap<[u8; 32], String>,
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut evidence_reads = std::collections::HashSet::new();
+    for message in messages {
+        for call in message.tool_calls.iter().flatten() {
+            let Some(id) = &call.id else { continue };
+            // Gateways may reuse call IDs in later turns. Follow actual native
+            // calls in sequence; an arbitrary tool's output cannot impersonate a read.
+            evidence_reads.remove(id);
+            let Some(function) = &call.function else {
+                continue;
+            };
+            if function.name.as_deref() != Some("read_file") {
+                continue;
+            }
+            let Some(args) = function
+                .arguments
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            else {
+                continue;
+            };
+            if let Some(path) = args["path"].as_str() {
+                let path = std::path::Path::new(path);
+                let path = path.strip_prefix(&runtime.workspace_root).unwrap_or(path);
+                if path.starts_with(".aris/evidence") {
+                    evidence_reads.insert(id.clone());
+                }
+            }
+        }
+        if message.role == aris_llm::Role::Tool
+            && message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| evidence_reads.remove(id))
+        {
+            // The page is already the transport representation. A Chinese page,
+            // JSON escaping or read_file's line numbers can exceed the inline
+            // preference even when the caller requests exactly one line.
+            continue;
+        }
+        let inline = match message.role {
+            aris_llm::Role::Tool => tool_page,
+            aris_llm::Role::User => input_page,
+            _ => continue,
+        };
+        let Some(aris_llm::ContentPart::Text(body)) = &mut message.content else {
+            continue;
+        };
+        if inline == 0 || body.len() <= inline {
+            continue;
+        }
+        let key: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+        let view = match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let reference = crate::synthesis::index_context_text(runtime, session_id, body)?;
+                let opening: String = body.chars().take(320).collect();
+                entry.insert(format!("Complete text available via read_file. Read the referenced JSONL pages in order (offset and limit count lines); use each record's text to retrieve the original.\n{reference}\nOpening excerpt:\n{opening}"))
+            }
+        };
+        body.clone_from(view);
+    }
+    Ok(())
 }
 
 fn record_event(
@@ -1647,6 +1697,61 @@ async fn execute_tool_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_file_returns_indexed_unicode_pages_to_the_model_without_reindexing() {
+        let fixture = crate::tests::RuntimeFixture::new(crate::SessionSettings::default(), false);
+        let rt = &fixture.runtime;
+        let guard = aris_fs::PathGuard::new(aris_fs::PathGuardConfig {
+            workspace_root: rt.workspace_root.clone(),
+            outer_home: rt.outer_home.clone(),
+            workspace_outer: rt.workspace_outer.clone(),
+            deny_core_writes: true,
+            deny_patterns: vec![],
+        })
+        .unwrap();
+        crate::register_builtin_tools(&rt.tools, Arc::new(aris_fs::FsService::new(guard)));
+        let session = rt.sessions.create();
+        let id = session.read().id.clone();
+        let original = format!("{}报告尾部", "中\"\\".repeat(1100));
+        let mut cache = HashMap::new();
+        let mut user = vec![aris_llm::ChatMessage::user(original.clone())];
+        index_long_messages(rt, &id, &mut user, 512, 512, &mut cache).unwrap();
+        let index: serde_json::Value =
+            serde_json::from_str(user[0].text().lines().nth(1).unwrap()).unwrap();
+        let ctx = aris_tools::ToolContext {
+            agent_id: id.clone(),
+            cwd: rt.workspace_root.clone(),
+            outer_home: rt.outer_home.clone(),
+            workspace_outer: rt.workspace_outer.clone(),
+            cancel: watch::channel(false).1,
+        };
+        let reader = rt.tools.get("read_file").unwrap();
+        let mut recovered = String::new();
+        for n in 1..=index["part_count"].as_u64().unwrap() {
+            let args = json!({"path":index["content_path"],"offset":n,"limit":1});
+            let page = reader.call(args.clone(), &ctx).await.unwrap();
+            assert!(page.len() > 512);
+            let mut call = aris_llm::ChatMessage::assistant("");
+            call.tool_calls = Some(vec![serde_json::from_value(json!({
+                "index":0,"id":"same-provider-id","type":"function",
+                "function":{"name":"read_file","arguments":args.to_string()}
+            }))
+            .unwrap()]);
+            let mut messages = vec![
+                call,
+                aris_llm::ChatMessage::tool_result("same-provider-id", page.clone()),
+            ];
+            index_long_messages(rt, &id, &mut messages, 512, 512, &mut cache).unwrap();
+            let delivered = messages[1].text();
+            assert_eq!(delivered, page);
+            let (_, record) = delivered.lines().next().unwrap().split_once('|').unwrap();
+            let record: serde_json::Value = serde_json::from_str(record).unwrap();
+            recovered.push_str(record["text"].as_str().unwrap());
+        }
+        assert_eq!(recovered, original);
+        assert_eq!(cache.len(), 1);
+    }
 
     #[tokio::test]
     async fn cognition_drops_stale_memory_when_existing_tui_toggle_changes() {

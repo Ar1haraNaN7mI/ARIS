@@ -74,7 +74,7 @@ def fetch(url, mode, timeout, scope, selector):
 
         kwargs = dict(headless=True, timeout=timeout * 1000, retries=1, load_dom=True,
                       google_search=False, page_setup=setup, network_idle=False,
-                      wait=100, selector_config={"huge_tree": False})
+                      wait=100, selector_config={"huge_tree": True})
         if executable := os.environ.get("ARIS_SCRAPLING_BROWSER"):
             kwargs["executable_path"] = executable
         if selector:
@@ -94,7 +94,7 @@ def fetch(url, mode, timeout, scope, selector):
             raise TimeoutError("Page redirect timeout")
         response = Fetcher.get(current, timeout=remaining, retries=1, follow_redirects=False,
                                stealthy_headers=False, headers={"User-Agent": "ARIS/0.1 (Scrapling)"},
-                               selector_config={"huge_tree": False})
+                               selector_config={"huge_tree": True})
         if response.status not in (301, 302, 303, 307, 308):
             return response
         headers = {key.lower(): value for key, value in response.headers.items()}
@@ -116,7 +116,9 @@ def crawl(options):
         raise ValueError("mode must be static or dynamic")
     max_pages = integer(options, "max_pages", 3, 1, 10)
     depth_limit = integer(options, "max_depth", 1, 0, 3)
-    max_chars = integer(options, "max_chars", 20000, 1000, 60000)
+    max_chars = options.get("max_chars")
+    if max_chars is not None and (isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 1):
+        raise ValueError("max_chars must be a positive integer")
     timeout = integer(options, "timeout_secs", 45, 1, 60)
     selector = options.get("css_selector")
     if selector is not None and (not isinstance(selector, str) or not selector or len(selector) > 512):
@@ -150,22 +152,19 @@ def crawl(options):
                 failures.append({"url": current, "source_url": source_url, "fetched_at": fetched_at,
                                  "category": "http_error", "status": response.status, "message": f"HTTP {response.status}"})
                 continue
-            if len(response.body) > 2 * 1024 * 1024:
-                failures.append({"url": current, "fetched_at": fetched_at, "category": "body_too_large", "message": "Page body exceeds 2 MiB"})
-                continue
             if content_type and not any(kind in content_type.lower() for kind in ("text/html", "application/xhtml", "text/plain")):
                 failures.append({"url": current, "fetched_at": fetched_at, "category": "unsupported_content", "message": content_type[:160]})
                 continue
             markdown = response.markdown(main_content_only=True, css_selector=selector)
-            available = max_chars - chars
-            truncated = len(markdown) > available
-            markdown = markdown[:available]
+            truncated = max_chars is not None and len(markdown) > max_chars - chars
+            if truncated:
+                markdown = markdown[:max_chars - chars]
             chars += len(markdown)
             pages.append({"url": current, "source_url": source_url, "fetched_at": fetched_at,
                           "depth": depth, "status": response.status,
-                          "title": (response.css("title::text").get() or "")[:512],
+                          "title": response.css("title::text").get() or "",
                           "markdown": markdown, "truncated": truncated})
-            if chars >= max_chars:
+            if truncated:
                 reason = "character_limit"
                 break
             if depth < depth_limit:
@@ -177,6 +176,9 @@ def crawl(options):
                     if origin(link) == scope and link not in scheduled and len(scheduled) < 1000:
                         scheduled.add(link)
                         queue.append((link, depth + 1))
+            if max_chars is not None and chars >= max_chars and queue:
+                reason = "character_limit"
+                break
         except Exception as error:
             failures.append({"url": current, "fetched_at": fetched_at,
                              "category": classify(error), "message": str(error)[:800]})

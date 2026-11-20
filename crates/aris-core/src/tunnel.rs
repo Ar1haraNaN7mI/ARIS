@@ -15,8 +15,6 @@ use uuid::Uuid;
 const MAX_TUNNELS: usize = 8;
 const MAX_ACTIVE_PER_AGENT: usize = 2;
 const MAX_MESSAGES: usize = 16;
-const MAX_MESSAGE_CHARS: usize = 2048;
-const MAX_TRANSCRIPT_CHARS: usize = 16_384;
 const MAX_FOLLOWUPS_PER_AGENT: u8 = 2;
 pub(crate) const MAX_FOLLOWUPS: usize = 8;
 
@@ -163,23 +161,10 @@ fn append(
     reply_to: Option<String>,
     resume_on_reply: bool,
 ) -> Result<()> {
-    ensure!(
-        !body.trim().is_empty() && body.chars().count() <= MAX_MESSAGE_CHARS,
-        "Message needs 1–2048 characters"
-    );
+    ensure!(!body.trim().is_empty(), "Message must contain text");
     ensure!(
         tunnel.messages.len() < MAX_MESSAGES,
         "Tunnel message limit reached; close it with the unresolved result"
-    );
-    ensure!(
-        tunnel
-            .messages
-            .iter()
-            .map(|message| message.text.chars().count())
-            .sum::<usize>()
-            + body.chars().count()
-            <= MAX_TRANSCRIPT_CHARS,
-        "Tunnel transcript limit reached; close it with the unresolved result"
     );
     let peer = tunnel
         .participants
@@ -314,10 +299,6 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         let index = if address_peer {
             let to = text(args, "to")?;
             let topic = text(args, "topic")?;
-            ensure!(
-                topic.chars().count() <= 160,
-                "Topic must be at most 160 characters"
-            );
             ensure!(to != actor.agent_id, "A tunnel needs two different workers");
             let peer = team
                 .agents
@@ -459,10 +440,6 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             "close" => {
                 let reason = optional_text(args, "text")
                     .unwrap_or("Closed by a participant without a joint decision");
-                ensure!(
-                    reason.chars().count() <= MAX_MESSAGE_CHARS,
-                    "Close reason is too long"
-                );
                 tunnel.status = "closed".into();
                 tunnel.close_reason = Some(reason.into());
                 tunnel.updated_at = now();
@@ -1111,6 +1088,28 @@ mod tests {
             completed.tunnel_turns.is_empty(),
             "accept cannot start a reciprocal loop"
         );
+    }
+
+    #[test]
+    fn both_participants_read_complete_long_messages_after_reopen() {
+        let (fixture, team, _lease) = setup();
+        let runtime = &fixture.runtime;
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        let topic = "预算复核".repeat(100);
+        let body = format!("{}\nEND-OF-EVIDENCE", "上游数据🧭\n".repeat(10_000));
+        let opened = perform(
+            runtime,
+            &a,
+            &json!({"action":"open","to":"b","topic":topic,"text":body}),
+        )
+        .unwrap();
+        let read = json!({"action":"read","tunnel_id":opened["tunnel"]["id"]});
+        for actor in [&a, &b] {
+            let thread = perform(runtime, actor, &read).unwrap();
+            assert_eq!(thread["tunnels"][0]["topic"], topic);
+            assert_eq!(thread["tunnels"][0]["messages"][0]["text"], body);
+        }
     }
 
     #[test]

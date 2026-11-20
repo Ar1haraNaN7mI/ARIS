@@ -146,7 +146,7 @@ export class BrowserRuntime {
         break;
       }
       case "type":
-        if (typeof request.text !== "string" || request.text.length > 16_384) throw new Error("type requires text up to 16384 characters");
+        if (typeof request.text !== "string") throw new Error("type requires text");
         await page.keyboard.insertText(request.text);
         break;
       case "keypress":
@@ -201,7 +201,7 @@ export class BrowserRuntime {
     const screenshot = await page.screenshot({ type: "png", fullPage: false });
     if (screenshot.length > 8 * 1024 * 1024) throw new Error("Screenshot exceeds 8 MiB");
     return { agent_id: session.agent_id, page_id: session.current, url: page.url(), title: await page.title(),
-      content_kind: "untrusted_browser_observation", text: text.slice(0, 12_000), nodes,
+      content_kind: "untrusted_browser_observation", text, nodes,
       coordinate_space: "viewport_css_pixels", viewport: { width: 1440, height: 900 },
       pointer: session.pointer, screenshot: { mime: "image/png", width: 1440, height: 900, image_base64: screenshot.toString("base64") } };
   }

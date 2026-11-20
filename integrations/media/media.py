@@ -255,7 +255,7 @@ def poster_render(root, args):
         kind = element.get("type")
         if kind == "text":
             text = element.get("text", "")
-            require(isinstance(text, str) and 0 < len(text) <= 2000, "Text must contain 1 to 2000 characters")
+            require(isinstance(text, str) and bool(text), "Text is required")
             size = integer(element.get("font_size", 48), 8, 512, "font_size")
             font, font_source = poster_font(root, element, text, size, ImageFont)
             fonts_used[font_source] = {"path": font_source, "family": font.getname()[0], "style": font.getname()[1]}
@@ -301,7 +301,7 @@ def image_generate(root, args, provider):
             "Invalid image provider API base", "invalid_configuration")
     output = local_path(root, args.get("output"), {".png"}, True)
     prompt = args.get("prompt", "")
-    require(isinstance(prompt, str) and 1 <= len(prompt) <= 16000, "prompt must contain 1 to 16000 characters")
+    require(isinstance(prompt, str) and bool(prompt), "prompt is required")
     protocol = provider.get("protocol", "images")
     require(protocol in ("images", "responses"), "Unknown image provider protocol", "invalid_configuration")
     options = {}
@@ -396,9 +396,7 @@ def dispatch(envelope):
 
 def main():
     try:
-        raw = sys.stdin.buffer.read(256 * 1024 + 1)
-        require(len(raw) <= 256 * 1024, "Media request exceeds 256 KiB")
-        result = dispatch(json.loads(raw))
+        result = dispatch(json.load(sys.stdin.buffer))
     except MediaError as error:
         result = {"error": {"code": error.code, "message": str(error)}}
     except Exception:

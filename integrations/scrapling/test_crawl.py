@@ -37,6 +37,8 @@ class Handler(BaseHTTPRequestHandler):
             "/large": '<h1>Large</h1><p>' + 'content ' * 1000 + '</p>',
             "/js": '<h1>Static shell</h1><p id="result"></p><script>document.getElementById("result").textContent="Rendered JavaScript evidence"</script>',
         }.get(self.path, '<h1>Fixture</h1>')
+        if self.path == "/full-length":
+            content = '<main><h1>Long page</h1><p>' + ('正文证据。' * 700000) + '原始尾标</p></main>'
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -50,6 +52,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class CrawlTests(unittest.TestCase):
+    def test_large_page_is_complete_unless_an_excerpt_is_requested(self):
+        full = module.crawl({"url": self.url + "/full-length", "max_depth": 0})
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["failures"], [])
+        page = full["pages"][0]
+        self.assertIn("原始尾标", page["markdown"])
+        self.assertEqual(page["markdown"].count("正文证据。"), 700000)
+        self.assertFalse(page["truncated"])
+        excerpt = module.crawl({"url": self.url + "/full-length", "max_chars": 70000})
+        self.assertEqual(excerpt["pages"][0]["markdown"], page["markdown"][:70000])
+        self.assertEqual(excerpt["stop_reason"], "character_limit")
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

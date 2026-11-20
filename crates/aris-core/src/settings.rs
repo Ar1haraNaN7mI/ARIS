@@ -112,8 +112,6 @@ impl Default for SessionSettings {
     }
 }
 
-pub const CUSTOM_INSTRUCTIONS_MAX_CHARS: usize = 8000;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CharacteristicLevel {
@@ -246,10 +244,6 @@ impl SessionSettings {
                 "max_tokens must be between 1 and 131072"
             );
         }
-        anyhow::ensure!(
-            self.custom_instructions.chars().count() <= CUSTOM_INSTRUCTIONS_MAX_CHARS,
-            "Custom instructions must be at most {CUSTOM_INSTRUCTIONS_MAX_CHARS} characters"
-        );
         anyhow::ensure!(
             !self
                 .custom_instructions
@@ -442,12 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn custom_instruction_limit_counts_characters_and_rejects_controls() {
+    fn custom_instructions_accept_long_unicode_and_reject_controls() {
         let mut settings = SessionSettings::default();
-        settings.custom_instructions = "语".repeat(CUSTOM_INSTRUCTIONS_MAX_CHARS);
+        settings.custom_instructions = "规则🧪\n".repeat(20_000);
         assert!(settings.validate().is_ok());
-        settings.custom_instructions.push('a');
-        assert!(settings.validate().is_err());
+        let home = std::env::temp_dir().join(format!("aris-settings-{}", uuid::Uuid::new_v4()));
+        save_settings(&home, &settings).unwrap();
+        assert_eq!(
+            load_settings(&home).custom_instructions,
+            settings.custom_instructions
+        );
+        std::fs::remove_dir_all(home).unwrap();
         settings.custom_instructions = "line\nnext\ttab".into();
         assert!(settings.validate().is_ok());
         settings.custom_instructions.push('\u{1b}');

@@ -84,8 +84,6 @@ pub struct ModelOptimizationConfig {
     pub small_tool_budget: usize,
     #[serde(default = "default_small_context_messages")]
     pub small_context_messages: usize,
-    #[serde(default = "default_small_context_chars")]
-    pub small_context_chars: usize,
     #[serde(default = "default_small_tool_result_max_chars")]
     pub small_tool_result_max_chars: usize,
     #[serde(default = "default_small_max_tokens")]
@@ -120,10 +118,6 @@ fn default_small_tool_budget() -> usize {
 
 fn default_small_context_messages() -> usize {
     24
-}
-
-fn default_small_context_chars() -> usize {
-    48_000
 }
 
 fn default_small_tool_result_max_chars() -> usize {
@@ -166,7 +160,6 @@ impl Default for ModelOptimizationConfig {
             small_max_steps: default_small_max_steps(),
             small_tool_budget: default_small_tool_budget(),
             small_context_messages: default_small_context_messages(),
-            small_context_chars: default_small_context_chars(),
             small_tool_result_max_chars: default_small_tool_result_max_chars(),
             small_max_tokens: default_small_max_tokens(),
             small_temperature: default_small_temperature(),
@@ -198,7 +191,6 @@ pub struct ModelPolicy {
     pub max_steps: Option<usize>,
     pub tool_budget: Option<usize>,
     pub context_messages: Option<usize>,
-    pub context_chars: Option<usize>,
     pub tool_result_max_chars: Option<usize>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -215,7 +207,6 @@ impl ModelPolicy {
             max_steps: None,
             tool_budget: None,
             context_messages: None,
-            context_chars: None,
             tool_result_max_chars: None,
             max_tokens: None,
             temperature: None,
@@ -237,7 +228,6 @@ impl ModelPolicy {
             max_steps: Some(config.small_max_steps.max(1)),
             tool_budget: Some(config.small_tool_budget.max(1)),
             context_messages: Some(config.small_context_messages.max(4)),
-            context_chars: Some(config.small_context_chars.max(2_048)),
             tool_result_max_chars: Some(config.small_tool_result_max_chars.max(512)),
             max_tokens: Some(config.small_max_tokens.max(256)),
             temperature: Some(temperature),
@@ -312,12 +302,11 @@ impl ModelProfile {
              - Prefer grep/glob/read_file and the progressive skill/plugin search tools; do not list every resource.\n\
              - Never invent file contents or tool arguments; use the smallest valid JSON object.\n\
              - After edits, run a focused check and report the concrete result.\n\
-             Budgets: max_steps={}, tool_schema_budget={}, schema_chars_per_tool={}, context_messages={}, context_chars={}, tool_result_chars={}, max_output_tokens={}, thinking={}, parallel_tools={}",
+             Budgets: max_steps={}, tool_schema_budget={}, schema_chars_per_tool={}, context_messages={}, tool_result_inline_threshold={}, max_output_tokens={}, thinking={}, parallel_tools={}",
             p.max_steps.unwrap_or(0),
             p.tool_budget.unwrap_or(0),
             p.tool_schema_chars.unwrap_or(0),
             p.context_messages.unwrap_or(0),
-            p.context_chars.unwrap_or(0),
             p.tool_result_max_chars.unwrap_or(0),
             p.max_tokens.unwrap_or(0),
             if p.thinking.unwrap_or(false) { "enabled" } else { "disabled" },

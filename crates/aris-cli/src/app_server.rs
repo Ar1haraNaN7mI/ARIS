@@ -14,12 +14,14 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 
-const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UNAUTHENTICATED_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT_RPC: usize = 64;
 
 type SessionTurnKeys = std::collections::HashSet<(usize, String)>;
@@ -181,16 +183,24 @@ where
     loop {
         while in_flight.try_join_next().is_some() {}
         raw_line.clear();
-        if reader.read_until(b'\n', &mut raw_line).await? == 0 {
+        let read = if authenticated {
+            reader.read_until(b'\n', &mut raw_line).await?
+        } else {
+            (&mut reader)
+                .take(MAX_UNAUTHENTICATED_LINE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut raw_line)
+                .await?
+        };
+        if read == 0 {
             in_flight.abort_all();
             return Ok(());
         }
-        if raw_line.len() > MAX_RPC_LINE_BYTES {
+        if !authenticated && raw_line.len() > MAX_UNAUTHENTICATED_LINE_BYTES {
             write_shared_error(
                 &writer,
                 None,
                 -32600,
-                format!("JSON-RPC request exceeds {MAX_RPC_LINE_BYTES} bytes"),
+                "Authentication frame is too large".into(),
                 None,
             )
             .await?;
@@ -474,15 +484,13 @@ async fn handle_request(
             let name = match params.get("name") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(name))
-                    if !name.trim().is_empty()
-                        && name.chars().count() <= 100
-                        && !name.chars().any(char::is_control) =>
+                    if !name.trim().is_empty() && !name.chars().any(char::is_control) =>
                 {
                     Some(name.trim().to_owned())
                 }
                 Some(_) => {
                     return Err(RpcFailure::invalid_params(
-                        "name must contain 1 to 100 printable characters",
+                        "name must contain printable characters",
                     ))
                 }
             };
@@ -773,11 +781,7 @@ async fn handle_request(
             let workspace = required_string(&params, "workspace")?;
             let source = required_string(&params, "source")?;
             let text = required_string(&params, "text")?;
-            if text.len() > MAX_RPC_LINE_BYTES {
-                return Err(RpcFailure::invalid_params(format!(
-                    "artifact text exceeds {MAX_RPC_LINE_BYTES} bytes"
-                )));
-            }
+
             let artifact = match cloud::import_artifact_text(
                 &runtime.outer_home,
                 &PathBuf::from(&workspace),

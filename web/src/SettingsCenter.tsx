@@ -706,7 +706,6 @@ export function SettingsCenter({
                   className="sc-input"
                   aria-label="聊天名称"
                   value={editingSession.name}
-                  maxLength={100}
                   required
                   disabled={blocked}
                   onChange={(event) =>
@@ -1353,14 +1352,10 @@ export function SettingsCenter({
                       },
                   )
                 }
-                maxLength={8000}
                 rows={5}
                 disabled={blocked || !draft}
                 placeholder="例如：用中文回复，先给结论，再解释关键依据。"
               />
-              <div className="sc-counter">
-                {Array.from(draft?.custom_instructions || "").length} / 8000
-              </div>
             </Section>
             <Section title="记忆">
               {remote?.effective.memory_available === false && (

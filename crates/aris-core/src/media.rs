@@ -194,13 +194,13 @@ fn schema(operation: &str) -> Value {
             json!({"output":path,"width":{"type":"integer","minimum":64,"maximum":4096},
             "height":{"type":"integer","minimum":64,"maximum":4096},"background":color,
             "elements":{"type":"array","maxItems":80,"items":{"oneOf":[
-                element("text",json!({"text":{"type":"string","minLength":1,"maxLength":2000},"font":path,"font_size":{"type":"integer","minimum":8,"maximum":512},"color":color}),vec!["text"]),
+                element("text",json!({"text":{"type":"string","minLength":1},"font":path,"font_size":{"type":"integer","minimum":8,"maximum":512},"color":color}),vec!["text"]),
                 element("rectangle",json!({"width":{"type":"integer","minimum":1,"maximum":4096},"height":{"type":"integer","minimum":1,"maximum":4096},"color":color}),vec!["width","height"]),
                 element("image",json!({"width":{"type":"integer","minimum":1,"maximum":4096},"height":{"type":"integer","minimum":1,"maximum":4096},"path":path}),vec!["width","height","path"])
             ]}}})
         }
         "image_generate" => {
-            json!({"prompt":{"type":"string","minLength":1,"maxLength":16000},"output":path,
+            json!({"prompt":{"type":"string","minLength":1},"output":path,
             "size":{"type":"string","minLength":1,"maxLength":64},"quality":{"type":"string","minLength":1,"maxLength":64}})
         }
         _ => unreachable!(),
@@ -495,7 +495,13 @@ mod tests {
             &json!({"clips":[{"path":"a.mp4","duration_seconds":601}],"output":"b.mp4"})
         )
         .is_err());
-        assert!(aris_tools::validate_tool_arguments(&definition("poster_render"), &json!({"width":100,"height":100,"output":"p.png","elements":[{"type":"text","x":0,"y":0,"text":"ok"}]})).is_ok());
+        let text = "长文本素材".repeat(20_000);
+        assert!(aris_tools::validate_tool_arguments(
+            &definition("image_generate"),
+            &json!({"prompt":text,"output":"a.png"})
+        )
+        .is_ok());
+        assert!(aris_tools::validate_tool_arguments(&definition("poster_render"), &json!({"width":100,"height":100,"output":"p.png","elements":[{"type":"text","x":0,"y":0,"text":text}]})).is_ok());
     }
     #[test]
     fn media_paths_respect_guard_and_workspace_boundaries() {

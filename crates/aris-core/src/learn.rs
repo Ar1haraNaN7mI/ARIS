@@ -371,7 +371,7 @@ impl LearnStore {
         let episode = LearnEpisode {
             id: Uuid::new_v4().to_string(),
             at: Utc::now(),
-            query: query.chars().take(240).collect(),
+            query: query.to_owned(),
             skill: skill.clone(),
             plugin: plugin.clone(),
             tool: tool.to_string(),
@@ -419,10 +419,10 @@ impl LearnStore {
             at: Utc::now(),
             task_id: task_id.to_string(),
             run_id: run_id.to_string(),
-            goal: goal.chars().take(240).collect(),
+            goal: goal.to_owned(),
             attempt: attempt.max(1),
             ok,
-            note: note.chars().take(500).collect(),
+            note: note.to_owned(),
             recalled_episode_ids: Some(recalled.iter().map(|episode| episode.id.clone()).collect()),
         };
         reinforce_feedback(&mut state.weights, &feedback, &recalled);
@@ -690,7 +690,10 @@ mod tests {
         next.observe_dispatch(&revised, "turn-b", 1, DispatchOutcome::Created);
         let history = next.recall_experiments("admin.dispatch.native.v1");
         assert_eq!(history.len(), 2);
-        assert_eq!((history[0].passed, history[1].passed), (Some(true), Some(false)));
+        assert_eq!(
+            (history[0].passed, history[1].passed),
+            (Some(true), Some(false))
+        );
         assert_eq!(history[0].previous.as_deref(), Some(history[1].id.as_str()));
         next.set_enabled(false, false);
         assert_eq!(next.propose_dispatch("model-a").instruction(), baseline);

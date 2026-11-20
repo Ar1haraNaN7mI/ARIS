@@ -7,11 +7,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 type RpcResult = Result<Value, RpcFailure>;
-const MAX_GIT_OUTPUT: u64 = 1024 * 1024;
 
 pub(crate) async fn dispatch(
     runtime: &Arc<Runtime>,
@@ -73,32 +71,14 @@ async fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command.spawn().map_err(|e| format!("start git: {e}"))?;
-    let stdout = child.stdout.take().ok_or("git stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("git stderr unavailable")?;
-    let work = async {
-        let mut output = Vec::new();
-        let mut errors = Vec::new();
-        let mut stdout = stdout.take(MAX_GIT_OUTPUT + 1);
-        let mut stderr = stderr.take(64 * 1024);
-        let (out, err) = tokio::join!(
-            stdout.read_to_end(&mut output),
-            stderr.read_to_end(&mut errors),
-        );
-        out.map_err(|e| e.to_string())?;
-        err.map_err(|e| e.to_string())?;
-        if output.len() as u64 > MAX_GIT_OUTPUT {
-            return Err("Git output exceeds 1 MiB; narrow the review scope".into());
-        }
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        if !status.success() {
-            return Err(String::from_utf8_lossy(&errors).trim().to_owned());
-        }
-        Ok(String::from_utf8_lossy(&output).into_owned())
-    };
-    tokio::time::timeout(Duration::from_secs(10), work)
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
         .await
         .map_err(|_| "Git command timed out after 10 seconds".to_owned())?
+        .map_err(|error| format!("run git: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn workspace_snapshot(runtime: &Runtime) -> RpcResult {
@@ -136,9 +116,9 @@ async fn prepare_review(workspace: &Path, params: &Value) -> RpcResult {
         .get("instructions")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if instructions.chars().count() > 8000 || instructions.contains('\0') {
+    if instructions.contains('\0') {
         return Err(RpcFailure::invalid_params(
-            "instructions must contain at most 8000 characters and no NUL",
+            "instructions must not contain NUL",
         ));
     }
     let status = git(
@@ -154,10 +134,8 @@ async fn prepare_review(workspace: &Path, params: &Value) -> RpcResult {
         ),
         "base" | "commit" => {
             let reference = required_string(params, "reference")?;
-            if reference.len() > 200 || reference.chars().any(char::is_control) {
-                return Err(RpcFailure::invalid_params(
-                    "reference must contain at most 200 printable characters",
-                ));
+            if reference.chars().any(char::is_control) {
+                return Err(RpcFailure::invalid_params("reference must be printable"));
             }
             let resolved = git(
                 workspace,
@@ -238,21 +216,28 @@ mod tests {
         )
         .await
         .unwrap();
-        std::fs::write(root.join("sample.txt"), "after\n").unwrap();
+        let changed = format!(
+            "after\n{}end-of-diff\n",
+            "evidence details\n".repeat(70_000)
+        );
+        std::fs::write(root.join("sample.txt"), &changed).unwrap();
+        let instructions = "核对变更依据\n".repeat(4_000);
         let review = prepare_review(
             &root,
-            &json!({"scope":"uncommitted","instructions":"Look for regressions"}),
+            &json!({"scope":"uncommitted","instructions":instructions}),
         )
         .await
         .unwrap();
         assert!(review["diff"].as_str().unwrap().contains("+after"));
+        assert!(review["prompt"].as_str().unwrap().contains("+end-of-diff"));
+        assert!(review["prompt"].as_str().unwrap().contains(&instructions));
         assert!(review["prompt"]
             .as_str()
             .unwrap()
             .contains("do not modify files"));
         assert_eq!(
             std::fs::read_to_string(root.join("sample.txt")).unwrap(),
-            "after\n"
+            changed
         );
         assert!(prepare_review(
             &root,

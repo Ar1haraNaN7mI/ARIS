@@ -36,6 +36,11 @@ test("real browser contexts isolate mouse, storage, tabs, queues and cancellatio
     const pageB = runtime.sessions.get("b").pages.get(b.page_id);
     assert.equal(await pageA.locator("input").inputValue(), "first-second");
     assert.equal(await pageB.locator("input").inputValue(), "");
+    const longText = "长篇输入".repeat(17_000) + "尾注";
+    await action("a", "type", { text: longText });
+    assert.equal(await pageA.locator("input").inputValue(), "first-second" + longText);
+    await pageA.locator("output").evaluate((element, text) => { element.textContent = text; }, longText);
+    assert.ok((await action("a", "observe")).text.endsWith(longText));
   });
 
   await t.test("cookies, local storage and page IDs cannot cross agents", async () => {
@@ -87,6 +92,8 @@ test("JSONL service correlates parallel requests and closes cleanly on EOF", asy
   ]);
   assert.equal(a.result.agent_id, "agent-one");
   assert.equal(b.result.agent_id, "agent-two");
+  const longRequest = await send({ id: "long", agent_id: "agent-one", action: "type", text: "字".repeat(70_000) });
+  assert.equal(longRequest.result.agent_id, "agent-one");
   const exit = once(child, "exit");
   child.stdin.end();
   const [code] = await exit;

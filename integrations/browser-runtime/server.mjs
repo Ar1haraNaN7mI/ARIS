@@ -7,7 +7,6 @@ const reply = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 input.on("line", line => {
   let request;
   try {
-    if (line.length > 64 * 1024) throw new Error("Browser request too large");
     request = JSON.parse(line);
     if (typeof request.id !== "string") throw new Error("Request id is required");
   } catch (error) { reply({ id: request?.id ?? null, error: error.message }); return; }

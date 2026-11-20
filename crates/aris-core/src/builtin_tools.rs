@@ -482,7 +482,7 @@ impl ToolHandler for WebFetchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::builtin(
             "web_fetch",
-            "Fetch a public URL and return truncated text/markdown-ish body (max ~32k chars).",
+            "Fetch a public URL and return its text, including the end of the page.",
             json!({
                 "type": "object",
                 "properties": {
@@ -520,8 +520,7 @@ impl ToolHandler for WebFetchTool {
             .await
             .map_err(|e| ToolError::Message(e.to_string()))?;
         let stripped = strip_html_light(&text);
-        let truncated: String = stripped.chars().take(32_000).collect();
-        Ok(format!("HTTP {status}\n{truncated}"))
+        Ok(format!("HTTP {status}\n{stripped}"))
     }
 }
 

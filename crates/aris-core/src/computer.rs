@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
@@ -26,7 +26,6 @@ pub const TOOL_NAMES: [&str; 5] = [
     "computer_act",
     "computer_close",
 ];
-const MAX_RESPONSE: usize = 12 * 1024 * 1024;
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
 
 struct Bridge {
@@ -102,13 +101,9 @@ impl Bridge {
             let mut reader = BufReader::new(output);
             loop {
                 let mut line = Vec::new();
-                let result = (&mut reader)
-                    .take((MAX_RESPONSE + 1) as u64)
-                    .read_until(b'\n', &mut line)
-                    .await;
+                let result = reader.read_until(b'\n', &mut line).await;
                 match result {
                     Ok(0) | Err(_) => break,
-                    Ok(_) if line.len() > MAX_RESPONSE => break,
                     Ok(_) => {}
                 }
                 let Ok(value) = serde_json::from_slice::<Value>(&line) else {
@@ -461,10 +456,8 @@ fn validate_action(args: &Value) -> Result<()> {
     }
     if action == "type" {
         anyhow::ensure!(
-            args.get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.chars().count() <= 16384),
-            "type requires text (up to 16384 characters)"
+            args.get("text").and_then(Value::as_str).is_some(),
+            "type requires text"
         );
     }
     if action == "keypress" {
@@ -495,7 +488,7 @@ pub fn act_definition() -> ToolDefinition {
             "action":{"type":"string","enum":["navigate","click","double_click","move","type","keypress","scroll","drag","wait","new_page","select_page","screenshot"]},
             "page_id":{"type":"string"},"url":{"type":"string","maxLength":8192},
             "x":{"type":"number","minimum":0,"maximum":1439.99},"y":{"type":"number","minimum":0,"maximum":899.99},
-            "button":{"type":"string","enum":["left","right","middle"]},"text":{"type":"string","maxLength":16384},"key":{"type":"string","maxLength":128},
+            "button":{"type":"string","enum":["left","right","middle"]},"text":{"type":"string"},"key":{"type":"string","maxLength":128},
             "delta_x":{"type":"number","minimum":-10000,"maximum":10000},"delta_y":{"type":"number","minimum":-10000,"maximum":10000},
             "ms":{"type":"integer","minimum":0,"maximum":5000},
             "path":{"type":"array","minItems":2,"maxItems":100,"items":{"type":"object","properties":{"x":{"type":"number","minimum":0,"maximum":1439.99},"y":{"type":"number","minimum":0,"maximum":899.99}},"required":["x","y"],"additionalProperties":false}}
@@ -547,9 +540,6 @@ impl ToolHandler for ComputerTool {
             .controller
             .execute_for(&ctx.agent_id, args, false, ctx.cancel.clone())
             .await?;
-        if let Some(text) = value.get("text").and_then(Value::as_str) {
-            value["text"] = json!(text.chars().take(5000).collect::<String>());
-        }
         if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) {
             nodes.truncate(30);
         }
@@ -630,6 +620,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     #[test]
     fn rejects_invalid_coordinates_and_old_native_actions() {
         for args in [
