@@ -188,6 +188,7 @@ pub struct AgentLoop {
     runtime: Arc<Runtime>,
     profile: Option<crate::kei::ModelProfileConfig>,
     execution_limits: Option<(usize, u32, usize)>,
+    cowork_only: bool,
 }
 
 struct TurnControl {
@@ -195,6 +196,7 @@ struct TurnControl {
     pause_rx: watch::Receiver<bool>,
     handle: AgentHandle,
     execution_limits: Option<(usize, u32, usize)>,
+    cowork_only: bool,
 }
 
 struct TurnModelIdentity {
@@ -209,6 +211,7 @@ impl AgentLoop {
             runtime,
             profile: None,
             execution_limits: None,
+            cowork_only: false,
         }
     }
 
@@ -222,12 +225,18 @@ impl AgentLoop {
             runtime,
             profile: Some(profile),
             execution_limits: None,
+            cowork_only: false,
         })
     }
 
     /// Limits are local to this invocation, never global model/user settings.
     pub fn with_execution_limits(mut self, steps: usize, tokens: u32, tools: usize) -> Self {
         self.execution_limits = Some((steps.max(1), tokens.max(1), tools.max(1)));
+        self
+    }
+
+    pub(crate) fn with_cowork_only(mut self, cowork_only: bool) -> Self {
+        self.cowork_only = cowork_only;
         self
     }
 
@@ -400,6 +409,7 @@ impl AgentLoop {
         let control_handle = handle.clone();
         let reservation_id = task_override.clone();
         let execution_limits = self.execution_limits;
+        let cowork_only = self.cowork_only;
         tokio::spawn(async move {
             if let Err(err) = run_turn_inner(
                 runtime,
@@ -416,6 +426,7 @@ impl AgentLoop {
                     pause_rx,
                     handle: control_handle,
                     execution_limits,
+                    cowork_only,
                 },
             )
             .await
@@ -449,6 +460,7 @@ async fn run_turn_inner(
         pause_rx,
         handle: control_handle,
         execution_limits,
+        cowork_only,
     } = control;
     let turn_id = Uuid::new_v4().to_string();
     let (session_id, session_goal, goal_paused) = {
@@ -690,11 +702,21 @@ async fn run_turn_inner(
             .filter(|a| a.id != worker.id && a.subagent_id.is_some())
             .map(|a| a.id.as_str())
             .collect();
-        Some(json!({"role":worker.id,"assignment":worker.prompt,"latest_instruction":instruction.map(|msg| &msg.text),"write_to":worker.files,"peer_ids":peers}).to_string())
+        let assignment = if cowork_only {
+            &user_text
+        } else {
+            &worker.prompt
+        };
+        let instruction = instruction.filter(|_| !cowork_only);
+        Some(json!({"role":worker.id,"assignment":assignment,"latest_instruction":instruction.map(|msg| &msg.text),"write_to":worker.files,"peer_ids":peers}).to_string())
     } else {
         None
     };
-    let output_check = crate::synthesis::delivery_check(&runtime, &task_id)?;
+    let output_check = if cowork_only {
+        None
+    } else {
+        crate::synthesis::delivery_check(&runtime, &task_id)?
+    };
     let mut requested_correction = false;
     let mut missing_files = Vec::<String>::new();
     let mut check_written_files = false;

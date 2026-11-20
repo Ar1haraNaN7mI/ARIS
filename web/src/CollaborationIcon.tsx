@@ -14,6 +14,8 @@ const outlines: Record<CollaborationAction, string> = {
   cowork_accept: person + " M12 7l2.2 2.2 4-4.5",
   cowork_decline: person + " M13 5l4.5 4.5 M17.5 5 13 9.5",
   cowork_result: "M3 12v4.5h14V12 M10 2.5v9.2 M6.5 8.2l3.5 3.5 3.5-3.5",
+  cowork_turn_started: "M2.5 7h15v10h-15z M7 7V4h6v3 M8.5 9.4l4 2.6-4 2.6z",
+  cowork_turn_finished: "M3 16V4h5l2 2h6v2 M17 10v1a3.5 3.5 0 0 1-3.5 3.5H8 M10.5 11.5l-3 3 3 3.1",
   open: "M8 4H3v12h5 M10 10h8 M15 7l3 3-3 3",
   close: "M3 10h8 M6 7l-3 3 3 3 M12 4h5v12h-5",
   read: "M1.5 10S4.8 4.7 10 4.7s8.5 5.3 8.5 5.3-3.3 5.3-8.5 5.3S1.5 10 1.5 10Z M12.1 10a2.1 2.1 0 1 0-4.2 0 2.1 2.1 0 0 0 4.2 0Z",

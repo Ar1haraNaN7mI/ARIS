@@ -67,6 +67,22 @@ it("keeps both speakers and their agreed wording visible after the temporary lan
   expect(select).toHaveBeenCalledWith("a");
 });
 
+it("shows independent co-work turns and the return to the assignment in the actual worker's chat and lane", () => {
+  const sample = { ...team, events: [
+    { at, agent_id: "b", kind: "cowork_turn_started", message: "work on the invitation" },
+    { at, agent_id: "b", kind: "cowork_turn_finished", message: "return to pending assignment" },
+  ] };
+  const props = { team: sample, sessions: {}, profiles: [], onSelectAgent: vi.fn() };
+  const view = render(<ProcessChat {...props} agentId="b" />);
+  for (const kind of ["cowork_turn_started", "cowork_turn_finished"] as const) {
+    expect(view.container.querySelector(`.lp-note svg[data-action-icon="${kind}"]`)?.parentElement?.textContent).toContain(actionLabels[kind]);
+  }
+  const trace = projectWorkspaceTrace([sample]).lanes.find((lane) => lane.agent.id === "b")!;
+  expect(trace.nodes.filter((node) => node.source === "team").map((node) => node.action)).toEqual(["cowork_turn_started", "cowork_turn_finished"]);
+  view.rerender(<ProcessChat {...props} agentId="a" />);
+  expect(view.container.querySelector('.lp-note svg[data-action-icon="cowork_turn_started"]')).toBeNull();
+});
+
 it("shows one copy of a peer exchange in either participant's chat, including co-work results and passive notices", () => {
   function message(seq: number, kind: TunnelMessage["kind"], text: string, from: string, reply_to?: string): TunnelMessage {
     return { id: String(seq), seq, from, to: from === "a" ? "b" : "a", at, kind, text, reply_to };

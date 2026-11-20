@@ -11,13 +11,19 @@ import type { ModelProfile, Team, TeamAgent, TeamTunnel, TunnelMessage } from ".
 import { TunnelMessageCard } from "./TeamTunnel";
 import { mirrorsReceivedTunnelMessage } from "./tunnelMessages";
 import { CollaborationIcon } from "./CollaborationIcon";
-import { actionLabels, toolAction } from "./collaborationActions";
+import { actionLabels, toolAction, type CollaborationAction } from "./collaborationActions";
 import type { SessionEvent, SessionResult } from "./types";
 import { conversationAgents, messageSource } from "./teamConversationModel";
 
-type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; peer?: { tunnel: TeamTunnel; message: TunnelMessage }; note?: string; noteLabel?: string; partial?: boolean };
+type Entry = { id: string; at: string; user?: string; source?: "user" | "admin" | "unknown"; recipient?: string; queued?: boolean; agent?: TeamAgent; identity?: SessionModelIdentity; event?: SessionEvent; tool?: Extract<ReturnType<typeof sessionTimeline>[number], { kind: "tool" }>; peer?: { tunnel: TeamTunnel; message: TunnelMessage }; note?: string; noteLabel?: string; action?: CollaborationAction; partial?: boolean };
 export function conversationEntries(team: Team, sessions: Record<string, SessionResult>, agentId?: string, profiles: ModelProfile[] = []): Entry[] {
   const entries: Entry[] = [{ id: "goal", at: team.created_at, user: team.goal }];
+  for (const event of team.events) {
+    if (event.kind !== "cowork_turn_started" && event.kind !== "cowork_turn_finished") continue;
+    if (agentId && agentId !== event.agent_id) continue;
+    const agent = team.agents.find((member) => member.id === event.agent_id);
+    if (agent) entries.push({ id: `cowork:${agent.id}:${event.kind}:${event.at}`, at: event.at, agent, action: event.kind, noteLabel: actionLabels[event.kind], note: event.message });
+  }
   for (const message of team.messages || []) if (!agentId || !message.agent_id || message.agent_id === agentId) entries.push({ id: message.id, at: message.at, user: message.text, source: messageSource(team, message), recipient: team.agents.find((agent) => agent.id === message.agent_id)?.name, queued: message.queued });
   for (const tunnel of team.tunnels || []) {
     if (agentId && !tunnel.participants.includes(agentId)) continue;
@@ -132,7 +138,7 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent, 
         {file && <div className="lp-delivery"><FileTextIcon /><span>产物 · <code>{file}</code></span></div>}
       </div>;
     }
-    if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{agent?.name} · {entry.noteLabel || (agent?.error === entry.note ? "执行失败" : "运行记录")}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
+    if (entry.note) return <details className={`lp-note ${agent?.error === entry.note ? "failed" : ""}`} key={entry.id} {...attrs}><summary>{entry.action && <CollaborationIcon action={entry.action} />}{agent?.name} · {entry.noteLabel || (agent?.error === entry.note ? "执行失败" : "运行记录")}<time>{formatTime(entry.at)}</time></summary><pre>{entry.note}</pre></details>;
     return <article className={`lp-assistant-message ${entry.partial ? "running" : ""}`} key={entry.id} {...attrs} style={{ "--model-color": color, "--light-color": color } as CSSProperties}>{entry.partial && <RunningBorder />}<div className="lp-message-who"><AgentGlyph family={entry.identity?.family || "unknown"} /><button title={entry.identity?.modelId || "历史模型未记录"} onClick={() => agent && onSelectAgent(agent.id)}>{agent?.name}</button>{entry.identity?.modelId && <small className="lp-message-model">{entry.identity.modelId}</small>}<time>{formatTime(entry.at)}</time>{entry.partial && <span className="lp-writing">正在回复</span>}</div>{entry.event?.reasoning && <details className="lp-reasoning"><summary>思考过程</summary><pre>{entry.event.reasoning}</pre></details>}{entry.event?.text && <Body text={entry.event.text} />}</article>;
   })}{activeAgents.length > 0 && <div className="lp-active-line"><span />{activeAgents.map((agent) => agent.name).join("、")} {team.status === "planning" ? "正在处理" : "正在执行"}</div>}</div></div>;
 }

@@ -46,7 +46,7 @@ impl HarnessProposal {
             context: self.context.clone(),
             observation,
             measurement_ms,
-            passed,
+            passed: Some(passed),
             previous: self.previous.clone(),
         })
     }
@@ -103,7 +103,7 @@ impl ExternalEvaluation {
             prediction: self.prediction,
             context: self.context,
             observation: self.observation,
-            passed: self.passed,
+            passed: Some(self.passed),
             measurement_ms: self.measurement_ms,
             previous: None,
         })
@@ -120,7 +120,7 @@ pub struct HarnessExperiment {
     pub prediction: String,
     pub context: String,
     pub observation: String,
-    pub passed: bool,
+    pub passed: Option<bool>,
     pub measurement_ms: Option<i64>,
     pub previous: Option<String>,
 }
@@ -176,7 +176,7 @@ impl HarnessTrial {
             for exp in runs.iter().filter(|e| e.edit == edit.key()) {
                 let weight = if exp.context == model { 3.0 } else { 1.0 };
                 total += weight;
-                if exp.passed {
+                if exp.passed == Some(true) {
                     passed += weight;
                 }
             }
@@ -214,7 +214,7 @@ impl HarnessTrial {
                 DispatchEdit::SharedContext => "Referring to shared inputs avoids repeating the same long goal for every worker.",
             }.into(), prediction: "The complete roster validates and commits atomically.".into(),
             context: self.model.clone(), observation: observation.into(),
-            passed: matches!(outcome, DispatchOutcome::Created), measurement_ms: None, previous: self.previous.clone(),
+            passed: Some(matches!(outcome, DispatchOutcome::Created)), measurement_ms: None, previous: self.previous.clone(),
         }
     }
 }
@@ -226,6 +226,6 @@ pub(crate) fn cowork_start(message: &str, model: &str, elapsed_ms: i64) -> Harne
         rationale: "Waiting for a whole batch delayed an eligible collaborator while another lane was still running.".into(),
         prediction: "A delivered invitation reaches an actual recipient run. Latency depends on eligibility and free capacity.".into(),
         context: model.to_owned(), observation: "Recipient started a run associated with the invitation.".into(),
-        passed: true, measurement_ms: Some(elapsed_ms), previous: None,
+        passed: None, measurement_ms: Some(elapsed_ms), previous: None,
     }
 }

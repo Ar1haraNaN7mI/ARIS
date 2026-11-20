@@ -52,6 +52,8 @@ pub struct TunnelMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_as: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_closed_reason: Option<String>,
 }
 
@@ -220,6 +222,7 @@ fn append(
         resumed_at: None,
         recipient_status_at_send: None,
         started_at: None,
+        started_as: None,
         followup_closed_reason: None,
     });
     tunnel.updated_at = at;
@@ -727,6 +730,7 @@ pub(crate) fn mark_started(
     team: &mut Team,
     agent_id: &str,
     at: chrono::DateTime<Utc>,
+    cowork_only: bool,
 ) -> Vec<(String, i64)> {
     let mut measurements = Vec::new();
     for tunnel in &mut team.tunnels {
@@ -746,6 +750,8 @@ pub(crate) fn mark_started(
                         .push((message.id.clone(), (at - sent.to_utc()).num_milliseconds()));
                 }
                 tunnel.messages[index].started_at = Some(at.to_rfc3339());
+                tunnel.messages[index].started_as =
+                    Some(if cowork_only { "co_work" } else { "assignment" }.into());
             }
         }
     }
@@ -753,14 +759,125 @@ pub(crate) fn mark_started(
 }
 
 pub(crate) fn pending_invite<'a>(team: &'a Team, agent_id: &str) -> Option<&'a TunnelMessage> {
+    let return_ready = team.tunnels.iter().any(|t| {
+        t.messages.iter().any(|m| {
+            m.to == agent_id
+                && m.reply_to.is_some()
+                && m.resumed_at.is_none()
+                && needs_attention(t, m)
+        })
+    });
     team.tunnels.iter().find_map(|tunnel| {
         tunnel.messages.iter().find(|message| {
             message.to == agent_id
                 && message.kind == "cowork_invite"
-                && message.started_at.is_none()
+                && (message.started_at.is_none()
+                    || (return_ready && message.started_as.as_deref() == Some("co_work")))
                 && needs_attention(tunnel, message)
         })
     })
+}
+
+pub(crate) fn has_followup_budget(team: &Team, peer: &str) -> bool {
+    team.tunnel_turns.get(peer).copied().unwrap_or(0) < MAX_FOLLOWUPS_PER_AGENT
+        && team
+            .tunnel_turns
+            .values()
+            .map(|count| usize::from(*count))
+            .sum::<usize>()
+            < MAX_FOLLOWUPS
+}
+
+impl TunnelMessage {
+    pub(crate) fn reserved_turn(&self) -> bool {
+        self.resumed_at.is_some() && self.started_at.is_none()
+    }
+}
+
+/// A pending primary role borrows its own lane to handle current invitations.
+/// One coalesced side turn consumes one follow-up, including one that resumes
+/// after the requester supplies missing information.
+pub(crate) fn begin_side_turn(team: &mut Team, peer: &str) -> Vec<String> {
+    let Some(invite) = pending_invite(team, peer) else {
+        return Vec::new();
+    };
+    // schedule() already charged a completed role when it made it pending.
+    let reserved = invite.reserved_turn();
+    if !reserved && !has_followup_budget(team, peer) {
+        return Vec::new();
+    }
+    let mut invites = Vec::new();
+    let at = now();
+    for tunnel in &mut team.tunnels {
+        for i in 0..tunnel.messages.len() {
+            let m = &tunnel.messages[i];
+            if m.to != peer || !needs_attention(tunnel, m) {
+                continue;
+            }
+            if m.kind == "cowork_invite" {
+                invites.push(m.id.clone());
+                tunnel.messages[i]
+                    .resumed_at
+                    .get_or_insert_with(|| at.clone());
+            } else if m.reply_to.is_some() {
+                tunnel.messages[i]
+                    .resumed_at
+                    .get_or_insert_with(|| at.clone());
+            }
+        }
+    }
+    if !reserved {
+        *team.tunnel_turns.entry(peer.to_owned()).or_default() += 1;
+    }
+    TeamStore::event(
+        team,
+        Some(peer),
+        "cowork_turn_started",
+        "Handling peer work while the primary assignment awaits its inputs",
+    );
+    invites
+}
+
+pub(crate) fn finish_side_turn(
+    team: &mut Team,
+    peer: &str,
+    invitations: &[String],
+    error: Option<&str>,
+) {
+    let awaiting_input = team.tunnels.iter().any(|t| {
+        t.messages.iter().any(|m| {
+            (m.from == peer
+                && m.kind == "question"
+                && m.resume_on_reply
+                && m.followup_closed_reason.is_none()
+                && awaiting(t, m))
+                || (m.to == peer
+                    && m.reply_to.is_some()
+                    && m.resumed_at.is_none()
+                    && needs_attention(t, m))
+        })
+    });
+    if error.is_some() || !awaiting_input {
+        for tunnel in &mut team.tunnels {
+            let unfinished = tunnel
+                .messages
+                .iter()
+                .filter(|m| invitations.contains(&m.id) && awaiting(tunnel, m))
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>();
+            end_followups(
+                tunnel,
+                &unfinished,
+                error.unwrap_or("Co-work turn ended before returning a result"),
+            );
+        }
+    }
+    TeamStore::event(
+        team,
+        Some(peer),
+        "cowork_turn_finished",
+        error.unwrap_or("Co-work turn ended; the primary assignment remains pending"),
+    );
 }
 
 pub(crate) fn schedule(team: &mut Team) {
@@ -790,15 +907,7 @@ pub(crate) fn schedule(team: &mut Team) {
         }
     }
     for (agent_id, pending) in candidates {
-        let exhausted = team.tunnel_turns.get(&agent_id).copied().unwrap_or(0)
-            >= MAX_FOLLOWUPS_PER_AGENT
-            || team
-                .tunnel_turns
-                .values()
-                .map(|count| *count as usize)
-                .sum::<usize>()
-                >= MAX_FOLLOWUPS;
-        if exhausted {
+        if !has_followup_budget(team, &agent_id) {
             for tunnel in &mut team.tunnels {
                 end_followups(
                     tunnel,

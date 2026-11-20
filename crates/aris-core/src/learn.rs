@@ -690,7 +690,7 @@ mod tests {
         next.observe_dispatch(&revised, "turn-b", 1, DispatchOutcome::Created);
         let history = next.recall_experiments("admin.dispatch.native.v1");
         assert_eq!(history.len(), 2);
-        assert!(history[0].passed && !history[1].passed);
+        assert_eq!((history[0].passed, history[1].passed), (Some(true), Some(false)));
         assert_eq!(history[0].previous.as_deref(), Some(history[1].id.as_str()));
         next.set_enabled(false, false);
         assert_eq!(next.propose_dispatch("model-a").instruction(), baseline);

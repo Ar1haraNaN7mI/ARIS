@@ -805,6 +805,168 @@ async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknow
 }
 
 #[tokio::test]
+async fn first_free_slot_serves_cowork_before_primary_dependencies_finish() {
+    let (fixture, mut rx, server) = fixture().await;
+    let runtime = fixture.runtime.clone();
+    let mut writer = worker("editor", &["audit", "growth", "research"]);
+    writer.delivery = Some(crate::synthesis::DeliveryKind::Final);
+    let team = runtime
+        .teams
+        .create(
+            &runtime,
+            TeamSpec {
+                name: "First available lane".into(),
+                goal: "Verify and publish".into(),
+                agents: vec![
+                    worker("budget", &[]),
+                    worker("growth", &[]),
+                    worker("research", &[]),
+                    worker("audit", &["budget"]),
+                    writer,
+                ],
+                files: vec![],
+            },
+        )
+        .unwrap();
+    runtime.teams.mutate(&team.id, |team|{
+        team.execution_budget = Some(serde_json::from_value(json!({
+            "agent_ids":["budget","research","growth","audit","editor"],"max_agent_runs":10,"max_steps_per_agent":18,
+            "max_tool_calls_per_agent":32,"max_context_chars":64000,"max_tokens_per_step":4096,"max_parallel":3,"max_runtime_secs":120
+        }))?);
+        Ok(())
+    }).unwrap();
+    runtime.teams.start(runtime.clone(), &team.id).unwrap();
+    let mut held = HashMap::new();
+    for _ in 0..3 {
+        let req = request(&mut rx).await;
+        let body = req.body.to_string();
+        let role = ["budget", "growth", "research"]
+            .into_iter()
+            .find(|r| body.contains(&format!("Your assignment: Answer as {r}")))
+            .unwrap();
+        held.insert(role, req);
+    }
+    tool_reply(
+        held.remove("budget").unwrap(),
+        "invite-audit",
+        json!({
+            "action":"invite","to":"audit","topic":"Compute margin","text":"What is the contribution of 10 teams at 90 each?"
+        }),
+    );
+    let waiting_budget = request(&mut rx).await;
+    let state = runtime.teams.get(&team.id).unwrap();
+    let tunnel = &state.tunnels[0];
+    let invite = &tunnel.messages[0];
+    assert_eq!(invite.recipient_status_at_send.as_deref(), Some("pending"));
+    assert!(invite.started_at.is_none());
+    assert_eq!(
+        state
+            .agents
+            .iter()
+            .filter(|a| a.status == "running")
+            .count(),
+        3
+    );
+    held.remove("growth")
+        .unwrap()
+        .reply
+        .send("Channel experiment ready".into())
+        .unwrap();
+    let peer = request(&mut rx).await;
+    assert!(peer.body["messages"]
+        .to_string()
+        .contains("separate, bounded co-work turn"));
+    let active = runtime.teams.get(&team.id).unwrap();
+    assert_eq!(
+        active
+            .agents
+            .iter()
+            .filter(|a| a.status == "running")
+            .count(),
+        3
+    );
+    assert_eq!(
+        active.tunnels[0].messages[0].started_as.as_deref(),
+        Some("co_work")
+    );
+    tool_reply(
+        peer,
+        "accept",
+        json!({"action":"accept_work","tunnel_id":tunnel.id,"reply_to":invite.id}),
+    );
+    tool_reply(
+        request(&mut rx).await,
+        "result",
+        json!({"action":"complete_work","tunnel_id":tunnel.id,"reply_to":invite.id,"text":"10 × 90 = 900."}),
+    );
+    request(&mut rx)
+        .await
+        .reply
+        .send("Contribution verified.".into())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.teams.get(&team.id).unwrap().agents[3].status != "pending" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = runtime.teams.get(&team.id).unwrap();
+    assert_eq!(pending.agents[3].output, "");
+    assert!(pending.agents[3].error.is_none());
+    let first_task = pending.agents[3].task_id.clone();
+    assert!(rx.try_recv().is_err());
+    waiting_budget
+        .reply
+        .send("Budget assignment now finished.".into())
+        .unwrap();
+    let audit = request(&mut rx).await;
+    assert!(audit.body["messages"]
+        .to_string()
+        .contains("Your assignment: Answer as audit"));
+    audit
+        .reply
+        .send("Independent audit of the completed budget.".into())
+        .unwrap();
+    held.remove("research")
+        .unwrap()
+        .reply
+        .send("Sources ready.".into())
+        .unwrap();
+    let editor = request(&mut rx).await;
+    assert!(editor.body["messages"]
+        .to_string()
+        .contains("Independent audit of the completed budget."));
+    editor.reply.send("Final verified report.".into()).unwrap();
+    let end = settled(&runtime, &team.id).await;
+    assert_eq!(end.status, "completed");
+    assert_eq!(end.tunnel_turns["audit"], 1);
+    assert_ne!(end.agents[3].task_id, first_task);
+    assert_eq!(end.agents[3].session_id, team.agents[3].session_id);
+    assert_eq!(
+        end.events
+            .iter()
+            .filter(|e| e.kind == "cowork_turn_started")
+            .count(),
+        1
+    );
+    assert_eq!(
+        end.events
+            .iter()
+            .filter(|e| e.kind == "agent_started" && e.agent_id.as_deref() == Some("audit"))
+            .count(),
+        2
+    );
+    assert!(
+        !crate::synthesis::deliverable(&runtime, &end)
+            .unwrap()
+            .unwrap()
+            .stale
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn worker_missing_an_assigned_document_gets_one_same_session_correction() {
     let (fixture, mut rx, server) = fixture().await;
     let runtime = fixture.runtime.clone();

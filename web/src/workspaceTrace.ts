@@ -121,6 +121,8 @@ function teamNode(team: Team, event: Team["events"][number], occurrence: number,
     case "model_changed": kind = "model"; label = compact(event.message); break;
     case "checkpoint": kind = "checkpoint"; label = checkpointLabel(event.message); break;
     case "tunnel_resumed": kind = "start"; action = "resume"; label = "继续处理协作请求"; break;
+    case "cowork_turn_started": kind = "start"; action = event.kind; label = actionLabels[action]; break;
+    case "cowork_turn_finished": kind = "note"; action = event.kind; label = actionLabels[action]; break;
     case "tunnel_followup_ended": action = "end_followup"; label = "协作跟进已结束"; break;
     case "tunnel_opened": case "tunnel_closed": case "tunnel_decision": case "tunnel_message": {
       kind = "tunnel";

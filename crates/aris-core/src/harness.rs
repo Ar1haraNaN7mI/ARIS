@@ -1515,14 +1515,24 @@ impl TeamStore {
             let wave_started = Instant::now();
             let mut dispatch = Vec::new();
             let mut expired = Vec::new();
-            for agent in ready {
+            for turn in ready {
+                let agent = &turn.agent;
                 let deadline = team.execution_budget.as_ref().map(|budget| {
-                    budget.role_deadline(started, wave_started, &agent, &mut publication_deadline)
+                    if turn.cowork_only {
+                        started + Duration::from_secs(budget.max_runtime_secs)
+                    } else {
+                        budget.role_deadline(
+                            started,
+                            wave_started,
+                            agent,
+                            &mut publication_deadline,
+                        )
+                    }
                 });
                 if deadline.is_some_and(|limit| wave_started >= limit) {
-                    expired.push(agent.id);
+                    expired.push(turn.agent.id);
                 } else {
-                    dispatch.push((agent, deadline));
+                    dispatch.push((turn, deadline));
                 }
             }
             if !expired.is_empty() {
@@ -1551,8 +1561,8 @@ impl TeamStore {
                 dispatch.truncate(available);
             }
             runs += dispatch.len();
-            for (agent, deadline) in dispatch {
-                let worker_id = agent.id.clone();
+            for (turn, deadline) in dispatch {
+                let worker_id = turn.agent.id.clone();
                 in_flight.insert(worker_id.clone());
                 let store = self.clone();
                 let runtime = runtime.clone();
@@ -1560,7 +1570,7 @@ impl TeamStore {
                 running.spawn(async move {
                     (
                         worker_id,
-                        store.run_agent(runtime, &id, agent, deadline).await,
+                        store.run_agent(runtime, &id, turn, deadline).await,
                     )
                 });
             }
@@ -1583,11 +1593,20 @@ impl TeamStore {
         self: &Arc<Self>,
         runtime: Arc<Runtime>,
         id: &str,
-        agent: TeamAgent,
+        turn: LaneTurn,
         deadline: Option<std::time::Instant>,
     ) -> Result<()> {
+        let LaneTurn { agent, cowork_only } = turn;
         let mut cowork_starts = Vec::new();
+        let mut invitations = Vec::new();
         let team = self.mutate(id, |t| {
+            if cowork_only {
+                invitations = crate::tunnel::begin_side_turn(t, &agent.id);
+                // The sender may settle/close the invitation just before admission.
+                if invitations.is_empty() {
+                    return Ok(());
+                }
+            }
             let current = t
                 .agents
                 .iter_mut()
@@ -1601,9 +1620,12 @@ impl TeamStore {
                 kind: "agent_started".into(),
                 message: agent.name.clone(),
             });
-            cowork_starts = crate::tunnel::mark_started(t, &agent.id, at);
+            cowork_starts = crate::tunnel::mark_started(t, &agent.id, at, cowork_only);
             Ok(())
         })?;
+        if cowork_only && invitations.is_empty() {
+            return Ok(());
+        }
         for (message_id, elapsed_ms) in cowork_starts {
             runtime
                 .learn
@@ -1612,7 +1634,7 @@ impl TeamStore {
         let outcome: Result<()> = async {
             let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
             let profile = kei.profile(&agent.profile_id)?;
-            let mut runner = AgentLoop::with_profile(runtime.clone(), profile)?;
+            let mut runner = AgentLoop::with_profile(runtime.clone(), profile)?.with_cowork_only(cowork_only);
             if let Some(budget) = &team.execution_budget {
                 runner = runner.with_execution_limits(
                     budget.max_steps_per_agent,
@@ -1621,9 +1643,13 @@ impl TeamStore {
                 );
             }
             let session = runtime.sessions.get_or_load(&agent.session_id)?;
-            let prepared =
-                crate::synthesis::prepare(&runtime, &team, &agent, agent_prompt(&team, &agent))?;
-            let prompt = prepared.prompt.clone();
+            let prepared = if cowork_only { None } else {
+                Some(crate::synthesis::prepare(&runtime, &team, &agent, agent_prompt(&team, &agent))?)
+            };
+            let prompt = match &prepared {
+                Some(delivery) => delivery.prompt.clone(),
+                None => format!("You are {} (worker ID {}). Your main assignment is waiting for its dependencies. This is a separate, bounded co-work turn in your own lane. Work only on the incoming invitations {} in the attached peer transcript. Accept and carry out the requested check with your tools; complete_work using the invitation ID, or decline_work if appropriate. If information is missing, ask the requester a concrete question with resume_on_reply=true, then yield without polling. Preserve existing files, write only to your owned paths ({}) if the invitation requires it. Your main assignment will run separately after its inputs arrive. Do not publish or complete the primary assignment during this turn.", agent.name, agent.id, invitations.join(", "), agent.files.join(", ")),
+            };
             let task = self.prepare_task(&runtime, &team, &agent, &prompt)?;
             let (tx, mut rx) = mpsc::channel(256);
             let handle = runner
@@ -1766,26 +1792,31 @@ impl TeamStore {
                 && error.is_none()
                 && self.read(id)?.status != "cancelling"
             {
-                crate::synthesis::capture(
+                if let Some(prepared) = &prepared { crate::synthesis::capture(
                     &runtime,
                     &self.read(id)?,
                     &agent,
                     &task.id,
                     latest_run.as_deref(),
-                    &prepared,
-                )?;
+                    prepared,
+                )?; }
             }
             self.mutate(id, |t| {
                 let cancelling = t.status == "cancelling";
+                if cowork_only {
+                    crate::tunnel::finish_side_turn(t, &agent.id, &invitations, error.as_deref());
+                }
                 let current = t
                     .agents
                     .iter_mut()
                     .find(|a| a.id == agent.id)
                     .context("agent missing")?;
-                current.output = output;
+                if !cowork_only { current.output = output; }
                 current.run_id = latest_run;
                 current.status = if cancelling {
                     "cancelled"
+                } else if cowork_only {
+                    "pending"
                 } else if native_task.state == TaskState::Cancelled {
                     "cancelled"
                 } else if error.is_some() {
@@ -1796,7 +1827,7 @@ impl TeamStore {
                     "completed"
                 }
                 .into();
-                current.error = error;
+                current.error = if cowork_only { None } else { error };
                 let message = format!("{}: {}", current.name, current.status);
                 Self::event(t, Some(&agent.id), "agent_finished", &message);
                 Ok(())
@@ -1813,13 +1844,28 @@ impl TeamStore {
                 .remove(&(id.into(), agent.id.clone()));
             self.mutate(id, |t| {
                 let cancelling = t.status == "cancelling";
+                if cowork_only {
+                    crate::tunnel::finish_side_turn(
+                        t,
+                        &agent.id,
+                        &invitations,
+                        Some(&error.to_string()),
+                    );
+                }
                 let a = t
                     .agents
                     .iter_mut()
                     .find(|a| a.id == agent.id)
                     .context("agent missing")?;
-                a.status = if cancelling { "cancelled" } else { "failed" }.into();
-                a.error = Some(error.to_string());
+                a.status = if cancelling {
+                    "cancelled"
+                } else if cowork_only {
+                    "pending"
+                } else {
+                    "failed"
+                }
+                .into();
+                a.error = (!cowork_only).then(|| error.to_string());
                 if let Some(task) = a.task_id.as_deref().and_then(|id| runtime.tasks.task(id)) {
                     if !matches!(
                         task.state,
@@ -2025,7 +2071,12 @@ pub(crate) fn validate_graph(agents: &[TeamAgent]) -> Result<()> {
         }
     }
 }
-fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<TeamAgent> {
+struct LaneTurn {
+    agent: TeamAgent,
+    cowork_only: bool,
+}
+
+fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<LaneTurn> {
     let complete: HashSet<_> = team
         .agents
         .iter()
@@ -2062,9 +2113,10 @@ fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<TeamAgent> {
         }
         // This lane already met its original prerequisites. Its current request
         // can come from a prerequisite that is itself now on a follow-up turn.
-        let resumed_worker = agent.delivery != Some(crate::synthesis::DeliveryKind::Final)
-            && invite.is_some_and(|message| message.resumed_at.is_some());
-        if crate::tunnel::blocks_final(team, agent)
+        let reserved = invite.is_some_and(|message| message.reserved_turn());
+        let resumed_worker =
+            agent.delivery != Some(crate::synthesis::DeliveryKind::Final) && reserved;
+        let cowork_only = crate::tunnel::blocks_final(team, agent)
             || (!resumed_worker
                 && !agent.depends_on.iter().all(|d| {
                     complete.contains(d)
@@ -2072,7 +2124,10 @@ fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<TeamAgent> {
                             .dispatch_agent_ids
                             .as_ref()
                             .is_some_and(|scope| !scope.contains(d))
-                }))
+                }));
+        if cowork_only
+            && (invite.is_none()
+                || (!reserved && !crate::tunnel::has_followup_budget(team, &agent.id)))
         {
             continue;
         }
@@ -2081,7 +2136,10 @@ fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<TeamAgent> {
             continue;
         }
         files.extend(claims);
-        ready.push(agent.clone());
+        ready.push(LaneTurn {
+            agent: agent.clone(),
+            cowork_only,
+        });
     }
     ready
 }
@@ -2342,7 +2400,7 @@ mod tests {
         assert_eq!(
             ready_wave(&team(agents), &HashSet::new())
                 .iter()
-                .map(|a| a.id.as_str())
+                .map(|turn| turn.agent.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "c"]
         );
@@ -2377,16 +2435,48 @@ mod tests {
         let selected = |team: &Team| {
             ready_wave(team, &active)
                 .into_iter()
-                .map(|a| a.id)
+                .map(|turn| turn.agent.id)
                 .collect::<Vec<_>>()
         };
-        // An unstarted helper waits for its original dependency.
-        assert_eq!(selected(&t), ["other"]);
+        // An unstarted helper can answer the invite while its primary assignment
+        // remains gated on the sender. A free slot does not bypass file leases.
+        assert_eq!(selected(&t), ["helper"]);
+        assert!(ready_wave(&t, &active)[0].cowork_only);
+        // A helper may ask for missing inputs and yield. The requested answer
+        // can resume the side turn while the primary prerequisite is still busy.
+        let mut missing = t.clone();
+        let original = missing.tunnels[0].messages[0].clone();
+        let first = crate::tunnel::begin_side_turn(&mut missing, "helper");
+        crate::tunnel::mark_started(&mut missing, "helper", Utc::now(), true);
+        let mut question = original.clone();
+        question.id = "need-quote".into();
+        question.kind = "question".into();
+        question.from = "helper".into();
+        question.to = "sender".into();
+        question.resume_on_reply = true;
+        missing.tunnels[0].messages.push(question);
+        crate::tunnel::finish_side_turn(&mut missing, "helper", &first, None);
+        assert_eq!(selected(&missing), ["other"]);
+        let mut answer = original;
+        answer.id = "quote".into();
+        answer.kind = "answer".into();
+        answer.expects_reply = false;
+        answer.reply_to = Some("need-quote".into());
+        missing.tunnels[0].messages.push(answer);
+        let followup = ready_wave(&missing, &active);
+        assert_eq!(followup[0].agent.id, "helper");
+        assert!(followup[0].cowork_only);
+        assert_eq!(
+            crate::tunnel::begin_side_turn(&mut missing, "helper"),
+            first
+        );
+        assert!(crate::tunnel::begin_side_turn(&mut missing, "helper").is_empty());
         t.agents[2].status = "completed".into();
         crate::tunnel::schedule(&mut t);
         // An idle helper already satisfied the same dependency on its first
         // turn. The requester stays in flight while the helper has priority.
         assert_eq!(selected(&t), ["helper"]);
+        assert!(!ready_wave(&t, &active)[0].cowork_only);
         t.agents[2].files = vec!["BUDGET.md".into()];
         assert_eq!(selected(&t), ["other"]);
         t.execution_budget.as_mut().unwrap().max_parallel = 1;

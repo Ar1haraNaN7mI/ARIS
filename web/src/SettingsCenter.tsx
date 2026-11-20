@@ -113,7 +113,7 @@ type Memory = {
 };
 type HarnessMemory = {
   id: string; problem: string; edit: string; rationale: string; prediction: string;
-  context: string; observation?: string; passed?: boolean; measurement_ms?: number | null;
+  context: string; observation?: string; passed?: boolean | null; measurement_ms?: number | null;
   evaluation?: string; alternative?: string;
 };
 type Memories = {
@@ -1484,7 +1484,7 @@ export function SettingsCenter({
                       .toLowerCase().includes(memorySearch.toLowerCase()),
                   ).map((item) => (
                     <details className="sc-memory" key={item.id}>
-                      <summary><span>{item.edit}<small>{item.passed === undefined ? "待评测提案" : item.passed ? "评测通过" : "评测未通过"} · {item.context}</small></span><ChevronRightIcon /></summary>
+                      <summary><span>{item.edit}<small>{item.passed === undefined ? "待评测提案" : item.passed === null ? "调度实测" : item.passed ? "评测通过" : "评测未通过"} · {item.context}</small></span><ChevronRightIcon /></summary>
                       <p><strong>修改理由</strong>　{item.rationale}</p>
                       <p><strong>预期</strong>　{item.prediction}</p>
                       {item.observation && <p><strong>实测</strong>　{item.observation}{item.measurement_ms != null && `（${item.measurement_ms} ms）`}</p>}
