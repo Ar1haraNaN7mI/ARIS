@@ -1,18 +1,8 @@
 import type { Team, TeamTunnel, TunnelMessage } from "./teamTypes";
-
-const labels: Record<TunnelMessage["kind"], string> = {
-  message: "发言", notice: "通知", question: "请求答复", answer: "答复",
-  proposal: "提议", accept: "同意提议", cowork_invite: "协作邀请",
-  cowork_accept: "接受协作", cowork_decline: "婉拒协作", cowork_result: "交付协作成果",
-};
+import { actionLabels, messageAction } from "./collaborationActions";
 
 export function tunnelMessageLabel(message: TunnelMessage) {
-  if (message.kind === "message") {
-    if (message.expects_reply) return labels.question;
-    if (message.reply_to) return labels.answer;
-    if (message.expects_reply === false) return labels.notice;
-  }
-  return labels[message.kind] || "协作消息";
+  return actionLabels[messageAction(message)];
 }
 
 export function mirrorsReceivedTunnelMessage(team: Team, recipient: string, noteId: string): boolean {

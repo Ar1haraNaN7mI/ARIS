@@ -25,6 +25,7 @@ mod report_calculate;
 pub mod scheduler;
 mod session;
 pub mod settings;
+pub mod sim;
 mod startup_profile;
 pub mod synthesis;
 mod system_prompt;

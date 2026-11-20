@@ -91,6 +91,20 @@ describe("role-owned workspace trajectory", () => {
     expect(headers(view.container)).toHaveLength(3);
   });
 
+  it("displays the actual invitation symbol on both endpoints, the open channel and the event legend", () => {
+    const { current } = fixture();
+    const team: Team = { ...current, tunnels: [{
+      id: "review", topic: "复算", status: "open", created_at: at(3), updated_at: at(3), participants: ["cost", "score"],
+      messages: [{ id: "ask", seq: 1, at: at(3), from: "cost", to: "score", kind: "cowork_invite", text: "请独立复算" }],
+    }] };
+    const { container } = render(<WorkspaceTrajectory teams={[team]} activeTeamId={team.id} profiles={profiles} onSelectAgent={vi.fn()} />);
+    const invite = '[data-action-icon="cowork_invite"]';
+    expect(container.querySelectorAll(`.wt-node[data-trace-kind="tunnel"] ${invite}`)).toHaveLength(2);
+    expect(container.querySelector(`.wt-tunnel-rail ${invite}`)).toBeTruthy();
+    expect(container.querySelector(`.wt-legend ${invite}`)?.parentElement?.parentElement?.textContent).toBe("协作邀请");
+    expect(container.querySelector('.wt-legend [data-action-icon="cowork_decline"]')).toBeNull();
+  });
+
   it("preserves the metadata-only admin column while new same-model roles start independently", () => {
     const select = vi.fn();
     const initial: Team = {

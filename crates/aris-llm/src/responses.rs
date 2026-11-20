@@ -279,6 +279,9 @@ pub(crate) async fn stream(
                 if result.tool_calls.is_empty() {
                     result.tool_calls = calls.into_values().collect();
                 }
+                if result.finish_reason == FinishReason::Length && !result.tool_calls.is_empty() {
+                    return Err(LlmError::IncompleteToolCalls(result.tool_calls));
+                }
                 if !result.tool_calls.is_empty() && result.finish_reason != FinishReason::Length {
                     result.finish_reason = FinishReason::ToolCalls;
                 }
@@ -352,9 +355,7 @@ fn assemble(value: &Value) -> Result<AssembledResponse, LlmError> {
         FinishReason::Stop
     };
     if finish_reason == FinishReason::Length && !tool_calls.is_empty() {
-        return Err(LlmError::Api(
-            "Responses tool call was truncated; increase max_tokens before retrying".into(),
-        ));
+        return Err(LlmError::IncompleteToolCalls(tool_calls));
     }
     let provider_items: Vec<Value> = output
         .iter()

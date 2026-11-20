@@ -1,5 +1,6 @@
 //! Self-learning store: episode memory + capability weights (outer-layer durable).
 
+use crate::sim::{self, DispatchOutcome, HarnessExperiment, HarnessTrial};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -40,6 +41,11 @@ pub struct LearnFeedback {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnState {
+    /// Bounded evaluation history for the harness optimizer, separate from solver recall.
+    #[serde(default)]
+    pub experiments: Vec<HarnessExperiment>,
+    #[serde(default)]
+    pub proposals: Vec<sim::HarnessProposal>,
     #[serde(default)]
     pub weights: HashMap<String, f32>,
     #[serde(default)]
@@ -91,6 +97,166 @@ impl LearnStore {
     /// Management access remains available when model recall is disabled.
     pub fn list(&self) -> LearnState {
         self.state.read().clone()
+    }
+
+    pub fn propose_dispatch(&self, model: &str) -> HarnessTrial {
+        let state = self.state.read();
+        let history = if self.retrieval_enabled.load(Ordering::Acquire) {
+            state.experiments.as_slice()
+        } else {
+            &[]
+        };
+        HarnessTrial::propose(history, model)
+    }
+
+    pub fn generation_enabled(&self) -> bool {
+        self.generation_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn save_proposal(&self, proposal: sim::HarnessProposal) -> Result<()> {
+        let mut state = self.state.write();
+        anyhow::ensure!(self.generation_enabled(), "Memory generation is disabled");
+        let mut next = state.clone();
+        next.proposals.push(proposal);
+        if next.proposals.len() > sim::HISTORY_LIMIT {
+            next.proposals.remove(0);
+        }
+        self.persist_state(&next, &state)?;
+        *state = next;
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn grade_proposal(
+        &self,
+        id: &str,
+        passed: bool,
+        observation: String,
+        measurement_ms: Option<i64>,
+    ) -> Result<bool> {
+        let mut state = self.state.write();
+        anyhow::ensure!(self.generation_enabled(), "Memory generation is disabled");
+        let proposal = state
+            .proposals
+            .iter()
+            .find(|p| p.id == id)
+            .context("Unknown proposal")?;
+        let experiment = proposal.grade(passed, observation, measurement_ms)?;
+        self.record_locked(&mut state, experiment)
+    }
+
+    pub fn observe_dispatch(
+        &self,
+        trial: &HarnessTrial,
+        turn: &str,
+        attempt: u8,
+        outcome: DispatchOutcome,
+    ) {
+        self.observe(trial.evaluate(turn, attempt, outcome));
+    }
+
+    pub fn observe_cowork_start(&self, message: &str, model: &str, elapsed_ms: i64) {
+        if elapsed_ms >= 0 {
+            self.observe(sim::cowork_start(message, model, elapsed_ms));
+        }
+    }
+
+    fn observe(&self, experiment: HarnessExperiment) {
+        if let Err(error) = self.record_experiment(experiment) {
+            tracing::warn!(%error, "Could not persist harness evaluation");
+        }
+    }
+
+    pub fn record_experiment(&self, experiment: HarnessExperiment) -> Result<bool> {
+        let mut state = self.state.write();
+        if !self.generation_enabled.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.record_locked(&mut state, experiment)
+    }
+
+    fn record_locked(
+        &self,
+        state: &mut LearnState,
+        mut experiment: HarnessExperiment,
+    ) -> Result<bool> {
+        if let Some(existing) = state
+            .experiments
+            .iter()
+            .find(|entry| entry.id == experiment.id)
+        {
+            anyhow::ensure!(
+                existing.problem == experiment.problem
+                    && existing.edit == experiment.edit
+                    && existing.context == experiment.context
+                    && existing.observation == experiment.observation
+                    && existing.rationale == experiment.rationale
+                    && existing.prediction == experiment.prediction
+                    && existing.passed == experiment.passed
+                    && existing.measurement_ms == experiment.measurement_ms,
+                "Experiment ID already identifies a different evaluation"
+            );
+            return Ok(false);
+        }
+        let mut next = state.clone();
+        if experiment.previous.is_none() && self.retrieval_enabled.load(Ordering::Acquire) {
+            experiment.previous = next
+                .experiments
+                .iter()
+                .rev()
+                .find(|e| e.problem == experiment.problem)
+                .map(|e| e.id.clone());
+        }
+        next.experiments.push(experiment);
+        if next.experiments.len() > sim::HISTORY_LIMIT {
+            next.experiments
+                .drain(..next.experiments.len() - sim::HISTORY_LIMIT);
+        }
+        self.persist_state(&next, state)?;
+        *state = next;
+        self.dirty.store(false, Ordering::Release);
+        Ok(true)
+    }
+
+    pub fn delete_experiment(&self, id: &str) -> Result<bool> {
+        let mut state = self.state.write();
+        let mut next = state.clone();
+        next.experiments.retain(|e| e.id != id);
+        next.proposals.retain(|e| e.id != id);
+        if next.experiments.len() == state.experiments.len()
+            && next.proposals.len() == state.proposals.len()
+        {
+            return Ok(false);
+        }
+        for e in &mut next.experiments {
+            if e.previous.as_deref() == Some(id) {
+                e.previous = None;
+            }
+        }
+        for p in &mut next.proposals {
+            if p.previous.as_deref() == Some(id) {
+                p.previous = None;
+            }
+        }
+        self.persist_state(&next, &state)?;
+        *state = next;
+        self.dirty.store(false, Ordering::Release);
+        Ok(true)
+    }
+
+    /// History for the optimizer's proposal/selection step, including contrary evidence.
+    pub fn recall_experiments(&self, problem: &str) -> Vec<HarnessExperiment> {
+        if !self.retrieval_enabled.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.state
+            .read()
+            .experiments
+            .iter()
+            .rev()
+            .filter(|e| e.problem == problem)
+            .cloned()
+            .collect()
     }
 
     pub fn delete_episode(&self, id: &str) -> Result<bool> {
@@ -508,6 +674,75 @@ mod tests {
                 .starts_with("aris-learn-fixture-"));
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn optimizer_carries_measured_failures_across_models_and_preserves_a_separate_evaluation() {
+        let fixture = Fixture::new();
+        let store = LearnStore::open(&fixture.0);
+        let first = store.propose_dispatch("model-a");
+        let baseline = first.instruction();
+        store.observe_dispatch(&first, "turn-a", 1, DispatchOutcome::Truncated);
+        store.observe_dispatch(&first, "turn-a", 1, DispatchOutcome::Truncated);
+        let next = LearnStore::open(&fixture.0);
+        let revised = next.propose_dispatch("model-b");
+        assert_ne!(revised.instruction(), baseline);
+        next.observe_dispatch(&revised, "turn-b", 1, DispatchOutcome::Created);
+        let history = next.recall_experiments("admin.dispatch.native.v1");
+        assert_eq!(history.len(), 2);
+        assert!(history[0].passed && !history[1].passed);
+        assert_eq!(history[0].previous.as_deref(), Some(history[1].id.as_str()));
+        next.set_enabled(false, false);
+        assert_eq!(next.propose_dispatch("model-a").instruction(), baseline);
+        next.observe_cowork_start("invite", "model-b", 7);
+        assert!(next
+            .recall_experiments("admin.dispatch.native.v1")
+            .is_empty());
+        assert_eq!(next.list().experiments.len(), 2);
+        next.set_enabled(true, true);
+        next.observe_cowork_start("invite", "model-b", 7);
+        assert_eq!(
+            next.recall_experiments("team.cowork.start.v1")[0].measurement_ms,
+            Some(7)
+        );
+        next.clear().unwrap();
+        assert!(LearnStore::open(&fixture.0).list().experiments.is_empty());
+    }
+
+    #[test]
+    fn optimizer_grades_a_proposal_once_and_preserves_the_prediction() {
+        let fixture = Fixture::new();
+        let store = LearnStore::open(&fixture.0);
+        let proposal = sim::HarnessProposal {
+            id: "proposal/run-1".into(),
+            problem: "external.test".into(),
+            context: "test suite B".into(),
+            edit: "defer checks".into(),
+            rationale: "use the complete input".into(),
+            prediction: "all checks pass".into(),
+            alternative: "repeat early checks".into(),
+            evaluation: "run both suites".into(),
+            model: "test optimizer".into(),
+            previous: None,
+        };
+        store.save_proposal(proposal.clone()).unwrap();
+        let reopened = LearnStore::open(&fixture.0);
+        assert!(reopened
+            .grade_proposal(&proposal.id, false, "one regression".into(), Some(4))
+            .unwrap());
+        assert!(!reopened
+            .grade_proposal(&proposal.id, false, "one regression".into(), Some(4))
+            .unwrap());
+        assert!(reopened
+            .grade_proposal(&proposal.id, true, "success".into(), None)
+            .is_err());
+        let history = reopened.recall_experiments("external.test");
+        assert_eq!(history[0].prediction, proposal.prediction);
+        assert_eq!(history[0].observation, "one regression");
+        assert!(reopened.delete_experiment(&proposal.id).unwrap());
+        assert!(reopened
+            .grade_proposal(&proposal.id, true, "new".into(), None)
+            .is_err());
     }
 
     #[test]

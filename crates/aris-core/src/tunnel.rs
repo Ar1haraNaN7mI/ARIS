@@ -45,6 +45,12 @@ pub struct TunnelMessage {
     pub delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_at: Option<String>,
+    /// Co-work evidence: distinguish an invite to an idle peer from a request
+    /// received in flight, and admission to a follow-up from its actual start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_status_at_send: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_closed_reason: Option<String>,
 }
@@ -212,6 +218,8 @@ fn append(
         turn_id: actor.turn_id.clone(),
         delivered_at: None,
         resumed_at: None,
+        recipient_status_at_send: None,
+        started_at: None,
         followup_closed_reason: None,
     });
     tunnel.updated_at = at;
@@ -291,6 +299,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         return Ok(json!({"tunnels":tunnels,"blocking":false}));
     }
     let mut selected_id = None;
+    let mut wake = false;
     let team = runtime.teams.mutate(&actor.team_id, |team| {
         ensure!(
             team.status == "running",
@@ -365,6 +374,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         // providers fill unused references with strings such as "none"; those
         // fields have no meaning for open. Reply actions remain strict.
         let was_active = has_pending_work(tunnel);
+        let before = tunnel.messages.len();
         let reply_to = if address_peer && action != "send" {
             None
         } else {
@@ -463,6 +473,16 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
             _ => "tunnel_message",
         };
         let summary = format!("{}: {}", tunnel.id, tunnel.topic);
+        if let Some(message) = tunnel.messages.get(before) {
+            wake = needs_attention(tunnel, message);
+            if message.kind == "cowork_invite" {
+                tunnel.messages[before].recipient_status_at_send = team
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == message.to)
+                    .map(|agent| agent.status.clone());
+            }
+        }
         if !was_active && has_pending_work(tunnel) {
             let participants = tunnel.participants.clone();
             for participant in &participants {
@@ -482,6 +502,9 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         TeamStore::event(team, Some(&actor.agent_id), event_kind, &summary);
         Ok(())
     })?;
+    if wake {
+        runtime.teams.wake_coordinator(&actor.team_id);
+    }
     let tunnel = team
         .tunnels
         .iter()
@@ -696,6 +719,48 @@ pub(crate) fn has_unread_request_or_result(runtime: &Runtime, task_id: &str) -> 
                         && needs_attention(tunnel, message)
                 })
         }))
+}
+
+/// Record a coalesced set of invitations on the actual lane-start event. A busy
+/// worker receiving its new assignment in-context has no second start event.
+pub(crate) fn mark_started(
+    team: &mut Team,
+    agent_id: &str,
+    at: chrono::DateTime<Utc>,
+) -> Vec<(String, i64)> {
+    let mut measurements = Vec::new();
+    for tunnel in &mut team.tunnels {
+        if tunnel.status != "open" || !tunnel.participants.iter().any(|id| id == agent_id) {
+            continue;
+        }
+        for index in 0..tunnel.messages.len() {
+            let message = &tunnel.messages[index];
+            if message.to == agent_id
+                && message.kind == "cowork_invite"
+                && message.started_at.is_none()
+                && needs_attention(tunnel, message)
+                && (message.delivered_at.is_none() || message.resumed_at.is_some())
+            {
+                if let Ok(sent) = chrono::DateTime::parse_from_rfc3339(&message.at) {
+                    measurements
+                        .push((message.id.clone(), (at - sent.to_utc()).num_milliseconds()));
+                }
+                tunnel.messages[index].started_at = Some(at.to_rfc3339());
+            }
+        }
+    }
+    measurements
+}
+
+pub(crate) fn pending_invite<'a>(team: &'a Team, agent_id: &str) -> Option<&'a TunnelMessage> {
+    team.tunnels.iter().find_map(|tunnel| {
+        tunnel.messages.iter().find(|message| {
+            message.to == agent_id
+                && message.kind == "cowork_invite"
+                && message.started_at.is_none()
+                && needs_attention(tunnel, message)
+        })
+    })
 }
 
 pub(crate) fn schedule(team: &mut Team) {

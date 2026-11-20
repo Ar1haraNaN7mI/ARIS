@@ -2,6 +2,8 @@ import { useLayoutEffect, useRef } from "react";
 import Markdown from "react-markdown";
 import type { Team, TeamTunnel, TunnelMessage } from "./teamTypes";
 import { tunnelMessageLabel, tunnelRequestState } from "./tunnelMessages";
+import { CollaborationIcon } from "./CollaborationIcon";
+import { messageAction } from "./collaborationActions";
 
 const tunnelStatus = { open: "通道开放", closed: "已结束", cancelled: "已取消", interrupted: "已中断" };
 
@@ -13,7 +15,7 @@ export function TunnelMessageCard({ tunnel, message, names, onSelectActor, onOpe
   const parentId = message.reply_to || message.proposal_id;
   const parent = parentId ? tunnel.messages.find((item) => item.id === parentId) : undefined;
   return <article className="lp-tunnel-message" data-side={message.from === tunnel.participants[0] ? "first" : "second"} data-tunnel-from={message.from} data-tunnel-to={message.to} data-peer-kind={message.kind}>
-    <div className="lp-tunnel-byline"><strong>{tunnelMessageLabel(message)}</strong>
+    <div className="lp-tunnel-byline"><strong><CollaborationIcon action={messageAction(message)} />{tunnelMessageLabel(message)}</strong>
       <button onClick={() => onSelectActor(message.from)}>{names.get(message.from) || message.from}</button>
       <span aria-hidden="true">→</span><button onClick={() => onSelectActor(message.to)}>{names.get(message.to) || message.to}</button>
       {state && <span className="lp-peer-state">{state}</span>}
@@ -45,7 +47,7 @@ export function TeamTunnelThread({ team, tunnel, onSelectActor, onSelectTunnel }
       const area = e.currentTarget; follow.current = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
     }}>
       {tunnel.messages.map((message) => <TunnelMessageCard key={message.id} tunnel={tunnel} message={message} names={names} onSelectActor={onSelectActor} />)}
-      {tunnel.decision && <section className="lp-tunnel-decision" aria-label="双方确认的结论"><strong>双方已确认</strong><p>{tunnel.decision.text}</p></section>}
+      {tunnel.decision && <section className="lp-tunnel-decision" aria-label="双方确认的结论"><strong><CollaborationIcon action="accept" />双方已确认</strong><p>{tunnel.decision.text}</p></section>}
     </div>
   </section>;
 }

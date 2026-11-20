@@ -3,6 +3,8 @@ import type { ModelProfile, Team } from "./teamTypes";
 import type { SessionResult } from "./types";
 import { statusLabels } from "./teamTypes";
 import { AgentGlyph } from "./AgentGlyph";
+import { CollaborationIcon } from "./CollaborationIcon";
+import { actionLabels, messageAction, type CollaborationAction } from "./collaborationActions";
 import { newTraceNodes, projectWorkspaceTrace, traceLabels, type TraceHistory, type TraceKind, type TraceNode } from "./workspaceTrace";
 import { createLightLayer, type LightLayer } from "./vendor/lancer-light-ui/src/index";
 import "./vendor/lancer-light-ui/src/running-border.css";
@@ -10,18 +12,17 @@ import "./WorkspaceTrajectory.css";
 
 const clock = (at?: string) => { const date = at ? new Date(at) : undefined; return date && Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"; };
 
-function eventLabel(node: TraceNode) {
-  if (node.teamEventKind === "admin_delegated") return "分工";
-  if (node.source === "handoff" || node.teamEventKind === "handoff") return "交接";
-  return traceLabels[node.kind];
+function eventTitle(node: TraceNode) {
+  const label = node.action ? actionLabels[node.action] : traceLabels[node.kind];
+  return node.label.startsWith(label) ? node.label : `${label} · ${node.label}`;
 }
 
-function TraceGlyph({ kind, failed = false }: { kind: TraceKind; failed?: boolean }) {
+function TraceGlyph({ kind, action, failed = false }: { kind: TraceKind; action?: CollaborationAction; failed?: boolean }) {
   if (failed || kind === "error") return <span className="wt-glyph wt-error">×</span>;
+  if (action) return <CollaborationIcon action={action} />;
   if (kind === "complete") return <span className="wt-glyph wt-complete">✓</span>;
   if (kind === "model") return <span className="wt-glyph wt-model">◇</span>;
   if (kind === "cancelled") return <span className="wt-glyph wt-cancelled">−</span>;
-  if (kind === "tunnel") return <span className="wt-glyph wt-tunnel">⇄</span>;
   return <span className={`wt-glyph wt-${kind}`} />;
 }
 
@@ -180,7 +181,8 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
     setDetail(node); if (node.agentId) onSelectAgent(node.teamId, node.agentId);
   };
   const legend: TraceKind[] = ["reply", "checkpoint", "start", "merge", "artifact", "tool", "model", "wait", "complete", "error", "cancelled", "message"];
-  if (visibleTeams.some((team) => team.tunnels?.length)) legend.push("tunnel");
+  const actionLegend = new Set<CollaborationAction>();
+  for (const lane of visible) for (const node of lane.nodes) if (node.action) actionLegend.add(node.action);
   return <aside className="lp-trajectory wt-panel" aria-label="工作树与泳道">
     <header className="wt-heading"><strong>工作树 · 泳道</strong><span>{visible.length} 个角色 · {visible.filter((lane) => lane.agent.status === "running").length} 运行中</span></header>
     <div className="wt-heads-scroll" ref={heads} style={{ maxWidth: width || undefined }} onScroll={(event) => {
@@ -202,7 +204,7 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
         {activeTunnels.map(({ team, tunnel, left, width: span, names }) => <div key={tunnel.id}>
           <button type="button" className="wt-tunnel-rail" style={{ marginLeft: left, width: span }}
             title={`${names} · ${tunnel.topic}`} aria-label={`打开协商 · ${names} · ${tunnel.topic}`}
-            onClick={() => onOpenTunnel?.(team.id, tunnel.id)}><span>{tunnel.topic}</span></button>
+            onClick={() => onOpenTunnel?.(team.id, tunnel.id)}><span><CollaborationIcon size={12} action={tunnel.messages.length ? messageAction(tunnel.messages[tunnel.messages.length - 1]) : "open"} />{tunnel.topic}</span></button>
         </div>)}
       </div>}
     </div>
@@ -250,8 +252,8 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
           <button type="button" key={node.id} className="wt-node" data-selected={currentDetail?.id === node.id}
             data-agent-current={activeTeamId === node.teamId && selectedAgentId === lane.agent.id} data-trace-kind={node.kind}
             style={{ left: rail - 9, top: node.y - 10, width: left + columnWidth - rail + 2, "--lc": lane.color } as CSSProperties}
-            aria-label={`${lane.agent.name} · ${eventLabel(node)} · ${node.label}`} onClick={() => choose(node)} onMouseEnter={(event) => showTip(node, event.currentTarget)} onMouseLeave={() => setTip(undefined)} onFocus={(event) => showTip(node, event.currentTarget)} onBlur={() => setTip(undefined)}>
-            <span className="wt-marker" data-anchor-key={`tree:${node.teamId}:${node.id}`} data-tree-anchor={node.id} data-event-lane={lane.id} data-event-type={node.kind}><TraceGlyph kind={node.kind} failed={node.ok === false} /></span>
+            aria-label={`${lane.agent.name} · ${eventTitle(node)}`} onClick={() => choose(node)} onMouseEnter={(event) => showTip(node, event.currentTarget)} onMouseLeave={() => setTip(undefined)} onFocus={(event) => showTip(node, event.currentTarget)} onBlur={() => setTip(undefined)}>
+            <span className="wt-marker" data-anchor-key={`tree:${node.teamId}:${node.id}`} data-tree-anchor={node.id} data-event-lane={lane.id} data-event-type={node.kind}><TraceGlyph kind={node.kind} action={node.action} failed={node.ok === false} /></span>
             <span className="wt-node-label"><span>{node.label}</span><small>{node.identity?.modelId || node.identity?.profileId || lane.agent.name} · {clock(node.at)}</small></span>
           </button>))}
       </div>}
@@ -265,8 +267,11 @@ export function WorkspaceTrajectory({ teams, activeTeamId, selectedAgentId, prof
         </div>;
       })}
     </section>}
-    {currentDetail && <section className="wt-detail" aria-label="节点详情"><header><strong>{eventLabel(currentDetail)} · {currentDetail.label}</strong><button type="button" onClick={() => setDetail(undefined)} aria-label="关闭节点详情">×</button></header><p>{clock(currentDetail.at)}{currentDetail.durationMs !== undefined ? ` · ${(currentDetail.durationMs / 1000).toFixed(1)} 秒` : ""}{currentDetail.ok === false ? " · 工具返回失败" : ""}</p><pre>{currentDetail.detail}</pre>{currentDetail.arguments !== undefined && <details><summary>输入参数</summary><pre>{JSON.stringify(currentDetail.arguments, null, 2)}</pre></details>}{currentDetail.result !== undefined && <details><summary>实际返回</summary><pre>{currentDetail.result}</pre></details>}{currentDetail.agentId && <button type="button" className="wt-open-session" onClick={() => onSelectAgent(currentDetail.teamId, currentDetail.agentId!)}>打开这位智能体的会话 ↗</button>}</section>}
-    <footer className="wt-legend"><strong>图例 · 真实事件</strong>{legend.map((kind) => <span key={kind}><span className="wt-legend-mark"><TraceGlyph kind={kind} /></span>{traceLabels[kind]}</span>)}</footer>
-    {tip && <aside className="wt-tooltip" role="tooltip" style={{ left: tip.x, top: tip.y }}><strong>{eventLabel(tip.node)} · {tip.node.label}</strong><small>{clock(tip.node.at)} · {tip.node.source === "session" ? "会话记录" : tip.node.source === "checkpoint" ? "保存的检查点" : "工作流记录"}</small><p>{tip.node.detail.slice(0, 260)}</p></aside>}
+    {currentDetail && <section className="wt-detail" aria-label="节点详情"><header><strong>{eventTitle(currentDetail)}</strong><button type="button" onClick={() => setDetail(undefined)} aria-label="关闭节点详情">×</button></header><p>{clock(currentDetail.at)}{currentDetail.durationMs !== undefined ? ` · ${(currentDetail.durationMs / 1000).toFixed(1)} 秒` : ""}{currentDetail.ok === false ? " · 工具返回失败" : ""}</p><pre>{currentDetail.detail}</pre>{currentDetail.arguments !== undefined && <details><summary>输入参数</summary><pre>{JSON.stringify(currentDetail.arguments, null, 2)}</pre></details>}{currentDetail.result !== undefined && <details><summary>实际返回</summary><pre>{currentDetail.result}</pre></details>}{currentDetail.agentId && <button type="button" className="wt-open-session" onClick={() => onSelectAgent(currentDetail.teamId, currentDetail.agentId!)}>打开这位智能体的会话 ↗</button>}</section>}
+    <footer className="wt-legend"><strong>图例 · 真实事件</strong>
+      {legend.map((kind) => <span key={kind}><span className="wt-legend-mark"><TraceGlyph kind={kind} /></span>{traceLabels[kind]}</span>)}
+      {Array.from(actionLegend).map((action) => <span key={`action-${action}`}><span className="wt-legend-mark"><CollaborationIcon size={14} action={action} /></span>{actionLabels[action]}</span>)}
+    </footer>
+    {tip && <aside className="wt-tooltip" role="tooltip" style={{ left: tip.x, top: tip.y }}><strong>{eventTitle(tip.node)}</strong><small>{clock(tip.node.at)} · {tip.node.source === "session" ? "会话记录" : tip.node.source === "checkpoint" ? "保存的检查点" : "工作流记录"}</small><p>{tip.node.detail.slice(0, 260)}</p></aside>}
   </aside>;
 }

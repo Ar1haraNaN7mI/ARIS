@@ -14,7 +14,8 @@ use std::{
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 /// Automatic administration is bounded independently of manually created teams.
@@ -224,11 +225,17 @@ pub struct TeamSpec {
     pub files: Vec<String>,
 }
 
+#[derive(Default)]
+struct ActiveTeam {
+    wakeup: Arc<Notify>,
+    handles: HashMap<String, AgentHandle>,
+}
+
 pub struct TeamStore {
     root: PathBuf,
     workspace: PathBuf,
     transaction: Mutex<()>,
-    handles: Mutex<HashMap<String, Vec<AgentHandle>>>,
+    active_runs: Mutex<HashMap<String, ActiveTeam>>,
     live_outputs: Mutex<HashMap<(String, String), String>>,
     /// Disposable lookup cache; Team.agents remains the only role registry.
     session_ownership: Mutex<HashMap<String, bool>>,
@@ -242,7 +249,7 @@ impl TeamStore {
             root,
             workspace: workspace.canonicalize()?,
             transaction: Mutex::new(()),
-            handles: Mutex::new(HashMap::new()),
+            active_runs: Mutex::new(HashMap::new()),
             live_outputs: Mutex::new(HashMap::new()),
             session_ownership: Mutex::new(HashMap::new()),
             tasks: Mutex::new(None),
@@ -317,7 +324,7 @@ impl TeamStore {
         let _state = self.state_lock(id)?;
         let mut team = self.read(id)?;
         if matches!(team.status.as_str(), "running" | "cancelling" | "planning")
-            && !self.handles.lock().contains_key(id)
+            && !self.active_runs.lock().contains_key(id)
         {
             if let Ok(_lease) = self.run_lock(id) {
                 if let Some(tasks) = self.tasks.lock().as_ref().and_then(Weak::upgrade) {
@@ -406,6 +413,13 @@ impl TeamStore {
             kind: kind.into(),
             message: message.into(),
         });
+    }
+    /// Wake the sole coordinator after actionable peer work is durable. A permit
+    /// also covers a send between the coordinator's last read and its next wait.
+    pub(crate) fn wake_coordinator(&self, id: &str) {
+        if let Some(run) = self.active_runs.lock().get(id) {
+            run.wakeup.notify_one();
+        }
     }
     /// Team.agents is the durable subagent registry. No second conversation or
     /// shadow role store is created. Legacy roles acquire an identity in place.
@@ -884,8 +898,8 @@ impl TeamStore {
             );
             Ok(())
         })?;
-        if let Some(handles) = self.handles.lock().get(id) {
-            for handle in handles {
+        if let Some(run) = self.active_runs.lock().get(id) {
+            for handle in run.handles.values() {
                 handle.cancel();
             }
         }
@@ -1368,12 +1382,21 @@ impl TeamStore {
             );
             Ok(())
         })?;
-        self.handles.lock().insert(id.into(), vec![]);
+        let active = ActiveTeam::default();
+        let wakeup = active.wakeup.clone();
+        self.active_runs.lock().insert(id.into(), active);
         let store = self.clone();
         let id = id.to_owned();
         tokio::spawn(async move {
-            let result = store.drive(runtime, &id).await;
+            let mut running = JoinSet::new();
+            let result = store.drive(runtime, &id, &wakeup, &mut running).await;
             if let Err(error) = result {
+                // Keep leases until active runners (including ones still opening
+                // their native task) have observed cancellation and stopped.
+                if !running.is_empty() {
+                    let _ = store.cancel(&id);
+                    while running.join_next().await.is_some() {}
+                }
                 let _ = store.mutate(&id, |t| {
                     t.status = "failed".into();
                     crate::tunnel::close_all(t, "interrupted", &error.to_string());
@@ -1381,25 +1404,37 @@ impl TeamStore {
                     Ok(())
                 });
             }
-            store.handles.lock().remove(&id);
+            store.active_runs.lock().remove(&id);
             drop(file_leases);
             drop(lease);
         });
         Ok(team)
     }
-    async fn drive(self: &Arc<Self>, runtime: Arc<Runtime>, id: &str) -> Result<()> {
+    async fn drive(
+        self: &Arc<Self>,
+        runtime: Arc<Runtime>,
+        id: &str,
+        wakeup: &Notify,
+        running: &mut JoinSet<(String, Result<()>)>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut publication_deadline = None;
         let mut runs = 0usize;
+        let mut in_flight = HashSet::new();
         loop {
             let team = self.mutate(id, |t| {
                 if t.status != "cancelling" {
-                    apply_queued_messages(t);
+                    if running.is_empty() {
+                        apply_queued_messages(t);
+                    }
                     crate::tunnel::schedule(t);
                 }
                 Ok(())
             })?;
             if team.status == "cancelling" {
+                while let Some(joined) = running.join_next().await {
+                    joined?.1?;
+                }
                 self.mutate(id, |t| {
                     t.status = "cancelled".into();
                     crate::tunnel::close_all(t, "cancelled", "Team execution was cancelled");
@@ -1419,8 +1454,14 @@ impl TeamStore {
                 })?;
                 return Ok(());
             }
-            let ready = ready_wave(&team);
-            if ready.is_empty() {
+            // User follow-ups can change several roles' assignments. Drain
+            // existing work before applying them, as for ordinary reruns.
+            let ready = if team.messages.iter().any(|message| message.queued) {
+                vec![]
+            } else {
+                ready_wave(&team, &in_flight)
+            };
+            if ready.is_empty() && running.is_empty() {
                 self.mutate(id, |t| {
                     // A message may arrive after ready_wave was computed. Keep
                     // the run alive and consume it on the next safe boundary.
@@ -1501,44 +1542,40 @@ impl TeamStore {
                     Ok(())
                 })?;
             }
-            if dispatch.is_empty() {
-                continue;
-            }
             if let Some(budget) = &team.execution_budget {
+                let available = budget.max_agent_runs.saturating_sub(runs);
                 ensure!(
-                    runs + dispatch.len() <= budget.max_agent_runs,
+                    dispatch.is_empty() || available > 0 || !running.is_empty(),
                     "Admin agent-run budget exhausted; send a new instruction to continue"
                 );
+                dispatch.truncate(available);
             }
-            let mut running = tokio::task::JoinSet::new();
             runs += dispatch.len();
             for (agent, deadline) in dispatch {
+                let worker_id = agent.id.clone();
+                in_flight.insert(worker_id.clone());
                 let store = self.clone();
                 let runtime = runtime.clone();
                 let id = id.to_owned();
-                running.spawn(async move { store.run_agent(runtime, &id, agent, deadline).await });
+                running.spawn(async move {
+                    (
+                        worker_id,
+                        store.run_agent(runtime, &id, agent, deadline).await,
+                    )
+                });
             }
-            let mut first_error = None;
-            while let Some(result) = running.join_next().await {
-                let error = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error),
-                    Err(error) => Some(error.into()),
-                };
-                if let Some(error) = error {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    if let Some(handles) = self.handles.lock().get(id) {
-                        for handle in handles {
-                            handle.cancel();
+            if !running.is_empty() {
+                tokio::select! {
+                    Some(joined) = running.join_next() => {
+                        let (worker_id, result) = joined?;
+                        in_flight.remove(&worker_id);
+                        if let Some(run) = self.active_runs.lock().get_mut(id) {
+                            run.handles.remove(&worker_id);
                         }
+                        result?;
                     }
+                    _ = wakeup.notified() => {}
                 }
-            }
-            self.handles.lock().entry(id.into()).or_default().clear();
-            if let Some(error) = first_error {
-                return Err(error);
             }
         }
     }
@@ -1549,6 +1586,7 @@ impl TeamStore {
         agent: TeamAgent,
         deadline: Option<std::time::Instant>,
     ) -> Result<()> {
+        let mut cowork_starts = Vec::new();
         let team = self.mutate(id, |t| {
             let current = t
                 .agents
@@ -1556,9 +1594,21 @@ impl TeamStore {
                 .find(|a| a.id == agent.id)
                 .context("agent missing")?;
             current.status = "running".into();
-            Self::event(t, Some(&agent.id), "agent_started", &agent.name);
+            let at = Utc::now();
+            t.events.push(TeamEvent {
+                at: at.to_rfc3339(),
+                agent_id: Some(agent.id.clone()),
+                kind: "agent_started".into(),
+                message: agent.name.clone(),
+            });
+            cowork_starts = crate::tunnel::mark_started(t, &agent.id, at);
             Ok(())
         })?;
+        for (message_id, elapsed_ms) in cowork_starts {
+            runtime
+                .learn
+                .observe_cowork_start(&message_id, &agent.profile_id, elapsed_ms);
+        }
         let outcome: Result<()> = async {
             let kei = crate::kei::load_kei_config(&runtime.outer_home, &runtime.config.kei)?;
             let profile = kei.profile(&agent.profile_id)?;
@@ -1580,11 +1630,12 @@ impl TeamStore {
                 .run_team_task(task.id.clone(), session, prompt, tx)
                 .await?;
             {
-                self.handles
+                self.active_runs
                     .lock()
-                    .entry(id.into())
-                    .or_default()
-                    .push(handle.clone());
+                    .get_mut(id)
+                    .context("team coordinator missing")?
+                    .handles
+                    .insert(agent.id.clone(), handle.clone());
             }
             let mut error = None;
             match self.read(id) {
@@ -1974,17 +2025,34 @@ pub(crate) fn validate_graph(agents: &[TeamAgent]) -> Result<()> {
         }
     }
 }
-fn ready_wave(team: &Team) -> Vec<TeamAgent> {
+fn ready_wave(team: &Team, in_flight: &HashSet<String>) -> Vec<TeamAgent> {
     let complete: HashSet<_> = team
         .agents
         .iter()
-        .filter(|a| a.status == "completed")
+        .filter(|a| a.status == "completed" && !in_flight.contains(&a.id))
         .map(|a| &a.id)
         .collect();
-    let mut files = HashSet::new();
+    // A spawned future can still be opening or closing its native task when
+    // another lane sends a signal. Its slot and files stay reserved until join.
+    let mut files: HashSet<_> = team
+        .agents
+        .iter()
+        .filter(|a| in_flight.contains(&a.id))
+        .flat_map(|a| a.files.iter().map(|file| file.to_lowercase()))
+        .collect();
     let mut ready = vec![];
-    for agent in &team.agents {
-        if ready.len()
+    let mut candidates: Vec<_> = team
+        .agents
+        .iter()
+        .filter(|a| {
+            a.status == "pending" && !in_flight.contains(&a.id) && selected_for_run(team, a)
+        })
+        .map(|a| (a, crate::tunnel::pending_invite(team, &a.id)))
+        .collect();
+    // A queued collaboration gets the next available slot before unrelated work.
+    candidates.sort_by_key(|(_, invite)| invite.is_none());
+    for (agent, invite) in candidates {
+        if in_flight.len() + ready.len()
             >= team
                 .execution_budget
                 .as_ref()
@@ -1992,16 +2060,19 @@ fn ready_wave(team: &Team) -> Vec<TeamAgent> {
         {
             break;
         }
-        if !selected_for_run(team, agent)
-            || agent.status != "pending"
-            || crate::tunnel::blocks_final(team, agent)
-            || !agent.depends_on.iter().all(|d| {
-                complete.contains(d)
-                    || team
-                        .dispatch_agent_ids
-                        .as_ref()
-                        .is_some_and(|scope| !scope.contains(d))
-            })
+        // This lane already met its original prerequisites. Its current request
+        // can come from a prerequisite that is itself now on a follow-up turn.
+        let resumed_worker = agent.delivery != Some(crate::synthesis::DeliveryKind::Final)
+            && invite.is_some_and(|message| message.resumed_at.is_some());
+        if crate::tunnel::blocks_final(team, agent)
+            || (!resumed_worker
+                && !agent.depends_on.iter().all(|d| {
+                    complete.contains(d)
+                        || team
+                            .dispatch_agent_ids
+                            .as_ref()
+                            .is_some_and(|scope| !scope.contains(d))
+                }))
         {
             continue;
         }
@@ -2269,7 +2340,7 @@ mod tests {
         ];
         validate_graph(&agents).unwrap();
         assert_eq!(
-            ready_wave(&team(agents))
+            ready_wave(&team(agents), &HashSet::new())
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
@@ -2277,6 +2348,51 @@ mod tests {
         );
         assert!(validate_graph(&[agent("a", &["b"], &[]), agent("b", &["a"], &[])]).is_err());
     }
+    #[test]
+    fn a_co_work_continuation_keeps_its_slot_and_file_constraints() {
+        use serde_json::json;
+        let mut t = team(vec![
+            agent("sender", &[], &["budget.md"]),
+            agent("other", &[], &[]),
+            agent("helper", &["sender"], &["receipt.md"]),
+        ]);
+        t.execution_budget = Some(serde_json::from_value(json!({
+            "agent_ids":["sender","other","helper"], "max_agent_runs":8, "max_steps_per_agent":12,
+            "max_tool_calls_per_agent":24, "max_context_chars":64000, "max_tokens_per_step":4096,
+            "max_parallel":2, "max_runtime_secs":120
+        })).unwrap());
+        t.tunnels.push(
+            serde_json::from_value(json!({
+                "id":"work","topic":"verify","status":"open","participants":["sender","helper"],
+                "created_at":now(), "updated_at":now(), "messages":[{
+                    "id":"invite","seq":1,"from":"sender","to":"helper","text":"check the budget",
+                    "kind":"cowork_invite","expects_reply":true,"at":now(),
+                    "session_id":"s","task_id":"t","turn_id":"turn","run_id":"r"
+                }]
+            }))
+            .unwrap(),
+        );
+        t.agents[0].status = "running".into();
+        let active = HashSet::from(["sender".to_owned()]);
+        let selected = |team: &Team| {
+            ready_wave(team, &active)
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>()
+        };
+        // An unstarted helper waits for its original dependency.
+        assert_eq!(selected(&t), ["other"]);
+        t.agents[2].status = "completed".into();
+        crate::tunnel::schedule(&mut t);
+        // An idle helper already satisfied the same dependency on its first
+        // turn. The requester stays in flight while the helper has priority.
+        assert_eq!(selected(&t), ["helper"]);
+        t.agents[2].files = vec!["BUDGET.md".into()];
+        assert_eq!(selected(&t), ["other"]);
+        t.execution_budget.as_mut().unwrap().max_parallel = 1;
+        assert!(selected(&t).is_empty());
+    }
+
     #[test]
     fn graph_rejects_multiple_or_nonterminal_explicit_final_roles() {
         let mut first = agent("a", &[], &[]);

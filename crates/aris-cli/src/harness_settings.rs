@@ -20,15 +20,38 @@ pub(crate) fn dispatch(runtime: &Arc<Runtime>, method: &str, params: &Value) -> 
             let state = runtime.learn.list();
             Ok(
                 json!({"total":state.episodes.len(),"feedback_total":state.feedback.len(),
-                "memories":state.episodes,"feedback":state.feedback}),
+                "memories":state.episodes,"feedback":state.feedback,"experiment_total":state.experiments.len(),
+                "experiments":state.experiments,"proposals":state.proposals}),
             )
         }
+        "memory/experiments/recall" => required_string(params, "problem")
+            .map(|problem| json!({"experiments":runtime.learn.recall_experiments(problem)})),
+        "memory/experiments/evaluate" => {
+            serde_json::from_value::<aris_core::sim::ExternalEvaluation>(params.clone())
+                .map_err(|e| RpcFailure::invalid_params(e.to_string()))
+                .and_then(|entry| {
+                    entry
+                        .into_experiment()
+                        .map_err(|e| RpcFailure::invalid_params(e.to_string()))
+                })
+                .and_then(|entry| {
+                    let id = entry.id.clone();
+                    let problem = entry.problem.clone();
+                    runtime
+                        .learn
+                        .record_experiment(entry)
+                        .map(|recorded| json!({"id":id,"problem":problem,"recorded":recorded}))
+                        .map_err(internal)
+                })
+        }
+        "memory/experiments/grade" => crate::sim_optimizer::grade(runtime, params)
+            .map_err(|e| RpcFailure::invalid_params(e.to_string())),
         "memory/delete" => delete_memory(runtime, params),
         "memory/clear" => {
             let before = runtime.learn.list();
             runtime.learn.clear().map_err(internal).map(|()| {
                 clear_memory_prompt(runtime);
-                json!({"deleted_episodes":before.episodes.len(),"deleted_feedback":before.feedback.len()})
+                json!({"deleted_episodes":before.episodes.len(),"deleted_feedback":before.feedback.len(),"deleted_experiments":before.experiments.len()})
             })
         }
         "sessions/archive" | "sessions/unarchive" | "sessions/delete" | "sessions/rename" => {
@@ -67,15 +90,21 @@ fn delete_memory(runtime: &Runtime, params: &Value) -> RpcResult {
     let id = required_string(params, "id")?;
     let kind = match params.get("kind") {
         None => "episode",
-        Some(Value::String(value)) if value == "episode" || value == "feedback" => value,
+        Some(Value::String(value))
+            if matches!(value.as_str(), "episode" | "feedback" | "experiment") =>
+        {
+            value
+        }
         _ => {
             return Err(RpcFailure::invalid_params(
-                "kind must be episode or feedback",
+                "kind must be episode, feedback or experiment",
             ))
         }
     };
     let deleted = if kind == "episode" {
         runtime.learn.delete_episode(id)
+    } else if kind == "experiment" {
+        runtime.learn.delete_experiment(id)
     } else {
         runtime.learn.delete_feedback(id)
     }

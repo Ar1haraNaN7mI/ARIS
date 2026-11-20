@@ -103,6 +103,9 @@
 .lp-tunnel-byline button { border:0; padding:0; background:none; color:#1e546a; font-weight:600; }
 .lp-tunnel-byline time { margin-left:auto; }
 .lp-tunnel-byline strong,.lp-peer-state { color:#186778; }
+.collaboration-icon { display:inline-block; flex:none; vertical-align:middle; color:#136d80; }
+.lp-tunnel-byline strong,.lp-tunnel-decision strong { display:inline-flex; align-items:center; gap:5px; }
+.lp-tool-step.failed .collaboration-icon { color:#aa5050; }
 .lp-peer-state { border-left:1px solid #b4d0d5; padding-left:6px; }
 .lp-peer-reference { display:block; margin:8px 0 0; padding-left:8px; border-left:2px solid #b8cdd3; color:#516e7a; font-size:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .lp-peer-topic { display:block; max-width:100%; margin-top:6px; padding:2px 0; background:none; border:0; color:#236b7b; font-size:12px; text-align:left; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }

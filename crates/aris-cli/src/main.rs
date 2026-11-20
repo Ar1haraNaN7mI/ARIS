@@ -7,6 +7,7 @@ mod harness_settings;
 mod kei_import;
 mod mcp_server;
 mod model_service;
+mod sim_optimizer;
 mod team_planner;
 mod team_service;
 mod web_access;

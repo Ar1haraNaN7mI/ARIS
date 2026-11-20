@@ -4,6 +4,7 @@ import { TeamDelivery } from "./TeamDelivery";
 import { TeamTunnelThread } from "./TeamTunnel";
 import { ProcessChat } from "./ProcessChat";
 import { tunnelRequestState } from "./tunnelMessages";
+import { actionLabels, messageAction } from "./collaborationActions";
 import { projectWorkspaceTrace } from "./workspaceTrace";
 import { rpc } from "./api";
 import type { Team, TeamAgent, TeamTunnel, TunnelMessage } from "./teamTypes";
@@ -18,6 +19,30 @@ const channel: TeamTunnel = { id: "tunnel-1", topic: "推广角度", participant
   { id: "r", seq: 2, at, from: "a", to: "b", kind: "accept", text: "我核过文档，同意。", proposal_id: "q" },
 ], decision: { proposal_id: "q", accepted_by: ["b","a"], text: "主推统一接口。", at } };
 const team: Team = { id: "team", name: "研究", created_at: at, status: "completed", goal: "调研与推广", agents: [actor("a"), actor("b"), { ...actor("writer"), delivery: "final" }], files: [], checkpoints: [], handoffs: [], events: [], tunnels: [channel] };
+
+it("uses a distinct outline and a readable action label for each peer action in both lanes and the conversation", () => {
+  const kinds: TunnelMessage["kind"][] = ["message", "question", "answer", "notice", "proposal", "accept", "cowork_invite", "cowork_accept", "cowork_decline", "cowork_result"];
+  const messages = kinds.map((kind, i) => ({ ...channel.messages[0], id: String(i), seq: i, kind }));
+  const tunnel = { ...channel, messages, decision: null };
+  const sample = { ...team, tunnels: [tunnel] };
+  const view = render(<TeamTunnelThread team={sample} tunnel={tunnel} onSelectActor={vi.fn()} onSelectTunnel={vi.fn()} />);
+  const paths = new Set<string>();
+  for (const message of messages) {
+    const heading = view.container.querySelector(`[data-peer-kind="${message.kind}"] .lp-tunnel-byline strong`)!;
+    const icon = heading.querySelector(`svg[data-action-icon="${message.kind}"]`)!;
+    expect(heading.textContent).toBe(actionLabels[message.kind]);
+    expect(icon.getAttribute("aria-hidden")).toBe("true");
+    paths.add(icon.querySelector("path")!.getAttribute("d")!);
+  }
+  expect(paths.size).toBe(kinds.length);
+  for (const lane of projectWorkspaceTrace([sample]).lanes.filter((l) => tunnel.participants.includes(l.agent.id))) {
+    expect(lane.nodes.map((node) => node.action)).toEqual(kinds);
+  }
+  const legacy = messages[0];
+  expect(messageAction({ ...legacy, expects_reply: true })).toBe("question");
+  expect(messageAction({ ...legacy, expects_reply: false })).toBe("notice");
+  expect(messageAction({ ...legacy, reply_to: "earlier" })).toBe("answer");
+});
 
 it("connects each tunnel message from its actual sender to its peer, including reverse messages at the same timestamp", () => {
   const trace = projectWorkspaceTrace([team]);

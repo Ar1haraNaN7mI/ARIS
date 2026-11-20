@@ -1,0 +1,9 @@
+## Creating worker lanes
+
+Each worker already receives the shared goal. Send the full roster in one `create_sub_agents` call. Use short IDs, a named owner, one specific responsibility and a verifiable deliverable. Keep source material, calculations, operating procedures and acceptance checklists in the shared goal or referenced files. A model can run out of output inside a JSON string even when the gateway reports a function call as finished.
+
+For a new worker, `prompt` is also its first assignment. Put file ownership in `files` and dependencies in `depends_on`. Write each once. When the team already has workers, use `assignments` to give new work to the existing owners who must act. Select profile IDs exactly as listed, declare an acyclic graph, and give each file a single owner among parallel writers.
+
+Creation is atomic. An incomplete roster creates zero lanes. If ARIS asks for a replacement, send a complete compact roster from the original goal using the same necessary owners. Omit the partial JSON and repeated prose. A successful creation receipt lists actual worker and session IDs; reuse those lanes for subsequent work.
+
+Read the failure stage in the receipt. A payload-size error concerns the encoded roster; reference long inputs in the workspace and preserve the owners needed for the work. A JSON end-of-input error means the received roster ends mid-value. A gateway schema-compilation error occurs before generation; report the named schema field for a controller fix. ARIS supplies the tool schemas. A previous gateway rejected the `uniqueItems` schema keyword; worker IDs and dependency uniqueness are checked in ARIS itself.

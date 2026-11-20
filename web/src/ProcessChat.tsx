@@ -10,6 +10,8 @@ import { RunningBorder } from "./RunningBorder";
 import type { ModelProfile, Team, TeamAgent, TeamTunnel, TunnelMessage } from "./teamTypes";
 import { TunnelMessageCard } from "./TeamTunnel";
 import { mirrorsReceivedTunnelMessage } from "./tunnelMessages";
+import { CollaborationIcon } from "./CollaborationIcon";
+import { actionLabels, toolAction } from "./collaborationActions";
 import type { SessionEvent, SessionResult } from "./types";
 import { conversationAgents, messageSource } from "./teamConversationModel";
 
@@ -110,12 +112,13 @@ export function ProcessChat({ team, sessions, profiles, agentId, onSelectAgent, 
       const duration = result ? Date.parse(result.at) - Date.parse(event.at) : NaN;
       const file = result?.ok === true ? writtenFile(event) : undefined;
       const toolName = event.name || result?.name || "";
+      const action = toolAction(toolName, event.arguments);
       const adminTool = team.admin && agent?.session_id === team.admin.session_id ? adminTools.get(toolName) : undefined;
       const recipients = adminTool ? recipientsFromReceipt(team, result) : [];
       return <div key={entry.id} {...attrs} className="lp-process-row" style={{ "--model-color": color, "--light-color": color } as CSSProperties}>
         <details className={`lp-tool-step ${live ? "running" : ""} ${result?.ok === false ? "failed" : ""}`}>
-          <summary>{live && <RunningBorder />}<span className={`lp-step-marker ${result?.ok === false ? "failed" : ""}`} />
-            <strong>{adminTool || toolName || "工具调用"}</strong><span className="lp-tool-owner">{agent?.name}</span>
+          <summary>{live && <RunningBorder />}{action ? <CollaborationIcon action={action} /> : <span className={`lp-step-marker ${result?.ok === false ? "failed" : ""}`} />}
+            <strong title={toolName}>{adminTool || (action && actionLabels[action]) || toolName || "工具调用"}</strong><span className="lp-tool-owner">{agent?.name}</span>
             <small>{live ? "执行中" : result ? result.ok === false ? "失败" : "已完成" : "未返回"}{Number.isFinite(duration) && duration >= 0 && ` · ${duration < 1000 ? `${duration} ms` : `${(duration / 1000).toFixed(1)} s`}`}</small>
           </summary>
           <div className="lp-tool-body">

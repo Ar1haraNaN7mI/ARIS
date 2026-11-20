@@ -423,6 +423,11 @@ async fn handle_request(
     if let Some(result) = crate::harness_extensions::dispatch(&runtime, method, &params) {
         return result;
     }
+    if method == "memory/experiments/propose" {
+        return crate::sim_optimizer::propose(&runtime, &params)
+            .await
+            .map_err(|error| RpcFailure::invalid_params(error.to_string()));
+    }
     if let Some(result) = crate::harness_settings::dispatch(&runtime, method, &params) {
         return result;
     }

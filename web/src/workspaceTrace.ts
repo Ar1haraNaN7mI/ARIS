@@ -1,6 +1,7 @@
 import type { ModelProfile, Team, TeamAgent } from "./teamTypes";
 import { adminAgent, conversationAgents } from "./teamConversationModel";
 import { mirrorsReceivedTunnelMessage, tunnelMessageLabel } from "./tunnelMessages";
+import { actionLabels, messageAction, toolAction, type CollaborationAction } from "./collaborationActions";
 import type { SessionEvent, SessionResult } from "./types";
 import { sessionModelIdentities, type SessionModelIdentity } from "./sessionModelIdentity";
 
@@ -10,6 +11,7 @@ export type TraceNode = {
   id: string; revision: string; teamId: string; laneId?: string; agentId?: string; at: string;
   kind: TraceKind; label: string; detail: string; source: "team" | "session" | "checkpoint" | "handoff" | "tunnel";
   tunnelId?: string; sentNodeId?: string; tunnelOrder?: number;
+  action?: CollaborationAction;
   eventId?: string; anchorEventId?: string; ok?: boolean; running?: boolean; arguments?: unknown; result?: string;
   identity?: SessionModelIdentity;
   parentIds: string[]; parentKinds: Record<string, TraceEdgeKind>; y: number; durationMs?: number;
@@ -65,7 +67,7 @@ function sessionNodes(team: Team, agent: TeamAgent, events: SessionEvent[], prof
       node.durationMs = Math.max(0, time(event.at) - time(node.at));
       node.at = event.at; node.eventId = event.id; node.revision = `${node.id}/result/${key(event.type, event.id, event.at)}`;
       node.ok = event.ok; node.running = false; node.result = event.content;
-      node.label = `${event.name || node.label}${event.ok === false ? " · 失败" : ""}`;
+      node.label = `${node.action ? actionLabels[node.action] : event.name || node.label}${event.ok === false ? " · 失败" : ""}`;
       const path = toolFile(node.arguments);
       if (event.ok && path && ["write_file", "edit_file", "create_file"].includes(event.name || "")) { node.kind = "artifact"; node.label = path; }
       pending.delete(event.call_id);
@@ -75,15 +77,17 @@ function sessionNodes(team: Team, agent: TeamAgent, events: SessionEvent[], prof
     const recordKey = key(event.type, event.id);
     const occurrence = occurrences.get(recordKey) || 0; occurrences.set(recordKey, occurrence + 1);
     const id = nodeId(team.id, "session", agent.id, agent.session_id || "", event.type, event.id, String(occurrence));
+    const action = kind === "tool" ? toolAction(event.name, event.arguments) : undefined;
     const node: TraceNode = {
       id, revision: id, teamId: team.id, laneId: traceLaneId(team.id, agent.id), agentId: agent.id,
       at: event.at, kind, source: "session", eventId: event.id, anchorEventId: event.id, parentIds: [], parentKinds: {}, y: 0,
       identity: identities.get(event.id),
       label: event.type === "user_message" ? isAdmin ? compact(event.text || "消息") : "接收执行上下文" : kind === "reply" ? compact(event.text || "模型回复") : kind === "tool" ? toolLabel(event, event.ok) : compact(event.text || "运行记录"),
-      detail: event.text || event.name || "", arguments: event.arguments, result: event.content, ok: event.ok,
+      action, detail: event.text || event.name || "", arguments: event.arguments, result: event.content, ok: event.ok,
       running: event.type === "tool_call" && agent.status === "running" && ["planning", "running", "cancelling"].includes(team.status),
     };
     nodes.push(node);
+    if (action) node.label = actionLabels[action];
     if (event.type === "tool_call" && event.call_id) pending.set(event.call_id, node);
   }
   return nodes;
@@ -92,16 +96,18 @@ function sessionNodes(team: Team, agent: TeamAgent, events: SessionEvent[], prof
 function teamNode(team: Team, event: Team["events"][number], occurrence: number, agent?: TeamAgent): TraceNode {
   let kind: TraceKind = "note", label = event.message;
   let ok: boolean | undefined;
+  let action: CollaborationAction | undefined;
+  const channel = event.kind.startsWith("tunnel_") ? team.tunnels?.find((t) => event.message.startsWith(t.id + ": ")) : undefined;
   switch (event.kind) {
     case "created": kind = "start"; label = "工作区已创建"; break;
     case "started": kind = "start"; label = "开始执行"; break;
     case "admin_started": kind = "start"; label = "ARIS · 正在处理"; break;
     case "admin_answered": kind = "complete"; label = "ARIS · 已回复"; break;
-    case "admin_delegated": kind = "merge"; label = "ARIS · 已安排协作"; break;
+    case "admin_delegated": kind = "merge"; action = "dispatch"; label = "ARIS · 已安排协作"; break;
     case "admin_failed": kind = "error"; label = "ARIS · 未完成"; break;
     case "admin_cancelled": kind = "cancelled"; label = "ARIS · 已停止"; break;
     case "admin_stopped": kind = "note"; label = "ARIS · 处理已停止"; break;
-    case "subagent_created": kind = "note"; label = `已创建 · ${agent?.name || event.message}`; break;
+    case "subagent_created": kind = "note"; action = "create"; label = `已创建 · ${agent?.name || event.message}`; break;
     case "agent_started": kind = "start"; label = agent ? `${agent.name} · 开始` : event.message; break;
     case "agent_finished":
       kind = /:\s*failed$/.test(event.message) ? "error" : /:\s*cancelled$/.test(event.message) ? "cancelled" : /:\s*completed$/.test(event.message) ? "complete" : "note";
@@ -114,16 +120,23 @@ function teamNode(team: Team, event: Team["events"][number], occurrence: number,
     case "messages_applied": kind = "message"; label = "已接收补充要求"; break;
     case "model_changed": kind = "model"; label = compact(event.message); break;
     case "checkpoint": kind = "checkpoint"; label = checkpointLabel(event.message); break;
-    case "tunnel_resumed": kind = "start"; label = "继续处理协作请求"; break;
+    case "tunnel_resumed": kind = "start"; action = "resume"; label = "继续处理协作请求"; break;
+    case "tunnel_followup_ended": action = "end_followup"; label = "协作跟进已结束"; break;
+    case "tunnel_opened": case "tunnel_closed": case "tunnel_decision": case "tunnel_message": {
+      kind = "tunnel";
+      action = ({ tunnel_opened: "open", tunnel_closed: "close", tunnel_decision: "accept", tunnel_message: "message" } as const)[event.kind];
+      label = channel ? `${actionLabels[action]} · ${channel.topic}` : actionLabels[action];
+      break;
+    }
     case "agent_error": case "error": case "interrupted": kind = "error"; label = compact(event.message); break;
     case "cancelled": case "cancelling": kind = "cancelled"; label = event.kind === "cancelled" ? "执行已停止" : "正在停止"; break;
     case "finished": kind = event.message === "All agents completed" ? "complete" : "error"; label = kind === "complete" ? "流程完成" : "流程未完成"; break;
     case "restored": kind = "checkpoint"; label = "已恢复登记文件"; break;
-    case "handoff": kind = "merge"; label = compact(event.message); break;
+    case "handoff": kind = "merge"; action = "handoff"; label = compact(event.message); break;
   }
   const id = nodeId(team.id, "team", event.at, event.kind, event.agent_id || "", String(occurrence));
   return { id, revision: `${id}/${hash(event.message)}`, teamId: team.id, agentId: event.agent_id || undefined,
-    at: event.at, kind, label: compact(label), detail: event.message, source: "team", teamEventKind: event.kind, ok, parentIds: [], parentKinds: {}, y: 0 };
+    at: event.at, kind, action, tunnelId: channel?.id, label: compact(label), detail: event.message, source: "team", teamEventKind: event.kind, ok, parentIds: [], parentKinds: {}, y: 0 };
 }
 
 // Compare sub-millisecond server timestamps without treating a newer summary
@@ -236,7 +249,8 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       const coveredThrough = owner ? toolCoverage.get(owner) : undefined;
       const coveredSummary = ["tool", "tool_finished"].includes(event.kind) && coveredThrough && compareAt(event.at, coveredThrough) <= 0;
       const durableHandoff = event.kind === "handoff" && team.handoffs.some((handoff) => handoff.to === event.agent_id && event.message === `${handoff.from} → ${handoff.to}: ${handoff.instruction}`);
-      if (!lane || coveredSummary || durableHandoff) {
+      const tunnelSummary = node.tunnelId && ["tunnel_message", "tunnel_decision"].includes(event.kind);
+      if (!lane || coveredSummary || durableHandoff || tunnelSummary) {
         // Detailed tool records cover an older prefix of this role's session.
         // Preserve its summaries in the record drawer, without guessing call IDs.
         records.push(node);
@@ -250,7 +264,7 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       const sentId = nodeId(team.id, "tunnel", channel.id, message.id, "send");
       const receivedId = nodeId(team.id, "tunnel", channel.id, message.id, "receive");
       const verb = tunnelMessageLabel(message);
-      const base = { teamId: team.id, tunnelId: channel.id, at: message.at, kind: "tunnel" as const, source: "tunnel" as const, detail: message.text, y: 0 };
+      const base = { teamId: team.id, tunnelId: channel.id, at: message.at, kind: "tunnel" as const, action: messageAction(message), source: "tunnel" as const, detail: message.text, y: 0 };
       from.nodes.push({ ...base, id: sentId, revision: sentId, laneId: from.id, agentId: from.agent.id, tunnelOrder: 2 * message.seq,
         label: `${verb} → ${to.label}`, parentIds: [], parentKinds: {} });
       to.nodes.push({ ...base, id: receivedId, revision: receivedId, laneId: to.id, agentId: to.agent.id, tunnelOrder: 2 * message.seq + 1,
@@ -260,7 +274,7 @@ export function projectWorkspaceTrace(teams: Team[], profiles: ModelProfile[] = 
       const id = nodeId(team.id, "handoff", handoff.id);
       const from = roles.get(handoff.from)?.agent.name || handoff.from;
       const to = roles.get(handoff.to)?.agent.name || handoff.to;
-      const node: TraceNode = { id, revision: id, teamId: team.id, agentId: handoff.to, at: handoff.at, kind: "merge", source: "handoff",
+      const node: TraceNode = { id, revision: id, teamId: team.id, agentId: handoff.to, at: handoff.at, kind: "merge", action: "handoff", source: "handoff",
         label: `交接 · ${from} → ${to}`, detail: `${handoff.instruction}\n\n来源交付：\n${handoff.summary}`, handoffFrom: handoff.from,
         parentIds: [], parentKinds: {}, y: 0 };
       const target = roles.get(handoff.to);

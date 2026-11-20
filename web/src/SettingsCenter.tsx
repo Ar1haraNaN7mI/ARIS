@@ -111,11 +111,18 @@ type Memory = {
   skill?: string | null;
   plugin?: string | null;
 };
+type HarnessMemory = {
+  id: string; problem: string; edit: string; rationale: string; prediction: string;
+  context: string; observation?: string; passed?: boolean; measurement_ms?: number | null;
+  evaluation?: string; alternative?: string;
+};
 type Memories = {
   memories: Memory[];
   feedback: Memory[];
   total: number;
   feedback_total: number;
+  experiments?: HarnessMemory[];
+  proposals?: HarnessMemory[];
 };
 type Category = {
   id: string;
@@ -420,6 +427,13 @@ export function SettingsCenter({
   const current =
     matches.find((category) => category.id === selected) || matches[0];
   const blocked = !!busy || loading || !data;
+  const experiments = memories?.experiments ?? [];
+  const graded = new Set(experiments.map((entry) => entry.id));
+  const harnessMemory = [
+    ...(memories?.proposals ?? []).filter((entry) => !graded.has(entry.id)),
+    ...experiments.slice().reverse(),
+  ];
+  const memoryCount = (memories?.total ?? 0) + (memories?.feedback_total ?? 0) + harnessMemory.length;
   const archived = allSessions.filter((session) => session.archived);
 
   useEffect(() => { if (data) acceptVisualProfile(data.profile); }, [data?.profile]);
@@ -1391,7 +1405,7 @@ export function SettingsCenter({
                 title="管理记忆"
                 description={
                   memories
-                    ? `${memories.total} 条工具经验 · ${memories.feedback_total} 条任务反馈`
+                    ? `${memories.total} 条工具经验 · ${memories.feedback_total} 条任务反馈 · ${harnessMemory.length} 条调度与优化记录`
                     : "读取本机学习记录"
                 }
               >
@@ -1465,8 +1479,25 @@ export function SettingsCenter({
                           </button>
                         </details>
                       ))}
+                  {harnessMemory.filter((item) =>
+                    [item.problem, item.edit, item.context, item.rationale, item.prediction, item.observation].join(" ")
+                      .toLowerCase().includes(memorySearch.toLowerCase()),
+                  ).map((item) => (
+                    <details className="sc-memory" key={item.id}>
+                      <summary><span>{item.edit}<small>{item.passed === undefined ? "待评测提案" : item.passed ? "评测通过" : "评测未通过"} · {item.context}</small></span><ChevronRightIcon /></summary>
+                      <p><strong>修改理由</strong>　{item.rationale}</p>
+                      <p><strong>预期</strong>　{item.prediction}</p>
+                      {item.observation && <p><strong>实测</strong>　{item.observation}{item.measurement_ms != null && `（${item.measurement_ms} ms）`}</p>}
+                      {item.alternative && <p><strong>另一候选</strong>　{item.alternative}</p>}
+                      {item.evaluation && <p><strong>验证方法</strong>　{item.evaluation}</p>}
+                      <button className="sc-button sc-danger" disabled={blocked}
+                        onClick={() => confirmAction("删除这条优化记录？", "该记录将从本机优化记忆中移除。", "memory/delete", { id: item.id, kind: "experiment" })}>
+                        删除这条记录
+                      </button>
+                    </details>
+                  ))}
                   {memories &&
-                    memories.total + memories.feedback_total === 0 && (
+                    memoryCount === 0 && (
                       <p className="sc-description">目前没有已保存的记忆。</p>
                     )}
                   <button
@@ -1474,12 +1505,12 @@ export function SettingsCenter({
                     disabled={
                       blocked ||
                       !memories ||
-                      memories.total + memories.feedback_total === 0
+                      memoryCount === 0
                     }
                     onClick={() =>
                       confirmAction(
                         "清除所有记忆？",
-                        "工具经验、任务反馈，以及学习到的路由权重和关联记录都会清除。此操作无法撤销。",
+                        "工具经验、任务反馈、优化记录和学习到的路由权重都会清除。此操作无法撤销。",
                         "memory/clear",
                       )
                     }

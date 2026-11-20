@@ -470,6 +470,8 @@ pub enum LlmError {
     Http(String),
     #[error("api error: {0}")]
     Api(String),
+    #[error("Responses tool call was truncated; increase max_tokens before retrying")]
+    IncompleteToolCalls(Vec<ToolCallDelta>),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

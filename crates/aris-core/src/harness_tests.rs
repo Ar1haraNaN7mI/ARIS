@@ -560,12 +560,22 @@ async fn real_tunnel_roundtrip(dependent: bool) {
         json!({"action":"send","tunnel_id":open.id,"reply_to":open.messages[0].id,
         "text":"Confirmed: the denominator is 25 trial applications, not 8 activations.","expects_reply":false}),
     );
-    request(&mut rx)
-        .await
+    // The subscribed result can reach A while B is still finishing its turn.
+    let first = request(&mut rx).await;
+    let second = request(&mut rx).await;
+    let (resumed_a, b_after_answer) = if first
+        .body
+        .to_string()
+        .contains("Your assignment: Answer as a")
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    b_after_answer
         .reply
         .send("Peer verification complete.".into())
         .unwrap();
-    let resumed_a = request(&mut rx).await;
     assert!(resumed_a
         .body
         .to_string()
@@ -675,15 +685,38 @@ async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknow
             "action":"invite","to":"finance","topic":"Cash reserve","text":"Calculate the reserve for six seats at 299 each."
         }),
     );
-    request(&mut requests)
-        .await
-        .reply
-        .send("Reviewed the launch conditions. Finance will verify the reserve.".into())
-        .unwrap();
+    // Keep the inviter's actual HTTP request open. With the old wave barrier
+    // the second request would never arrive until the first one finished.
+    let first = request(&mut requests).await;
+    let second = request(&mut requests).await;
+    let (helper, held_inviter) = if first
+        .body
+        .to_string()
+        .contains("Your assignment: Answer as finance")
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let saved = runtime.teams.get(&team.id).unwrap();
     let tunnel = &saved.tunnels[0];
     let invite = &tunnel.messages[0].id;
-    let helper = request(&mut requests).await;
+    assert_eq!(
+        tunnel.messages[0].recipient_status_at_send.as_deref(),
+        Some("completed")
+    );
+    let started = tunnel.messages[0].started_at.as_ref().unwrap();
+    assert!(saved.events.iter().any(|e| e.kind == "agent_started"
+        && e.agent_id.as_deref() == Some("finance")
+        && &e.at == started));
+    assert!(
+        saved
+            .agents
+            .iter()
+            .filter(|a| a.status == "running")
+            .count()
+            == 2
+    );
     assert!(helper.body["messages"]
         .to_string()
         .contains("Calculate the reserve"));
@@ -713,6 +746,10 @@ async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknow
         .await
         .reply
         .send("Base budget checked. Refund reserve verified at 1794.".into())
+        .unwrap();
+    held_inviter
+        .reply
+        .send("Reviewed the launch conditions. Finance verified the reserve.".into())
         .unwrap();
     let publication = request(&mut requests).await;
     assert!(publication.body["messages"]
