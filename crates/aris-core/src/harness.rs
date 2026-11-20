@@ -32,6 +32,49 @@ fn pending() -> String {
     "pending".into()
 }
 
+#[cfg(windows)]
+fn team_replace_conflict(error: &std::io::Error, target: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+
+    match error.raw_os_error() {
+        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => true,
+        Some(ERROR_ACCESS_DENIED) => {
+            // MoveFileEx can report access denied while a normal reader omits
+            // FILE_SHARE_DELETE. Distinguish this from a read-only file or ACL.
+            if !fs::metadata(target)
+                .is_ok_and(|meta| meta.is_file() && !meta.permissions().readonly())
+            {
+                return false;
+            }
+            match OpenOptions::new().access_mode(DELETE_ACCESS).open(target) {
+                Ok(_) => true, // The conflicting handle may already have closed.
+                Err(probe) => matches!(
+                    probe.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ),
+            }
+        }
+        _ => false,
+    }
+}
+
+fn replace_team_state(staged: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    for delay_ms in [10, 20, 40, 80, 160, 320] {
+        match fs::rename(staged, target) {
+            Err(error) if team_replace_conflict(&error, target) => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+    fs::rename(staged, target)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamAgent {
     #[serde(default = "new_id")]
@@ -301,11 +344,26 @@ impl TeamStore {
     }
     fn save(&self, team: &Team) -> Result<()> {
         let dir = self.directory(&team.id)?;
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create team directory {}", dir.display()))?;
+        let target = dir.join("team.json");
         let temp = dir.join(format!("{}.tmp", new_id()));
-        fs::write(&temp, serde_json::to_vec_pretty(team)?)?;
-        fs::rename(temp, dir.join("team.json"))?;
-        Ok(())
+        let bytes = serde_json::to_vec_pretty(team)?;
+        let result = fs::write(&temp, bytes)
+            .map_err(|e| {
+                let message = format!("stage team state {}: {e}", temp.display());
+                anyhow::Error::new(e).context(message)
+            })
+            .and_then(|()| {
+                replace_team_state(&temp, &target).map_err(|e| {
+                    let message = format!("replace team state {}: {e}", target.display());
+                    anyhow::Error::new(e).context(message)
+                })
+            });
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
     fn run_lock(&self, id: &str) -> Result<File> {
         let file = OpenOptions::new()
@@ -2191,6 +2249,99 @@ mod tests {
             tunnels: vec![],
             tunnel_turns: HashMap::new(),
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn team_state_replace_waits_for_a_reader_and_preserves_the_prior_ledger_on_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!("aris-team-share-{}", new_id()));
+        let store = TeamStore::open(root.join("teams"), root.clone()).unwrap();
+        let mut team = team(vec![]);
+        store.save(&team).unwrap();
+        let dir = store.directory(&team.id).unwrap();
+        let target = dir.join("team.json");
+        let staged_files = || {
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+                .count()
+        };
+        let reader = || {
+            OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(&target)
+                .unwrap()
+        };
+
+        let blocker = reader(); // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
+        assert!(team_replace_conflict(
+            &std::io::Error::from_raw_os_error(5),
+            &target
+        ));
+        TeamStore::event(
+            &mut team,
+            Some("editor"),
+            "tool_finished",
+            "read_file: completed",
+        );
+        std::thread::scope(|scope| {
+            let update = scope.spawn(|| store.save(&team));
+            let until = Instant::now() + Duration::from_secs(2);
+            while staged_files() == 0 && Instant::now() < until && !update.is_finished() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(staged_files(), 1);
+            assert!(store.read(&team.id).unwrap().events.is_empty());
+            std::thread::sleep(Duration::from_millis(40));
+            drop(blocker);
+            update.join().unwrap().unwrap();
+        });
+        let committed = fs::read(&target).unwrap();
+        assert_eq!(store.read(&team.id).unwrap().events.len(), 1);
+        assert_eq!(staged_files(), 0);
+
+        // A reader that never moves must not remove the last good ledger or
+        // strand the new one. The watchdog releases it on a broken retry loop.
+        let blocker = reader();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(4));
+            drop(blocker);
+        });
+        team.name = "not committed".into();
+        let error = store.save(&team).unwrap_err();
+        drop(done);
+        holder.join().unwrap();
+        assert!(error.to_string().contains(target.to_str().unwrap()));
+        assert!(error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error()
+            .is_some());
+        assert_eq!(fs::read(&target).unwrap(), committed);
+        assert_eq!(staged_files(), 0);
+
+        let writable = fs::metadata(&target).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&target, readonly).unwrap();
+        let denied = std::io::Error::from_raw_os_error(5);
+        assert!(!team_replace_conflict(&denied, &target));
+        let error = store.save(&team).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert_eq!(fs::read(&target).unwrap(), committed);
+        assert_eq!(staged_files(), 0);
+        fs::set_permissions(&target, writable).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
     fn admin(session_id: &str) -> TeamAdmin {
         TeamAdmin {
