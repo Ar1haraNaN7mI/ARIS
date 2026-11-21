@@ -67,6 +67,28 @@ it("keeps both speakers and their agreed wording visible after the temporary lan
   expect(select).toHaveBeenCalledWith("a");
 });
 
+it("keeps the caption readable and offers the original peer data on demand", async () => {
+  const tunnel = { ...channel, messages: [{ ...channel.messages[0], text: "已核对两组数据。", data: { counts: [0, 19], verified: false } }] };
+  const page = render(<TeamTunnelThread team={team} tunnel={tunnel} onSelectActor={vi.fn()} onSelectTunnel={vi.fn()} />);
+  expect(screen.getByText("已核对两组数据。")).toBeTruthy();
+  const details = page.container.querySelector("details")!;
+  expect(details.open).toBe(false);
+  expect(details.querySelector("pre")).toBeNull();
+  fireEvent.click(screen.getByText("查看传递的数据"));
+  expect(details.open).toBe(true);
+  await waitFor(() => expect(JSON.parse(details.querySelector("pre")!.textContent!)).toEqual(tunnel.messages[0].data));
+});
+
+it("displays the exact peer integers supplied by the backend when JavaScript rounded a nested value", async () => {
+  const exact = '{"account_id":9007199254740993,"rows":[-9007199254740993]}';
+  const data: unknown = JSON.parse(exact);
+  expect(JSON.stringify(data)).not.toBe(exact);
+  const tunnel = { ...channel, messages: [{ ...channel.messages[0], data, data_json: exact }] };
+  const page = render(<TeamTunnelThread team={team} tunnel={tunnel} onSelectActor={vi.fn()} onSelectTunnel={vi.fn()} />);
+  fireEvent.click(screen.getByText("查看传递的数据"));
+  await waitFor(() => expect(page.container.querySelector("pre")?.textContent).toBe(exact));
+});
+
 it("shows co-work and final review events in the responsible worker's chat and lane", () => {
   const sample = { ...team, events: [
     { at, agent_id: "b", kind: "cowork_turn_started", message: "work on the invitation" },

@@ -8,6 +8,7 @@ mod kei_import;
 mod mcp_server;
 mod model_service;
 mod sim_optimizer;
+mod team_output;
 mod team_planner;
 mod team_service;
 mod web_access;
@@ -152,7 +153,7 @@ enum Commands {
         #[arg(long, group = "subject")]
         session: Option<String>,
     },
-    /// Create, execute and inspect multi-agent workflows (JSON output)
+    /// Create, execute and inspect multi-agent workflows
     Team {
         #[command(subcommand)]
         action: TeamCmd,
@@ -411,6 +412,8 @@ enum TeamCmd {
         /// Use only the roles already configured for this team
         #[arg(long, requires = "id")]
         existing_roles_only: bool,
+        #[arg(long, value_enum)]
+        output: Option<team_output::Format>,
     },
     /// Plan a team from a natural-language goal using a configured KEI model
     Plan {
@@ -420,6 +423,8 @@ enum TeamCmd {
         /// Execute the generated team and wait for its result
         #[arg(long)]
         run: bool,
+        #[arg(long, value_enum, requires = "run")]
+        output: Option<team_output::Format>,
     },
     /// Create a workflow from a JSON specification
     Create {
@@ -432,6 +437,8 @@ enum TeamCmd {
     /// Execute pending stages and wait for a terminal result
     Run {
         id: String,
+        #[arg(long, value_enum)]
+        output: Option<team_output::Format>,
     },
     /// Continue the team conversation, or one agent and its dependent stages
     Message {
@@ -439,6 +446,8 @@ enum TeamCmd {
         message: String,
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long, value_enum)]
+        output: Option<team_output::Format>,
     },
     Checkpoint {
         id: String,
@@ -453,6 +462,8 @@ enum TeamCmd {
         from: String,
         to: String,
         instruction: String,
+        #[arg(long, value_enum)]
+        output: Option<team_output::Format>,
     },
 }
 
@@ -2636,20 +2647,31 @@ fn headless_final_message<'a>(session: &'a Session, turn: Option<&str>) -> Optio
 async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()> {
     use anyhow::Context;
     use serde_json::json;
+    let output = match &command {
+        TeamCmd::Admin { output, .. }
+        | TeamCmd::Run { output, .. }
+        | TeamCmd::Message { output, .. }
+        | TeamCmd::Plan { output, .. }
+        | TeamCmd::Handoff { output, .. } => *output,
+        _ => None,
+    };
+    let text =
+        team_output::text_requested(output, std::io::IsTerminal::is_terminal(&std::io::stdout()));
     let (method, params, wait) = match command {
         TeamCmd::Admin {
             message,
             id,
             profile,
             existing_roles_only,
+            ..
         } => (
             "teams/admin",
             json!({"message":message,"id":id,"profile_id":profile,"allow_new_roles":!existing_roles_only}),
             true,
         ),
-        TeamCmd::Plan { goal, profile, run } => {
-            ("teams/plan", json!({"goal":goal,"profile_id":profile}), run)
-        }
+        TeamCmd::Plan {
+            goal, profile, run, ..
+        } => ("teams/plan", json!({"goal":goal,"profile_id":profile}), run),
         TeamCmd::Create { file } => (
             "teams/create",
             serde_json::from_slice(&std::fs::read(file)?)?,
@@ -2657,8 +2679,10 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
         ),
         TeamCmd::List => ("teams/list", json!({}), false),
         TeamCmd::Get { id } => ("teams/get", json!({"id":id}), false),
-        TeamCmd::Run { id } => ("teams/run", json!({"id":id}), true),
-        TeamCmd::Message { id, message, agent } => (
+        TeamCmd::Run { id, .. } => ("teams/run", json!({"id":id}), true),
+        TeamCmd::Message {
+            id, message, agent, ..
+        } => (
             "teams/message",
             json!({"id":id,"agent_id":agent,"message":message,"cascade":true}),
             true,
@@ -2676,11 +2700,21 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
             from,
             to,
             instruction,
+            ..
         } => (
             "teams/handoff",
             json!({"id":id,"from":from,"to":to,"instruction":instruction}),
             true,
         ),
+    };
+    let round_start = if wait && text {
+        params["id"]
+            .as_str()
+            .map(|id| runtime.teams.get(id).map(|team| team.events.len()))
+            .transpose()?
+            .unwrap_or(0)
+    } else {
+        0
     };
     let mut result = team_service::dispatch(runtime.clone(), method, &params)
         .await
@@ -2696,6 +2730,10 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
     if method == "teams/plan" {
         result = json!({"team":runtime.teams.start_all(runtime.clone(), &id)?});
     }
+    let request_id = (method == "teams/admin")
+        .then(|| result["team"]["admin"]["request_id"].as_str())
+        .flatten()
+        .map(str::to_owned);
     let mut interrupted = false;
     let mut event_cursor = result["team"]["events"].as_array().map_or(0, Vec::len);
     loop {
@@ -2713,7 +2751,16 @@ async fn run_team_command(runtime: Arc<Runtime>, command: TeamCmd) -> Result<()>
             runtime.teams.wait_for_controller(&id).await?;
             aris_core::workflow_reviewer::wait_for_team(&runtime, &team).await?;
             runtime.computer.shutdown().await;
-            println!("{}", serde_json::to_string_pretty(&json!({"team":team}))?);
+            if text {
+                println!(
+                    "{}",
+                    team_output::render(&team, round_start, request_id.as_deref(), |role| {
+                        aris_core::synthesis::current_worker_delivery(&runtime, &team, role)
+                    })?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&json!({"team":team}))?);
+            }
             anyhow::ensure!(
                 team.status == "completed"
                     || (method == "teams/admin"

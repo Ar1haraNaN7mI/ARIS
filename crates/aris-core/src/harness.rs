@@ -1,4 +1,6 @@
 //! Durable multi-agent workspaces. File snapshots never touch the user's Git index.
+pub(crate) mod brief;
+
 use crate::{AgentEvent, AgentHandle, AgentLoop, Runtime};
 use anyhow::{bail, ensure, Context, Result};
 use aris_protocol::{GoalSpec, RetryPolicy, TaskRecord, TaskState, TeamTaskOwner};
@@ -1791,14 +1793,15 @@ impl TeamStore {
             }
             let session = runtime.sessions.get_or_load(&agent.session_id)?;
             let prepared = if cowork_only { None } else {
-                Some(crate::synthesis::prepare(&runtime, &team, &agent, agent_prompt(&team, &agent))?)
+                let fallback = if agent.delivery.is_none() { brief::worker_prompt(&team, &agent) } else { String::new() };
+                Some(crate::synthesis::prepare(&runtime, &team, &agent, fallback)?)
             };
             let mut prompt = match &prepared {
                 Some(delivery) => delivery.prompt.clone(),
-                None => format!("You are {} (worker ID {}). Your main assignment is waiting for its dependencies. This is a separate, bounded co-work turn in your own lane. Work only on the incoming invitations {} in the attached peer transcript. Accept and carry out the requested check with your tools; complete_work using the invitation ID, or decline_work if appropriate. If information is missing, ask the requester a concrete question with resume_on_reply=true, then yield without polling. Preserve existing files, write only to your owned paths ({}) if the invitation requires it. Your main assignment will run separately after its inputs arrive. Do not publish or complete the primary assignment during this turn.", agent.name, agent.id, invitations.join(", "), agent.files.join(", ")),
+                None => brief::cowork_prompt(&agent, &invitations),
             };
             if final_review {
-                prompt.push_str("\nFinal publication review: a source completed or changed after the preceding draft was prepared. Read the current source deliveries and prior draft, apply any material differences, and confirm the final publication. Preserve accurate existing files. Send no additional peer requests for this closing check.");
+                prompt.insert_str(0, "Final publication review: compare updated sources with the prior draft, apply material changes and confirm the publication. Close this check without new peer requests.\n");
             }
             let task = self.prepare_task(&runtime, &team, &agent, &prompt)?;
             let (tx, mut rx) = mpsc::channel(256);
@@ -2111,64 +2114,6 @@ fn apply_queued_messages(team: &mut Team) {
         "messages_applied",
         "Queued instructions applied at the next execution boundary",
     );
-}
-
-pub(crate) const PEER_COORDINATION_GUIDANCE: &str = r#"Use agent_tunnel with the exact peer ID. Choose the interaction by what the recipient needs to do:
-- To share an observation, credit a contribution or say “已采纳”, use open/send as a notice. Both lanes show it. An acknowledgment needs no reply.
-- Use ask for a specific unanswered question. Answer with send and reply_to. Use propose/accept for a decision requiring both participants' agreement.
-- Use invite for co-work: name a bounded piece of the assignment a peer can actually perform and the result you need. The recipient uses accept_work or decline_work with reply_to pointing to the invite. After accepting, do the work in your own session using your tools and owned files. Preserve your original contribution when you report the added work. Use complete_work against that same invite with the result and any file references. An invitation or acceptance alone is not a delivery.
-If your own deliverable still needs the answer or work result, set resume_on_reply=true on the request. Otherwise the result is available to the final author in the shared record. Continue available work without polling or requesting courtesy acknowledgments."#;
-
-fn agent_prompt(team: &Team, agent: &TeamAgent) -> String {
-    let inputs: Vec<_> = team
-        .agents
-        .iter()
-        .filter(|a| agent.depends_on.contains(&a.id))
-        .map(|a| format!("{} ({})\n{}", a.name, a.profile_id, a.output))
-        .collect();
-    let handoffs: Vec<_> = team
-        .handoffs
-        .iter()
-        .filter(|h| h.to == agent.id)
-        .map(|h| format!("From {}: {}\n{}", h.from, h.instruction, h.summary))
-        .collect();
-    let mut messages: Vec<_> = team
-        .messages
-        .iter()
-        .rev()
-        .filter(|m| {
-            !m.queued
-                && m.agent_id
-                    .as_deref()
-                    .is_none_or(|target| target == agent.id)
-        })
-        .map(|m| {
-            format!(
-                "{}: {}",
-                if m.source.as_deref() == Some("admin") {
-                    "ARIS admin assignment"
-                } else if m.source.is_none() && team.admin.is_some() {
-                    "Task instruction (source not recorded)"
-                } else {
-                    "User"
-                },
-                m.text
-            )
-        })
-        .collect();
-    messages.reverse();
-    let peers = team
-        .agents
-        .iter()
-        .filter(|peer| peer.id != agent.id && peer.subagent_id.is_some())
-        .map(|peer| format!("{}: {} ({})", peer.id, peer.name, peer.role))
-        .collect::<Vec<_>>()
-        .join("; ");
-    messages.push(format!(
-        "Internal coordination: your worker id is {}. Available peer ids: {}.\n{}",
-        agent.id, peers, PEER_COORDINATION_GUIDANCE
-    ));
-    format!("You are {} in ARIS, a general-purpose multi-agent harness. Role: {}.\nShared goal: {}\nYour assignment: {}\nYour browser identity is your session; use your own browser tools.\nShared artifact files: {}\nYour owned output files: {}\nRead relevant existing files before editing. Keep edits within your assigned output files; other agents can be working concurrently. Use shared files directly, preserve previous contributions, and report exact delivered paths and unfinished work. If no output files were assigned, return your findings in the response.\nDependency results:\n{}\nExplicit handoffs:\n{}\nConversation instructions with their actual source, oldest to newest (latest takes precedence):\n{}", agent.name,agent.role,team.goal,agent.prompt,team.files.join(", "),agent.files.join(", "),inputs.join("\n\n"),handoffs.join("\n\n"),messages.join("\n\n"))
 }
 
 pub(crate) fn validate_graph(agents: &[TeamAgent]) -> Result<()> {
@@ -2894,6 +2839,55 @@ mod tests {
     }
 
     #[test]
+    fn worker_brief_shares_exact_repeats_and_keeps_revisions_in_order() {
+        let mut source = agent("a", &[], &[]);
+        source.output = "evidence\n结论 \"A\"".into();
+        let mut writer = agent("b", &["a"], &["result.txt"]);
+        writer.prompt = "首要任务\n不要改变数据".into();
+        let mut t = team(vec![source.clone(), writer.clone()]);
+        let message = |id: &str, text: &str, from: &str| TeamMessage {
+            id: id.into(),
+            agent_id: Some("b".into()),
+            text: text.into(),
+            source: Some(from.into()),
+            at: "now".into(),
+            queued: false,
+            cascade: false,
+        };
+        t.messages = vec![
+            message("1", &writer.prompt, "admin"),
+            message("2", "请引用 https://example.org/source#page", "user"),
+        ];
+        for (id, summary) in [("1", source.output.as_str()), ("2", "older revision")] {
+            t.handoffs.push(Handoff {
+                id: id.into(),
+                from: source.id.clone(),
+                to: writer.id.clone(),
+                at: "then".into(),
+                instruction: "inspect the source".into(),
+                summary: summary.into(),
+            });
+        }
+        let prompt = brief::worker_prompt(&t, &writer);
+        let body: serde_json::Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+        assert_eq!(body["type"], "aris.brief");
+        assert_eq!(body["assignment"], writer.prompt);
+        assert_eq!(body["instructions"][0]["text_ref"], "assignment");
+        assert_eq!(body["instructions"][0]["source"], "admin");
+        assert_eq!(body["instructions"][1]["text"], t.messages[1].text);
+        assert_eq!(body["instructions"][1]["source"], "user");
+        assert_eq!(body["source_deliveries"][0]["text"], source.output);
+        assert_eq!(body["handoffs"][0]["summary_from"], "a");
+        assert_eq!(body["handoffs"][1]["summary"], "older revision");
+        assert_eq!(prompt.matches("首要任务").count(), 1);
+        assert_eq!(prompt.matches("evidence\\n").count(), 1);
+        writer.prompt = t.goal.clone();
+        let body = brief::assignment(&t, &writer);
+        assert_eq!(body["assignment_ref"], "goal");
+        assert!(body.get("assignment").is_none());
+    }
+
+    #[test]
     fn chat_instructions_queue_without_interrupting_then_continue_only_target() {
         let root = std::env::temp_dir().join(format!("aris-queue-{}", new_id()));
         fs::create_dir_all(&root).unwrap();
@@ -2911,13 +2905,16 @@ mod tests {
         assert_eq!(queued.status, "running");
         assert!(queued.messages[0].queued);
         assert_eq!(queued.agents[0].status, "running");
-        assert!(!agent_prompt(&queued, &queued.agents[0]).contains("Please explain the sources"));
+        assert!(!brief::worker_prompt(&queued, &queued.agents[0])
+            .contains("Please explain the sources"));
         apply_queued_messages(&mut queued);
         assert!(!queued.messages[0].queued);
         assert_eq!(queued.agents[0].status, "pending");
         assert_eq!(queued.agents[1].status, "completed");
         assert_eq!(queued.agents[1].output, "existing result");
-        assert!(agent_prompt(&queued, &queued.agents[0]).contains("Please explain the sources"));
+        assert!(
+            brief::worker_prompt(&queued, &queued.agents[0]).contains("Please explain the sources")
+        );
         for index in 0..9 {
             store
                 .chat_message(&t.id, Some("a"), &format!("queued-note-{index}"))
@@ -2925,7 +2922,7 @@ mod tests {
         }
         let mut batch = store.read(&t.id).unwrap();
         apply_queued_messages(&mut batch);
-        let prompt = agent_prompt(&batch, &batch.agents[0]);
+        let prompt = brief::worker_prompt(&batch, &batch.agents[0]);
         for index in 0..9 {
             assert!(prompt.contains(&format!("queued-note-{index}")));
         }

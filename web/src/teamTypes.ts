@@ -8,6 +8,8 @@ export type ModelProfile = {
 export type KeiConfig = { base_url: string; profiles: ModelProfile[]; configured: boolean };
 export type TunnelMessage = {
   id: string; seq: number; from: string; to: string; text: string; at: string;
+  data?: unknown;
+  data_json?: string;
   kind: "message" | "notice" | "question" | "answer" | "proposal" | "accept" | "cowork_invite" | "cowork_accept" | "cowork_decline" | "cowork_result";
   expects_reply?: boolean; reply_to?: string | null; proposal_id?: string | null; followup_closed_reason?: string | null;
 };

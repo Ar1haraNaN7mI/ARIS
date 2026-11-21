@@ -111,6 +111,9 @@
 .lp-peer-topic { display:block; max-width:100%; margin-top:6px; padding:2px 0; background:none; border:0; color:#236b7b; font-size:12px; text-align:left; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .lp-peer-topic:hover,.lp-tunnel-byline button:hover { text-decoration:underline; }
 .lp-tunnel-message .message-body { padding-top:6px; }
+.lp-peer-data { margin-top:6px; }
+.lp-peer-data summary { cursor:pointer; color:var(--text-muted, #4b6773); }
+.lp-peer-data pre { overflow:auto; padding:8px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .lp-tunnel-decision { padding:12px 14px; margin-block:14px; border:1px solid #a6ccc2; border-radius:5px; }
 .lp-tunnel-decision p { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:5px; }
 .lp-open-final { margin:5px 18px; padding:8px 12px; border:1px solid #a6d6dd; border-radius:5px; background:#eff9fb; color:#16677c; text-align:left; }

@@ -823,11 +823,13 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
         let operation = async {
             let deadline = tokio::time::Instant::now() + ADMIN_TIMEOUT;
             let mut attempt = 1;
+            let mut rewriting_answer = false;
             let (response, additions, assignments) = loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 ensure!(!remaining.is_zero(), "Admin planning deadline expired; no roles were created");
                 let output = {
-                    let future = generate_response(config.clone(), &messages, &tools, remaining);
+                    let allowed_tools = if rewriting_answer { &[][..] } else { &tools[..] };
+                    let future = generate_response(config.clone(), &messages, allowed_tools, remaining);
                     tokio::pin!(future);
                     loop {
                         tokio::select! {
@@ -839,6 +841,7 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
                     }
                 };
                 calls = admin_invocations(&output)?;
+                ensure!(!rewriting_answer || calls.is_empty(), "重写公开答复时收到了额外的派工请求。");
                 if !calls.is_empty() {
                     {
                         let mut s = admin_session.write();
@@ -872,7 +875,21 @@ pub fn admin(runtime: Arc<Runtime>, params: &Value) -> Result<Team> {
                 ensure!(attempt == 1 || creating, "A truncated creation requires a complete replacement roster; no roles were created");
                 match parse_admin_output(&output, &calls, &tools, &reserved,
                     &catalog_public, request.allow_new_roles, &runtime.workspace_root) {
-                    Ok(decision) => break decision,
+                    Ok((response, additions, assignments)) => {
+                        ensure!(!rewriting_answer || assignments.is_empty(), "重写公开答复时收到了额外的派工请求。");
+                        if aris_core::is_standalone_json_reply(&response) {
+                            if !assignments.is_empty() {
+                                let count = assignments.len();
+                                break (format!("已为 {count} 位智能体分配任务。"), additions, assignments);
+                            }
+                            ensure!(!rewriting_answer, "管理员尚未生成面向读者的最终答复。");
+                            rewriting_answer = true;
+                            messages.push(ChatMessage::assistant(output.text));
+                            messages.push(ChatMessage::user("Keep mode=answer. Write response as a complete natural-language answer in the user's language using the facts in your draft."));
+                            continue;
+                        }
+                        break (response, additions, assignments);
+                    }
                     Err(error) => {
                         if creating {
                             runtime.learn.observe_dispatch(&trial, &turn_id, attempt, DispatchOutcome::Rejected);
@@ -996,7 +1013,7 @@ fn admin_messages(
     let system = r#"You are ARIS, the conversational admin of a universal workspace. Make one decision in this request. Your only tools create or dispatch bounded worker roles; you cannot browse, read files or produce artifacts directly.
 Answer greetings, explanations, questions and ordinary writing directly when supplied context suffices. response must contain the COMPLETE useful answer, with no second model request. Ask a concise question only when a missing fact blocks progress. Trivial tasks need no workers.
 Use one worker for a single operational task such as editing one file. For a broader request, identify the decisions or deliverables the user needs, the evidence or methods each requires, and which pieces can start independently. Give independently checkable, substantial pieces their own owners, including parallel contributions to the same final report. Combine closely coupled steps where a handoff would duplicate work. Name roles for their specific responsibilities and give each a verifiable result. Honor any explicit staffing or independence requirements within the available capacity. Add a synthesis owner when the user needs the contributions integrated. Workers check available capabilities before making commitments.
-For a direct answer, return ONLY {"mode":"answer","response":"full answer"} and do not call a tool.
+For a direct answer, return ONLY {"mode":"answer","response":"full answer"} and do not call a tool. The response field is public: write natural language for the reader. Structured records belong in tool arguments or explicitly requested artifacts.
 To add missing roles, call create_sub_agents once with response (brief plan) and new_agents. Include assignments for existing workers when the tool asks for them. To reuse existing roles without additions, call dispatch_sub_agents once with response and assignments. Never call both or make multiple calls. A call creates/persists/schedules the work; it does not mean the workers have completed it. No confirmation model request follows.
 Use the user's language except tool/schema values. Exact catalog profile IDs only; existing roles, models, instructions, dependencies and sessions are immutable.
 Match the work to existing roles first. When allow_new_roles=true, create the missing owners in this request, within new_worker_slots. Role count follows the work. The controller occupies no worker slot. Explain the split and handoffs briefly. Give each new role a compact prompt describing its remit and first task. All workers already receive the shared goal. Refer to input files by name and leave the analysis to their owners. Assign each new role once and only the existing roles needed for this request. Never create/assign an admin or ask workers to spawn, schedule, recursively delegate, or call the admin API.
@@ -1025,13 +1042,18 @@ Preserve evidence links/file references, mark unknowns, and send workers to orig
             })
         })
         .collect();
-    messages.push(ChatMessage::user(serde_json::to_string(
-        &serde_json::json!({
-            "message":message,"original_goal":team.goal,"profiles":catalog,
-            "allow_new_roles":allow_new,"existing_roles":context,"worker_limit":ADMIN_WORKER_LIMIT,
-            "new_worker_slots":if allow_new { admin_worker_capacity(team) } else { 0 },
-        }),
-    )?));
+    let mut request = serde_json::json!({
+        "message":message,"profiles":catalog,"allow_new_roles":allow_new,
+        "worker_limit":ADMIN_WORKER_LIMIT,
+        "new_worker_slots":if allow_new { admin_worker_capacity(team) } else { 0 },
+    });
+    if team.goal != message {
+        request["original_goal"] = serde_json::json!(team.goal);
+    }
+    if !context.is_empty() {
+        request["existing_roles"] = serde_json::Value::Array(context);
+    }
+    messages.push(ChatMessage::user(serde_json::to_string(&request)?));
     Ok(messages)
 }
 
@@ -2069,6 +2091,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_rewrites_structured_draft_before_publishing_its_answer() {
+        let root = TestRoot::new();
+        let draft = json!({"result":19}).to_string();
+        let answer = "本周新增 19 份订阅。";
+        let (url, server) = sequence_server(vec![
+            chat_body(
+                &json!({"mode":"answer","response":draft}).to_string(),
+                "stop",
+            ),
+            chat_body(
+                &json!({"mode":"answer","response":answer}).to_string(),
+                "stop",
+            ),
+        ])
+        .await;
+        let runtime = test_runtime(&root, url);
+        let team = admin(
+            runtime.clone(),
+            &json!({"message":"请用一句中文报告本周新增订阅数。"}),
+        )
+        .unwrap();
+        let team = settled(&runtime, &team.id).await;
+        assert_eq!(team.admin.as_ref().unwrap().response, answer);
+        let session = runtime
+            .sessions
+            .get_or_load(&team.admin.unwrap().session_id)
+            .unwrap();
+        let replies: Vec<_> = session
+            .read()
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::AssistantMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, [answer]);
+        let calls = server.await.unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1]["messages"].to_string().contains("19"));
+    }
+
+    #[tokio::test]
     async fn admin_direct_answer_uses_one_request_and_continues_same_session() {
         let root = TestRoot::new();
         let (url, server) = sequence_server(vec![
@@ -2177,9 +2242,16 @@ mod tests {
         assert!(calls[2]["messages"]
             .to_string()
             .contains("verified fixture evidence"));
-        assert!(calls[1]["messages"]
-            .to_string()
-            .contains("ARIS admin assignment"));
+        let packet = calls[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str()?.lines().last())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .find(|packet| packet["type"] == "aris.brief")
+            .unwrap();
+        assert_eq!(packet["instructions"][0]["source"], "admin");
     }
 
     #[tokio::test]
@@ -2486,12 +2558,9 @@ mod tests {
         let calls = server.await.unwrap();
         assert_eq!(calls.len(), 5); // controller + two steps per worker
         for i in [2, 4] {
-            assert!(
-                calls[i]["messages"].as_array().unwrap().last().unwrap()["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("All assigned documents have verified content")
-            );
+            let last = calls[i]["messages"].as_array().unwrap().last().unwrap();
+            let state: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+            assert_eq!(state["worker_state"]["documents_ready"], true);
         }
         assert!(calls[3]["messages"].to_string().contains(research));
         assert!(!calls[3]["messages"]

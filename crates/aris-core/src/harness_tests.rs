@@ -12,6 +12,19 @@ struct Request {
     reply: oneshot::Sender<String>,
 }
 
+fn worker_packet(request: &Request) -> Value {
+    request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str()?.lines().last())
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find(|packet| packet["type"] == "aris.brief")
+        .expect("worker receives a structured commission")
+}
+
 async fn fixture() -> (
     crate::tests::RuntimeFixture,
     mpsc::Receiver<Request>,
@@ -505,7 +518,7 @@ async fn team_execution_lock_protects_live_native_runs_and_released_lock_recover
             },
         )
         .unwrap();
-    let prompt = agent_prompt(&team, &team.agents[0]);
+    let prompt = brief::worker_prompt(&team, &team.agents[0]);
     let task = runtime
         .teams
         .prepare_task(&runtime, &team, &team.agents[0], &prompt)
@@ -628,11 +641,7 @@ async fn real_tunnel_roundtrip(dependent: bool) {
         (first, None)
     } else {
         let second = request(&mut rx).await;
-        if first
-            .body
-            .to_string()
-            .contains("Your assignment: Answer as a")
-        {
+        if worker_packet(&first)["agent_id"] == "a" {
             (first, Some(second))
         } else {
             (second, Some(first))
@@ -687,11 +696,7 @@ async fn real_tunnel_roundtrip(dependent: bool) {
     // The subscribed result can reach A while B is still finishing its turn.
     let first = request(&mut rx).await;
     let second = request(&mut rx).await;
-    let (resumed_a, b_after_answer) = if first
-        .body
-        .to_string()
-        .contains("Your assignment: Answer as a")
-    {
+    let (resumed_a, b_after_answer) = if worker_packet(&first)["agent_id"] == "a" {
         (first, second)
     } else {
         (second, first)
@@ -704,10 +709,7 @@ async fn real_tunnel_roundtrip(dependent: bool) {
         .body
         .to_string()
         .contains("Confirmed: the denominator is 25"));
-    assert!(resumed_a
-        .body
-        .to_string()
-        .contains("Your assignment: Answer as a"));
+    assert!(worker_packet(&resumed_a)["agent_id"] == "a");
     resumed_a
         .reply
         .send("Final analysis corrected using the peer's denominator.".into())
@@ -813,11 +815,7 @@ async fn cowork_runs_in_the_invited_lane_and_adoption_finishes_without_an_acknow
     // the second request would never arrive until the first one finished.
     let first = request(&mut requests).await;
     let second = request(&mut requests).await;
-    let (helper, held_inviter) = if first
-        .body
-        .to_string()
-        .contains("Your assignment: Answer as finance")
-    {
+    let (helper, held_inviter) = if worker_packet(&first)["agent_id"] == "finance" {
         (first, second)
     } else {
         (second, first)
@@ -961,10 +959,7 @@ async fn publication_rechecks_a_source_revised_during_the_writers_own_cowork() {
     );
     let a = request(&mut rx).await;
     let b = request(&mut rx).await;
-    let (research, held_writer) = if a.body["messages"]
-        .to_string()
-        .contains("Your assignment: Answer as research")
-    {
+    let (research, held_writer) = if worker_packet(&a)["agent_id"] == "research" {
         (a, b)
     } else {
         (b, a)
@@ -1083,10 +1078,10 @@ async fn first_free_slot_serves_cowork_before_primary_dependencies_finish() {
     let mut held = HashMap::new();
     for _ in 0..3 {
         let req = request(&mut rx).await;
-        let body = req.body.to_string();
+        let packet = worker_packet(&req);
         let role = ["budget", "growth", "research"]
             .into_iter()
-            .find(|r| body.contains(&format!("Your assignment: Answer as {r}")))
+            .find(|r| packet["agent_id"].as_str() == Some(*r))
             .unwrap();
         held.insert(role, req);
     }
@@ -1117,9 +1112,10 @@ async fn first_free_slot_serves_cowork_before_primary_dependencies_finish() {
         .send("Channel experiment ready".into())
         .unwrap();
     let peer = request(&mut rx).await;
-    assert!(peer.body["messages"]
-        .to_string()
-        .contains("separate, bounded co-work turn"));
+    assert!(!worker_packet(&peer)["invitations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let active = runtime.teams.get(&team.id).unwrap();
     assert_eq!(
         active
@@ -1165,9 +1161,7 @@ async fn first_free_slot_serves_cowork_before_primary_dependencies_finish() {
         .send("Budget assignment now finished.".into())
         .unwrap();
     let audit = request(&mut rx).await;
-    assert!(audit.body["messages"]
-        .to_string()
-        .contains("Your assignment: Answer as audit"));
+    assert_eq!(worker_packet(&audit)["agent_id"], "audit");
     audit
         .reply
         .send("Independent audit of the completed budget.".into())
@@ -1241,8 +1235,11 @@ async fn worker_missing_an_assigned_document_gets_one_same_session_correction() 
         .unwrap()
         .last()
         .unwrap();
-    assert!(last["content"].as_str().unwrap().contains("research.md"));
-    assert!(last["content"].as_str().unwrap().contains("verified write"));
+    let reminder: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        reminder["worker_state"]["write_files"],
+        json!(["research.md"])
+    );
     correction
         .reply
         .send("No document delivered".into())

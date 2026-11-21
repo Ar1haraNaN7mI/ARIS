@@ -23,6 +23,8 @@ pub mod model_profile;
 pub mod permissions;
 pub mod policy;
 mod project_checks;
+mod public_reply;
+pub use public_reply::only_data as is_standalone_json_reply;
 mod report_calculate;
 mod review_intents;
 pub mod reviewer_policy;

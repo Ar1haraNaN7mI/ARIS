@@ -1,6 +1,9 @@
 //! Bounded, nonblocking peer coordination between registered native workers.
 //! Team.tunnels is the durable source of truth; tools never wait for another
 //! agent or start a second competing runner for a live conversation.
+mod wire;
+pub(crate) use wire::model_transcript;
+
 use crate::harness::{selected_for_run, Team, TeamAgent, TeamStore};
 use crate::{Runtime, SessionEvent};
 use anyhow::{ensure, Context, Result};
@@ -25,6 +28,13 @@ pub struct TunnelMessage {
     pub from: String,
     pub to: String,
     pub text: String,
+    /// Native JSON shared with the peer. Text remains the human transcript.
+    #[serde(
+        flatten,
+        serialize_with = "wire::serialize_data",
+        deserialize_with = "wire::deserialize_data"
+    )]
+    pub data: Option<Value>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_id: Option<String>,
@@ -157,11 +167,10 @@ fn append(
     tunnel: &mut AgentTunnel,
     actor: &Actor,
     kind: &str,
-    body: String,
+    body: wire::Body,
     reply_to: Option<String>,
     resume_on_reply: bool,
 ) -> Result<()> {
-    ensure!(!body.trim().is_empty(), "Message must contain text");
     ensure!(
         tunnel.messages.len() < MAX_MESSAGES,
         "Tunnel message limit reached; close it with the unresolved result"
@@ -188,7 +197,8 @@ fn append(
         seq: tunnel.messages.len() + 1,
         from: actor.agent_id.clone(),
         to: peer,
-        text: body,
+        text: body.text,
+        data: body.data,
         kind: kind.into(),
         proposal_id: if kind == "accept" {
             reply_to.clone()
@@ -240,31 +250,35 @@ fn respond_to_invite(
                 )
         })
         .map(|m| m.kind.as_str());
-    let (kind, body) = match action {
+    let (kind, default_text) = match action {
         "accept_work" => {
             ensure!(previous.is_none(), "This invitation already has a response");
-            (
-                "cowork_accept",
-                optional_text(args, "text").unwrap_or("I will work on this task."),
-            )
+            ("cowork_accept", Some("I will work on this task."))
         }
         "decline_work" => {
             ensure!(
                 previous.is_none() || previous == Some("cowork_accept"),
                 "This invitation is already settled"
             );
-            ("cowork_decline", text(args, "text")?)
+            ("cowork_decline", None)
         }
         "complete_work" => {
             ensure!(
                 previous == Some("cowork_accept"),
                 "Accept this invitation before delivering the result"
             );
-            ("cowork_result", text(args, "text")?)
+            ("cowork_result", None)
         }
         _ => unreachable!(),
     };
-    append(tunnel, actor, kind, body.into(), Some(invite.into()), false)
+    append(
+        tunnel,
+        actor,
+        kind,
+        wire::body(args, kind, default_text)?,
+        Some(invite.into()),
+        false,
+    )
 }
 
 fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
@@ -279,6 +293,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                 tunnel.participants.contains(&actor.agent_id)
                     && requested_id.is_none_or(|id| tunnel.id == id)
             })
+            .map(model_transcript)
             .collect();
         ensure!(
             !tunnels.is_empty() || requested_id.is_none(),
@@ -288,6 +303,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
     }
     let mut selected_id = None;
     let mut wake = false;
+    let mut appended = None;
     let team = runtime.teams.mutate(&actor.team_id, |team| {
         ensure!(
             team.status == "running",
@@ -366,8 +382,10 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         };
         match action {
             "open" | "send" | "ask" | "invite" | "propose" => {
-                if action != "open" || optional_text(args, "text").is_some() {
-                    let body = text(args, "text")?.to_owned();
+                if action != "open"
+                    || optional_text(args, "text").is_some()
+                    || wire::data(args).is_some()
+                {
                     let kind = match action {
                         "ask" => "question",
                         "propose" => "proposal",
@@ -389,7 +407,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                         tunnel,
                         actor,
                         kind,
-                        body,
+                        wire::body(args, kind, None)?,
                         reply_to,
                         args.get("resume_on_reply").and_then(Value::as_bool) == Some(true),
                     )?;
@@ -418,9 +436,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                     tunnel,
                     actor,
                     "accept",
-                    optional_text(args, "text")
-                        .unwrap_or("I accept this proposal.")
-                        .into(),
+                    wire::body(args, "accept", Some("I accept this proposal."))?,
                     Some(proposal.id.clone()),
                     false,
                 )?;
@@ -438,6 +454,10 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
                 }
             }
             "close" => {
+                ensure!(
+                    wire::data(args).is_none(),
+                    "close accepts a text reason; send data before closing"
+                );
                 let reason = optional_text(args, "text")
                     .unwrap_or("Closed by a participant without a joint decision");
                 tunnel.status = "closed".into();
@@ -454,6 +474,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         };
         let summary = format!("{}: {}", tunnel.id, tunnel.topic);
         if let Some(message) = tunnel.messages.get(before) {
+            appended = Some(before);
             wake = needs_attention(tunnel, message);
             if message.kind == "cowork_invite" {
                 tunnel.messages[before].recipient_status_at_send = team
@@ -490,9 +511,7 @@ fn perform(runtime: &Runtime, actor: &Actor, args: &Value) -> Result<Value> {
         .iter()
         .find(|tunnel| Some(&tunnel.id) == selected_id.as_ref())
         .unwrap();
-    Ok(
-        json!({"tunnel":tunnel,"blocking":false,"notice":"The transcript is shared by both participants. Continue your assignment; outstanding requests are delivered asynchronously."}),
-    )
+    Ok(wire::receipt(tunnel, appended))
 }
 
 struct TunnelTool {
@@ -506,13 +525,14 @@ impl ToolHandler for TunnelTool {
         // or an external account. It remains available to read-only workers.
         metadata.idempotent = false;
         ToolDefinition::builtin("agent_tunnel",
-            "Coordinate asynchronously with an existing teammate. open or send posts a visible notice without waking a worker. ask requests a necessary answer; invite requests a specific piece of work with a checkable result. For send/ask/invite supply to+topic or an existing tunnel_id, plus text. Up to two tunnels per participant can have outstanding work; notices do not use these slots. If your own deliverable depends on the return, set resume_on_reply=true on the request. Answer via send+reply_to with the received message id. The invitee uses accept_work, performs the work with its own tools/permissions, then complete_work with the result or artifact reference; decline_work gives a reason. All three use tunnel_id and reply_to=invitation message id. propose/accept record an explicit decision via proposal_id. read returns the full transcript; close ends a discussion. Continue useful work without polling.",
+            "Coordinate asynchronously via compact JSON. Send parameters, facts and artifact references in data; use text for an exact question, reason or wording. Address send/ask/invite by to+topic or tunnel_id. open/send notify; ask requests an answer; invite requests work. Set resume_on_reply when your next step needs the return. Answer with send+reply_to. For co-work use accept_work then complete_work, or decline_work, with reply_to=invite ID. propose/accept records agreement via proposal_id. Writes return message IDs; read retrieves the full exchange. Up to two outstanding channels per worker. Continue without polling.",
             json!({"type":"object","properties":{
                 "action":{"type":"string","enum":["open","send","ask","invite","accept_work","decline_work","complete_work","read","propose","accept","close"]},
                 "to":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Exact peer worker id. Pair with topic to open a tunnel or send directly."},
                 "topic":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Topic for the peer route. Reusing the same open topic reuses its transcript."},
                 "tunnel_id":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"For send/ask/invite use an existing tunnel id or address via to and topic."},
                 "text":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                "data":{"anyOf":[{"type":"object"},{"type":"array","items":{}},{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"}],"description":"Native JSON facts, parameters, sources or artifact paths. May replace or accompany text. Omit when unused."},
                 "reply_to":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "proposal_id":{"anyOf":[{"type":"string"},{"type":"null"}]},
                 "expects_reply":{"anyOf":[{"type":"boolean"},{"type":"null"},{"enum":[""]}],"description":"For open/send, true requests an answer. Omit for notices and receipts."},
@@ -603,26 +623,22 @@ fn end_followups(tunnel: &mut AgentTunnel, messages: &[String], reason: &str) {
     }
 }
 
-/// Visible before each model request, including messages received before the
-/// recipient's first run. The full bounded transcript is repeated as clearly
-/// attributed peer context, never as a new human message in durable history.
-pub(crate) fn context(runtime: &Runtime, task_id: &str) -> Result<Option<String>> {
+/// Project peer input missing from this request's actual, budgeted history.
+/// The durable transcript remains available to either participant through read.
+pub(crate) fn context(
+    runtime: &Runtime,
+    task_id: &str,
+    history: &mut [aris_llm::ChatMessage],
+) -> Result<Option<String>> {
     let Some(owner) = runtime.tasks.task(task_id).and_then(|task| task.owner) else {
         return Ok(None);
     };
     let team = runtime.teams.get(&owner.team_id)?;
-    let relevant: Vec<_> = team
+    if !team
         .tunnels
         .iter()
-        .filter(|tunnel| {
-            tunnel.participants.contains(&owner.agent_id)
-                && (tunnel.status == "open"
-                    || tunnel.messages.iter().any(|message| {
-                        message.to == owner.agent_id && message.delivered_at.is_none()
-                    }))
-        })
-        .collect();
-    if relevant.is_empty() {
+        .any(|t| t.participants.contains(&owner.agent_id))
+    {
         return Ok(None);
     }
     let agent = team
@@ -631,6 +647,34 @@ pub(crate) fn context(runtime: &Runtime, task_id: &str) -> Result<Option<String>
         .find(|agent| agent.id == owner.agent_id)
         .context("Worker missing")?;
     let session = runtime.sessions.get_or_load(&agent.session_id)?;
+    let turn_start = session.read().events.iter().rev().find_map(|e| match e {
+        SessionEvent::TurnStart { at, .. } => Some(*at),
+        _ => None,
+    });
+    let visible = wire::project_history(history);
+    let relevant: Vec<_> = team
+        .tunnels
+        .iter()
+        .filter(|tunnel| {
+            tunnel.participants.contains(&owner.agent_id)
+                && (tunnel.status == "open"
+                    || tunnel.messages.iter().any(|m| {
+                        m.to == owner.agent_id
+                            && match &m.delivered_at {
+                                None => true,
+                                // A closed exchange still supplies its last reply throughout the
+                                // receiving turn, including steps after a tool call.
+                                Some(at) => turn_start.is_some_and(|start| {
+                                    at.parse::<chrono::DateTime<Utc>>()
+                                        .is_ok_and(|delivered| delivered >= start)
+                                }),
+                            }
+                    }))
+        })
+        .collect();
+    if relevant.is_empty() {
+        return Ok(None);
+    }
     let unread: Vec<_> = relevant
         .iter()
         .flat_map(|tunnel| {
@@ -678,8 +722,11 @@ pub(crate) fn context(runtime: &Runtime, task_id: &str) -> Result<Option<String>
             Ok(())
         })?;
     }
-    let transcript = serde_json::to_string(&relevant)?;
-    Ok(Some(format!("Internal peer coordination. Your worker id is {}. Full shared transcript:\n{}\nNotices, acknowledgments and completed work are visible to both participants. Reply to actual questions with send + reply_to. For a co-work invitation, accept_work then perform the requested work with your own tools and complete_work with the result, or decline_work with a reason. Reference the original invitation message id in reply_to. Integrate requested results into your assignment. Continue useful work without polling.",owner.agent_id,transcript)))
+    let inbox: Vec<_> = relevant
+        .into_iter()
+        .filter_map(|tunnel| wire::inbox(tunnel, &owner.agent_id, &visible))
+        .collect();
+    Ok((!inbox.is_empty()).then(|| json!({"peer_inbox":inbox}).to_string()))
 }
 
 pub(crate) fn has_unread_request_or_result(runtime: &Runtime, task_id: &str) -> Result<bool> {
@@ -1046,6 +1093,194 @@ mod tests {
         }
     }
 
+    fn read_channel(runtime: &Runtime, actor: &Actor, receipt: &Value) -> Value {
+        perform(
+            runtime,
+            actor,
+            &json!({"action":"read", "tunnel_id":receipt["tunnel"]["id"]}),
+        )
+        .unwrap()["tunnels"][0]
+            .clone()
+    }
+
+    #[test]
+    fn wide_peer_integers_render_exactly_without_duplicating_model_data() {
+        let data = json!({"rows":[{"id":u64::MAX,"delta":-9_007_199_254_740_993_i64}]});
+        let legacy = json!({"id":"message","seq":1,"from":"a","to":"b","text":"已核对。","kind":"notice",
+            "expects_reply":false,"at":"now","session_id":"session","task_id":"task","run_id":"run",
+            "turn_id":"turn","data":data});
+        let message: TunnelMessage = serde_json::from_str(&legacy.to_string()).unwrap();
+        let ui = serde_json::to_value(&message).unwrap();
+        assert_eq!(ui["data"], data);
+        assert_eq!(
+            ui["data_json"],
+            serde_json::to_string_pretty(&data).unwrap()
+        );
+        let mut cache = ui;
+        cache["data_json"] = json!("rounded or stale");
+        let reread: TunnelMessage = serde_json::from_value(cache).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reread).unwrap()["data_json"],
+            serde_json::to_string_pretty(&data).unwrap()
+        );
+
+        let (fixture, team, _lease) = setup();
+        let sent = perform(
+            &fixture.runtime,
+            &participant(&team, "a"),
+            &json!({"action":"send","to":"b","topic":"精度","data":data}),
+        )
+        .unwrap();
+        let read = read_channel(&fixture.runtime, &participant(&team, "b"), &sent);
+        assert_eq!(read["messages"][0]["data"], data);
+        assert!(read["messages"][0].get("data_json").is_none());
+
+        let mut safe = legacy;
+        safe["data"] = json!([
+            9_007_199_254_740_991_u64,
+            -9_007_199_254_740_991_i64,
+            0.5,
+            "18446744073709551615"
+        ]);
+        let message: TunnelMessage = serde_json::from_value(safe.clone()).unwrap();
+        let ui = serde_json::to_value(message).unwrap();
+        assert_eq!(ui["data"], safe["data"]);
+        assert!(ui.get("data_json").is_none());
+        safe.as_object_mut().unwrap().remove("data");
+        let historic: TunnelMessage = serde_json::from_value(safe).unwrap();
+        let ui = serde_json::to_value(historic).unwrap();
+        assert!(ui.get("data").is_none() && ui.get("data_json").is_none());
+    }
+
+    #[test]
+    fn structured_cowork_moves_native_values_once_and_keeps_a_readable_lane() {
+        let (fixture, team, _lease) = setup();
+        let rt = &fixture.runtime;
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        let inputs = json!({"summary":"核对辅料成本","unit":"元","rows":[[2,4.5,null],[3,0,false]],"source":"notes/原始表.tsv"});
+        let args =
+            json!({"action":"invite","to":"b","topic":"成本","data":inputs,"resume_on_reply":true});
+        rt.tools
+            .preflight(&aris_tools::ToolCall {
+                id: "call".into(),
+                name: "agent_tunnel".into(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+        let sent = perform(rt, &a, &args).unwrap();
+        let tunnel_id = sent["tunnel"]["id"].as_str().unwrap();
+        let invite_id = sent["tunnel"]["messages"][0]["id"].as_str().unwrap();
+        assert!(!sent.to_string().contains("原始表.tsv"));
+        let read = read_channel(rt, &b, &sent);
+        let first = &read["messages"][0];
+        assert_eq!(first["id"], invite_id);
+        assert_eq!(first["data"], inputs);
+        assert!(first.get("text").is_none());
+        assert_eq!(first["resume_on_reply"], true);
+        assert!(first.get("session_id").is_none());
+        let saved = rt.teams.get(&team.id).unwrap();
+        assert_eq!(saved.tunnels[0].messages[0].text, "核对辅料成本");
+        assert_eq!(saved.tunnels[0].messages[0].task_id, a.task_id);
+        perform(
+            rt,
+            &b,
+            &json!({"action":"accept_work","tunnel_id":tunnel_id,"reply_to":invite_id}),
+        )
+        .unwrap();
+        let result = json!({"amount":9.0, "units":"元", "references":["notes/原始表.tsv"]});
+        let receipt = perform(rt,&b,&json!({"action":"complete_work","tunnel_id":tunnel_id,"reply_to":invite_id,"text":"两笔合计九元。","data":result})).unwrap();
+        assert_eq!(receipt["tunnel"]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["tunnel"]["messages"][0]["kind"], "cowork_result");
+        let full = read_channel(rt, &a, &sent);
+        assert_eq!(read_channel(rt, &b, &sent), full);
+        assert_eq!(full["messages"][2]["text"], "两笔合计九元。");
+        assert_eq!(full["messages"][2]["data"], result);
+        assert_eq!(full["messages"][2]["reply_to"], invite_id);
+        assert!(perform(
+            rt,
+            &participant(&team, "c"),
+            &json!({"action":"read","tunnel_id":tunnel_id})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn projected_inbox_skips_visible_reads_but_recovers_after_history_eviction() {
+        use aris_llm::{ChatMessage, FunctionCallDelta, ToolCallDelta};
+        let (fixture, team, _lease) = setup();
+        let a = participant(&team, "a");
+        let b = participant(&team, "b");
+        let opened = perform(
+            &fixture.runtime,
+            &a,
+            &json!({"action":"send","to":"b","topic":"metrics","data":{"count":0}}),
+        )
+        .unwrap();
+        let first_id = &opened["tunnel"]["messages"][0]["id"];
+        let old = fixture
+            .runtime
+            .teams
+            .get(&team.id)
+            .unwrap()
+            .tunnels
+            .remove(0);
+        let mut legacy = serde_json::to_value(&old).unwrap();
+        legacy["messages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("data");
+        legacy["messages"][0]["text"] = json!("Original wording");
+        let mut call = ChatMessage::assistant("");
+        call.tool_calls = Some(vec![ToolCallDelta {
+            id: Some("read".into()),
+            function: Some(FunctionCallDelta {
+                name: Some("agent_tunnel".into()),
+                arguments: Some(json!({"action":"read"}).to_string()),
+            }),
+            ..Default::default()
+        }]);
+        let raw = json!({"tunnels":[legacy],"blocking":false}).to_string();
+        let mut history = vec![call, ChatMessage::tool_result("read", &raw)];
+        let known = wire::project_history(&mut history);
+        assert!(raw.contains("session_id") && !history[1].text().contains("session_id"));
+        assert!(history[1].text().contains("Original wording"));
+        assert!(wire::inbox(&old, &b.agent_id, &known).is_none());
+        let reopened = wire::inbox(&old, &b.agent_id, &Default::default()).unwrap();
+        assert_eq!(reopened["messages"][0]["id"], *first_id);
+        let new = perform(
+            &fixture.runtime,
+            &a,
+            &json!({"action":"send","tunnel_id":old.id,"data":false}),
+        )
+        .unwrap();
+        let current = fixture
+            .runtime
+            .teams
+            .get(&team.id)
+            .unwrap()
+            .tunnels
+            .remove(0);
+        let just_new = wire::inbox(&current, &b.agent_id, &known).unwrap();
+        assert_eq!(just_new["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(just_new["messages"][0]["data"], false);
+        assert_eq!(
+            just_new["messages"][0]["id"],
+            new["tunnel"]["messages"][0]["id"]
+        );
+        let indexed = ChatMessage::user(
+            json!({"type":"aris.brief","tunnels":[{"id":old.id,"content_path":"trace.json"}]})
+                .to_string(),
+        );
+        assert!(wire::project_history(&mut [indexed]).is_empty());
+        let inline = ChatMessage::user(
+            json!({"type":"aris.brief","tunnels":[model_transcript(&current)]}).to_string(),
+        );
+        assert!(
+            wire::inbox(&current, &b.agent_id, &wire::project_history(&mut [inline])).is_none()
+        );
+    }
+
     #[test]
     fn proposal_requires_the_other_participant_and_keeps_full_two_way_evidence() {
         let (fixture, team, _lease) = setup();
@@ -1070,11 +1305,10 @@ mod tests {
         .is_err());
         assert!(perform(runtime, &outsider, &json!({"action":"read","tunnel_id":id})).is_err());
         let accepted=perform(runtime,&b,&json!({"action":"accept","tunnel_id":id,"proposal_id":proposal,"text":"Verified the supplied records; I agree."})).unwrap();
-        assert_eq!(
-            accepted["tunnel"]["decision"]["accepted_by"],
-            json!(["a", "b"])
-        );
-        assert_eq!(accepted["tunnel"]["messages"].as_array().unwrap().len(), 2);
+        let transcript = read_channel(runtime, &a, &accepted);
+        assert_eq!(transcript["decision"]["accepted_by"], json!(["a", "b"]));
+        assert_eq!(transcript["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(accepted["tunnel"]["messages"].as_array().unwrap().len(), 1);
         assert_eq!(accepted["tunnel"]["status"], "closed");
         let left = perform(runtime, &a, &json!({"action":"read","tunnel_id":id})).unwrap();
         let right = perform(runtime, &b, &json!({"action":"read","tunnel_id":id})).unwrap();
@@ -1155,21 +1389,21 @@ mod tests {
             &b,
             &json!({
                 "action":"send","tunnel_id":opened["tunnel"]["id"],
-                "reply_to":question["tunnel"]["messages"][1]["id"],"text":"净额 500 元。"
+                "reply_to":question["tunnel"]["messages"][0]["id"],"text":"净额 500 元。"
             }),
         )
         .unwrap();
-        assert_eq!(answer["tunnel"]["messages"][2]["kind"], "answer");
+        assert_eq!(answer["tunnel"]["messages"][0]["kind"], "answer");
         let receipt = perform(
             runtime,
             &a,
             &json!({
                 "action":"send","tunnel_id":opened["tunnel"]["id"],
-                "reply_to":answer["tunnel"]["messages"][2]["id"],"text":"已采纳。"
+                "reply_to":answer["tunnel"]["messages"][0]["id"],"text":"已采纳。"
             }),
         )
         .unwrap();
-        assert_eq!(receipt["tunnel"]["messages"][3]["kind"], "notice");
+        assert_eq!(receipt["tunnel"]["messages"][0]["kind"], "notice");
         let mut current = runtime.teams.get(&team.id).unwrap();
         current
             .agents
@@ -1198,11 +1432,8 @@ mod tests {
         // Three distinct upstream roles can notify a writer already handling two requests.
         for source in ["a", "b", "c"] {
             let posted = post(source, "send", source).unwrap();
-            let last = posted["tunnel"]["messages"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap();
+            let transcript = read_channel(runtime, &final_owner, &posted);
+            let last = transcript["messages"].as_array().unwrap().last().unwrap();
             assert_eq!(last["kind"], "notice");
             assert_eq!(last["from"], source);
             assert_eq!(last["to"], "final");
@@ -1241,9 +1472,9 @@ mod tests {
             "a direct reply must reference a message in its actual route"
         );
         let answer = reply(&question["tunnel"]["messages"][0]["id"]).unwrap();
-        assert_eq!(answer["tunnel"]["messages"][2]["kind"], "answer");
+        assert_eq!(answer["tunnel"]["messages"][0]["kind"], "answer");
         assert_eq!(
-            answer["tunnel"]["messages"][2]["reply_to"],
+            read_channel(runtime, &final_owner, &answer)["messages"][2]["reply_to"],
             question["tunnel"]["messages"][0]["id"]
         );
         post("c", "ask", "c").unwrap();
@@ -1333,7 +1564,7 @@ mod tests {
         .unwrap();
         let tunnel = &asked["tunnel"]["id"];
         let invited = perform(runtime,&b,&json!({"action":"invite","tunnel_id":tunnel,"text":"Cross-check the total independently"})).unwrap();
-        let invite = &invited["tunnel"]["messages"][1]["id"];
+        let invite = &invited["tunnel"]["messages"][0]["id"];
         perform(
             runtime,
             &a,
@@ -1358,7 +1589,7 @@ mod tests {
             .followup_closed_reason
             .is_none());
         let result = perform(runtime,&a,&json!({"action":"complete_work","tunnel_id":tunnel,"reply_to":invite,"text":"Checked 25 trial rows."})).unwrap();
-        assert_eq!(result["tunnel"]["messages"][3]["kind"], "cowork_result");
+        assert_eq!(result["tunnel"]["messages"][0]["kind"], "cowork_result");
     }
 
     #[test]
@@ -1482,8 +1713,9 @@ mod tests {
                 .unwrap();
             let opened = perform(runtime, &a, &args).unwrap();
             let id = opened["tunnel"]["id"].as_str().unwrap();
-            assert!(opened["tunnel"]["messages"][0].get("reply_to").is_none());
-            assert_eq!(opened["tunnel"]["messages"][0]["expects_reply"], false);
+            let transcript = read_channel(runtime, &a, &opened);
+            assert!(transcript["messages"][0].get("reply_to").is_none());
+            assert!(transcript["messages"][0].get("expects_reply").is_none());
             let read = perform(runtime, &a, &json!({"action":"read","tunnel_id":empty})).unwrap();
             assert!(!read["tunnels"].as_array().unwrap().is_empty());
             assert!(perform(
@@ -1522,7 +1754,7 @@ mod tests {
                 &json!({"action":"close","tunnel_id":id,"text":empty}),
             )
             .unwrap();
-            assert!(!closed["tunnel"]["close_reason"]
+            assert!(!read_channel(runtime, &a, &closed)["close_reason"]
                 .as_str()
                 .unwrap()
                 .is_empty());
@@ -1554,7 +1786,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            accepted["tunnel"]["messages"][1]["text"],
+            read_channel(runtime, &b, &accepted)["messages"][1]["text"],
             "I accept this proposal."
         );
         let read_empty = perform(
@@ -1577,13 +1809,9 @@ mod tests {
         let semantic_open=perform(runtime,&a,&json!({"action":"open","to":"b","topic":"ignore unused references",
             "text":"Verify the official condition","reply_to":"none","proposal_id":"none","tunnel_id":"none"})).unwrap();
         let semantic_id = semantic_open["tunnel"]["id"].as_str().unwrap();
-        assert!(semantic_open["tunnel"]["messages"][0]
-            .get("reply_to")
-            .is_none());
-        assert_eq!(
-            semantic_open["tunnel"]["messages"][0]["expects_reply"],
-            false
-        );
+        let transcript = read_channel(runtime, &a, &semantic_open);
+        assert!(transcript["messages"][0].get("reply_to").is_none());
+        assert!(transcript["messages"][0].get("expects_reply").is_none());
         for action in ["send", "propose"] {
             assert!(perform(runtime,&a,&json!({"action":action,"tunnel_id":semantic_id,"text":"Bad reply","reply_to":"none"})).is_err());
         }

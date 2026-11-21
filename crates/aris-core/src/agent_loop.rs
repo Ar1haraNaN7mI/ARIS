@@ -707,7 +707,7 @@ async fn run_turn_inner(
     let owner = runtime.tasks.task(&task_id).and_then(|task| task.owner);
     let team_worker = owner.is_some();
     let mut requested_commands = Vec::new();
-    let worker_brief = if let Some(owner) = owner {
+    if let Some(owner) = owner {
         let team = runtime.teams.get(&owner.team_id)?;
         let worker = team
             .agents
@@ -719,28 +719,14 @@ async fn run_turn_inner(
             .iter()
             .rev()
             .find(|msg| !msg.queued && msg.agent_id.as_deref() == Some(worker.id.as_str()));
-        let peers: Vec<_> = team
-            .agents
-            .iter()
-            .filter(|a| a.id != worker.id && a.subagent_id.is_some())
-            .map(|a| a.id.as_str())
-            .collect();
-        let assignment = if cowork_only {
-            &user_text
-        } else {
-            &worker.prompt
-        };
-        let instruction = instruction.filter(|_| !cowork_only);
         if !cowork_only {
             let active_instruction =
-                instruction.map_or(assignment.as_str(), |message| message.text.as_str());
+                instruction.map_or(worker.prompt.as_str(), |message| message.text.as_str());
             crate::coding_checks::add_requested(active_instruction, &mut requested_commands);
         }
-        Some(json!({"role":worker.id,"assignment":assignment,"latest_instruction":instruction.map(|msg| &msg.text),"write_to":worker.files,"peer_ids":peers}).to_string())
     } else {
         crate::coding_checks::add_requested(&user_text, &mut requested_commands);
-        None
-    };
+    }
     let output_check = if cowork_only {
         None
     } else {
@@ -771,6 +757,8 @@ async fn run_turn_inner(
     }
     let mut command_correction: Option<String> = None;
     let mut requested_command_correction = false;
+    let mut public_reply_draft: Option<String> = None;
+    let mut private_tool_notes: Vec<String> = Vec::new();
     let system = turn_prompt.render();
     let mut indexed_messages = HashMap::new();
     let mut tool_calls_used = 0usize;
@@ -811,7 +799,6 @@ async fn run_turn_inner(
         );
 
         runtime.computer_status();
-        let peer_context = crate::tunnel::context(&runtime, &task_id)?;
         if check_written_files {
             if let Some(check) = &output_check {
                 documents_ready = check.missing(&session.read())?.is_empty();
@@ -833,32 +820,58 @@ async fn run_turn_inner(
         {
             messages.insert(1, aris_llm::ChatMessage::user(user_text.clone()));
         }
-        if let Some(context) = peer_context {
+        // A model may return facts alongside a native call. Keep its notes
+        // available to this turn without publishing them in the lane.
+        messages.extend(
+            private_tool_notes
+                .iter()
+                .cloned()
+                .map(aris_llm::ChatMessage::assistant),
+        );
+        if let Some(context) = crate::tunnel::context(&runtime, &task_id, &mut messages)? {
             messages.push(aris_llm::ChatMessage::user(context));
         }
         if let Some(reminder) = command_correction.take() {
             messages.push(aris_llm::ChatMessage::user(reminder));
         }
-        if let Some(brief) = &worker_brief {
-            if _step > 0 {
-                let next_action = if documents_ready {
-                    "All assigned documents have verified content for this run. Address any outstanding peer request, then return your final handoff with the file paths and findings. Reopen sources or revise files only to correct a specific outstanding issue."
-                } else {
-                    "Use the tools to complete your assigned files and to send any requested questions, proposals or replies to the named peers."
-                };
-                let mut reminder = format!("Continue your current ARIS assignment using the observations above. Answer in the user's language. Your recipient already supplied the brief. {next_action} Return concrete findings and sources.\n{brief}");
-                if let Some((_, _, limit)) = execution_limits {
-                    let steps_left = max_steps - _step;
-                    let calls_left = limit.saturating_sub(tool_calls_used);
-                    if steps_left <= 4 || calls_left <= 6 {
-                        reminder.push_str(&format!("\nRemaining budget including this step: {steps_left} model responses and {calls_left} tool calls. Deliver from the evidence already collected. Reserve time for the outstanding peer reply, writing the declared files, and a final answer. Disclose any genuine evidence gap in the report."));
-                    }
+        if team_worker && _step > 0 {
+            let mut state = serde_json::Map::new();
+            if documents_ready {
+                state.insert("documents_ready".into(), json!(true));
+            }
+            if let Some((_, _, limit)) = execution_limits {
+                let steps = max_steps - _step;
+                let calls = limit.saturating_sub(tool_calls_used);
+                if steps <= 4 || calls <= 6 {
+                    state.insert(
+                        "budget_left".into(),
+                        json!({"steps":steps,"tool_calls":calls}),
+                    );
                 }
-                if !missing_files.is_empty() {
-                    reminder.push_str(&format!("\nThese assigned documents still need a verified write. Use write_file to finish them now: {}",missing_files.join(", ")));
-                    missing_files.clear();
+            }
+            if !missing_files.is_empty() {
+                state.insert(
+                    "write_files".into(),
+                    json!(std::mem::take(&mut missing_files)),
+                );
+                if let Some(hint) = output_check
+                    .as_ref()
+                    .and_then(|check| check.report_rewrite_hint())
+                {
+                    state.insert("rewrite_guidance".into(), json!(hint));
                 }
-                messages.push(aris_llm::ChatMessage::user(reminder));
+            }
+            if !state.is_empty() {
+                messages.push(aris_llm::ChatMessage::user(
+                    json!({"worker_state":state}).to_string(),
+                ));
+            }
+            if let Some(draft) = &public_reply_draft {
+                messages.push(aris_llm::ChatMessage::user(format!(
+                    "{}\n{}",
+                    crate::public_reply::WRITE_FOR_READER,
+                    draft
+                )));
             }
         }
         if vision {
@@ -1004,10 +1017,13 @@ async fn run_turn_inner(
         // Stream path: forward to UI immediately; do NOT append per-token chunk
         // events (official keeps chunks for UI fidelity via live events; durable
         // assistant/message is written once after assemble — preserves token rate).
+        let mut public_stream = crate::public_reply::Stream::new(team_worker);
         while let Some(ev) = llm_rx.recv().await {
             match ev {
                 LlmEvent::TextDelta(t) => {
-                    let _ = event_tx.try_send(AgentEvent::TextDelta(t));
+                    if let Some(text) = public_stream.push(t) {
+                        let _ = event_tx.try_send(AgentEvent::TextDelta(text));
+                    }
                 }
                 LlmEvent::ReasoningDelta(t) => {
                     let _ = event_tx.try_send(AgentEvent::ReasoningDelta(t));
@@ -1019,7 +1035,7 @@ async fn run_turn_inner(
             }
         }
 
-        let assembled = match llm_task.await? {
+        let mut assembled = match llm_task.await? {
             Ok(a) => a,
             Err(e) if e.to_string().contains("cancelled") => {
                 session.write().append(SessionEvent::SystemNote {
@@ -1052,6 +1068,61 @@ async fn run_turn_inner(
                 return Err(e.into());
             }
         };
+        let structured_reply = team_worker && crate::public_reply::only_data(&assembled.text);
+        let draft = if structured_reply {
+            // Preserve native tool/reasoning items when replaying provider
+            // history. The public assistant text is projected separately.
+            if let Some(items) = assembled.provider_items.as_mut() {
+                items.retain(|item| item["type"] != "message");
+            }
+            Some(std::mem::take(&mut assembled.text))
+        } else if let Some(text) = public_stream.finish() {
+            let _ = event_tx.send(AgentEvent::TextDelta(text)).await;
+            None
+        } else {
+            None
+        };
+        let tool_calls = match assembled.parsed_tool_calls() {
+            Ok(tool_calls) => tool_calls,
+            Err(err) => {
+                record_task_feedback(&runtime, &task_id, &run_id, false, &err.to_string());
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
+                return Err(err);
+            }
+        };
+        let needs_tools =
+            !tool_calls.is_empty() && assembled.finish_reason == FinishReason::ToolCalls;
+        if needs_tools {
+            if let Some(note) = draft {
+                if !private_tool_notes.contains(&note) {
+                    private_tool_notes.push(note);
+                }
+            }
+        } else if let Some(draft) = draft {
+            if public_reply_draft.is_some() || _step + 1 >= max_steps {
+                let reason = "智能体返回了内部数据，尚未生成面向读者的最终答复。";
+                record_task_feedback(&runtime, &task_id, &run_id, false, reason);
+                review.finish(&lease, TaskState::Failed, RunState::Failed);
+                anyhow::bail!(reason);
+            }
+            public_reply_draft = Some(draft);
+            session.write().append(SessionEvent::StepEnd {
+                id: step_id.clone(),
+                turn_id: turn_id.clone(),
+                at: Utc::now(),
+            });
+            record_event(
+                &runtime,
+                EventEnvelope::new("step.ended", json!({"reason":"public_reply_required"}))
+                    .with_source(EventSource::Core)
+                    .with_turn(turn_id.clone())
+                    .with_step(step_id.clone()),
+                Some(&task_id),
+                Some(&run_id),
+            );
+            save_step_checkpoint(&runtime, &session, &task_id, &run_id, _step);
+            continue;
+        }
         session.write().append(SessionEvent::AssistantMessage {
             provider_items: assembled.provider_items.clone(),
             id: Uuid::new_v4().to_string(),
@@ -1072,16 +1143,6 @@ async fn run_turn_inner(
             Some(&run_id),
         );
 
-        let tool_calls = match assembled.parsed_tool_calls() {
-            Ok(tool_calls) => tool_calls,
-            Err(err) => {
-                record_task_feedback(&runtime, &task_id, &run_id, false, &err.to_string());
-                review.finish(&lease, TaskState::Failed, RunState::Failed);
-                return Err(err);
-            }
-        };
-        let needs_tools =
-            !tool_calls.is_empty() && assembled.finish_reason == FinishReason::ToolCalls;
         if !needs_tools {
             let peer_arrived = _step + 1 < max_steps
                 && crate::tunnel::has_unread_request_or_result(&runtime, &task_id)?;

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import type { Team, TeamTunnel, TunnelMessage } from "./teamTypes";
 import { tunnelMessageLabel, tunnelRequestState } from "./tunnelMessages";
@@ -6,6 +6,14 @@ import { CollaborationIcon } from "./CollaborationIcon";
 import { messageAction } from "./collaborationActions";
 
 const tunnelStatus = { open: "通道开放", closed: "已结束", cancelled: "已取消", interrupted: "已中断" };
+
+function PeerData({ value, exact }: { value: unknown; exact?: string }) {
+  const [open, setOpen] = useState(false);
+  return <details className="lp-peer-data" onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary>查看传递的数据</summary>
+    {open && <pre>{exact ?? JSON.stringify(value, null, 2)}</pre>}
+  </details>;
+}
 
 export function TunnelMessageCard({ tunnel, message, names, onSelectActor, onOpenTunnel }: {
   tunnel: TeamTunnel; message: TunnelMessage; names: Map<string, string>;
@@ -22,6 +30,7 @@ export function TunnelMessageCard({ tunnel, message, names, onSelectActor, onOpe
       <time dateTime={message.at}>{new Date(message.at).toLocaleTimeString()}</time></div>
     {parent && <blockquote className="lp-peer-reference" title={parent.text}>{tunnelMessageLabel(parent)} · {parent.text}</blockquote>}
     <div className="message-body"><Markdown components={{ a: (props) => <a {...props} target="_blank" rel="noreferrer noopener" /> }}>{message.text}</Markdown></div>
+    {message.data !== undefined && <PeerData value={message.data} exact={message.data_json} />}
     {onOpenTunnel && <button type="button" className="lp-peer-topic" onClick={() => onOpenTunnel(tunnel.id)} aria-label={`打开协作记录 · ${tunnel.topic}`}>{tunnel.topic} ↗</button>}
   </article>;
 }
